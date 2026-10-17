@@ -357,7 +357,12 @@ class Pi0(model.BaseModel):
         # Preprocess first (requires float32 for image ops), then cast the
         # observation to embed_dtype for Gemma / SigLIP. Keep actions in
         # fp32 like the RL sampler: action / time projections stay fp32.
-        observation = model.preprocess_observation(observation, train=train, rng=rng)
+        observation = model.preprocess_observation(
+            observation,
+            train=train,
+            rng=rng,
+            spatial_augmentation=self._config.spatial_augmentation,
+        )
 
         observation = model._observation_to_dtype(observation, self.embed_dtype)
         actions = actions.to(dtype=torch.float32)
@@ -782,7 +787,11 @@ class Pi0(model.BaseModel):
         batch_size = actions.shape[0]
         device = actions.device
 
-        observation = model.preprocess_observation(observation, train=True)
+        observation = model.preprocess_observation(
+            observation,
+            train=True,
+            spatial_augmentation=self._config.spatial_augmentation,
+        )
         observation = model._observation_to_dtype(observation, self.embed_dtype)
         actions = actions.to(dtype=torch.float32)
         dtype = actions.dtype

@@ -813,3 +813,49 @@ File Structure
        ├── advantage.py                          # quantile threshold + boolean label
        ├── distributed.py                        # sharded-inference helpers
        └── mixture_config.py                     # meta/mixture_config.yaml tag I/O
+
+Evo-RL Piper recordings
+--------------------------------------------------------------------------------
+
+Use existing single-arm Evo-RL LeRobot v3 recordings with the ``pi05_piper`` data configuration. The recipe preserves absolute joint targets: source joints in degrees and gripper width in millimetres become radians and metres before normalization. Policy output transforms restore degrees and millimetres for an Evo-RL executor. An RLinf robot executor additionally needs its own gripper-fraction conversion.
+
+The adapter requires seven named values (``joint_1.pos`` through ``joint_6.pos``, then ``gripper.pos``) and three RGB views. It accepts either ``base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb`` or the Evo-RL USB aliases ``front / front_2 / wrist`` under ``observation.images``. These slots preserve Evo-RL's mapping: ``front_2`` is a second external view even though the model slot is named ``left_wrist_0_rgb``. Check physical camera placement before mixing recordings. Dual-arm 14-dimensional datasets need a separate adapter.
+
+Prepare a dataset
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Activate an RLinf OpenPI environment with LeRobot 0.4.4 for v3 data. The hardware-check-only environment is not a GPU training environment. From the repository root, prepare a separate metadata directory:
+
+.. code-block:: bash
+
+   export REPO_PATH="$PWD"
+   export PIPER_DATA_PATH=/path/to/prepared/usb_iter2_recap
+   python -m toolkits.lerobot.prepare_piper_recap \
+     --source /path/to/Evo-RL/data/eval_usb_light_iter2_rollout+hil \
+     --output "$PIPER_DATA_PATH"
+
+This copies metadata, links the source data and videos, and writes ``meta/returns_piper.parquet`` and ``meta/norm_stats.json`` into the new directory. Keep the source accessible for the links. Existing output directories are rejected. The tool checks the seven named state/action entries and computes normalization in model units with the policy's ten-step action windows.
+
+Return computation reads ``episode_success`` from episode metadata (``success`` or ``failure``), or a terminal ``is_success`` field. Explicit conflicting or unknown labels fail. Explicit failures remain failures even for a dataset declared as ``sft``. The example uses ``type: rollout`` for mixed outcomes. Episodes spanning multiple Parquet files are joined before computing returns; task text is read from v3 ``tasks.parquet`` as well as v2 ``tasks.jsonl``. The initial reward is -1 per frame, 0 on a successful terminal frame, and -300 on a failed terminal frame. Set ``--failure-reward`` for the task's time/success tradeoff; this starting value is not a tuned USB reward.
+
+Run the three training stages
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set the backbone paths, then train the value model:
+
+.. code-block:: bash
+
+   export SIGLIP_MODEL_PATH=/path/to/siglip2-so400m-patch14-224
+   export GEMMA_MODEL_PATH=/path/to/gemma-3-270m
+   export PI05_MODEL_PATH=/path/to/pi05_base_pytorch
+   bash examples/offline_rl/advantage_labeling/recap/run_value_sft.sh piper_recap_value
+
+``PI05_MODEL_PATH`` must use the OpenPI PyTorch layout consumed by RLinf's CFG model (weight keys under ``paligemma_with_expert.*``). This differs from RLinf's bare ``Pi0`` export (``img.* / llm.*``). This recipe does not convert an Evo-RL checkpoint. Once value training has saved a checkpoint, label advantages and train the policy:
+
+.. code-block:: bash
+
+   export PIPER_VALUE_CHECKPOINT=/path/to/value_checkpoint
+   bash examples/offline_rl/advantage_labeling/recap/process/run_compute_advantages.sh piper_recap_advantages --nproc 1
+   bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh piper_recap_cfg
+
+Both configs use the ``piper`` sidecar tag. CFG loading and the model's inference wrapper use the same explicit ``openpi_data.norm_stats_path``. The policy initially trains the action expert with a frozen VLM. The examples start with micro-batch 1, global batch 8, and 100 training steps to check the pipeline. Set ``runner.max_steps``, the optimizer schedule, and checkpoint intervals for a full experiment. Choose held-out episodes or an independent evaluation dataset before reporting performance; the initial configuration disables validation and provides no success-rate estimate. These commands train offline and do not connect to the robot.

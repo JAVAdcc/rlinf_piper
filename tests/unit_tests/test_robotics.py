@@ -6368,3 +6368,693 @@ def test_SE3_body_delta_compose_round_trip():
 
         assert np.allclose(T_rec[..., :3, :3], T_abs[..., :3, :3], atol=1e-6)
         assert np.allclose(T_rec[..., :3, 3], T_abs[..., :3, 3], atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "bad_target",
+    [
+        [float("nan")] * 7,
+        [6, 0, 0, 0, 0, 0, 0],
+        [0, -1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 71],
+        [0, 0, 0, 0, 0, 0, 21],
+    ],
+)
+def test_piper_policy_rejects_invalid_or_large_targets(bad_target):
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.piper_runtime import (
+        PiperExecutionConfig,
+        piper_action_for_robot,
+    )
+
+    with pytest.raises(ValueError):
+        piper_action_for_robot(
+            np.array(bad_target),
+            np.zeros(7),
+            (PiperArm.JOINT_LIMITS_LOWER, PiperArm.JOINT_LIMITS_UPPER),
+            PiperExecutionConfig(),
+        )
+
+
+def test_piper_camera_resolution_distinguishes_rgb_from_depth_and_metadata(tmp_path):
+    from rlinf.robotics.piper_camera import resolve_piper_camera
+
+    usb = tmp_path / "usb"
+    usb.mkdir()
+    (usb / "idVendor").write_text("2bc5")
+    (usb / "serial").write_text("camera-serial")
+    sysfs = tmp_path / "video4linux"
+    sysfs.mkdir()
+
+    def node(name, interface, index):
+        parent = usb / interface
+        parent.mkdir(exist_ok=True)
+        (parent / "bInterfaceNumber").write_text(interface)
+        entry = sysfs / name
+        entry.mkdir()
+        (entry / "index").write_text(str(index))
+        (entry / "device").symlink_to(parent, target_is_directory=True)
+
+    node("video0", "00", 0)
+    node("video6", "04", 0)
+    node("video7", "04", 1)
+    assert resolve_piper_camera("camera-serial", "04", sysfs=sysfs) == "/dev/video6"
+    with pytest.raises(ValueError, match="Expected one"):
+        resolve_piper_camera("other-camera", "04", sysfs=sysfs)
+    node("video8", "04", 0)
+    with pytest.raises(ValueError, match="Expected one"):
+        resolve_piper_camera("camera-serial", "04", sysfs=sysfs)
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_piper_camera_recovery_resets_only_the_selected_idle_usb_device(
+    tmp_path, monkeypatch, busy
+):
+    from rlinf.robotics.piper_camera import reset_piper_camera
+
+    usb_sysfs, video_sysfs, devices = (
+        tmp_path / name for name in ("usb", "video4linux", "dev")
+    )
+    usb_sysfs.mkdir()
+    video_sysfs.mkdir()
+    for serial, number in [("selected", 7), ("other", 8)]:
+        usb = usb_sysfs / serial
+        usb.mkdir()
+        for name, value in {
+            "serial": serial,
+            "idVendor": "2bc5",
+            "busnum": "2",
+            "devnum": str(number),
+        }.items():
+            (usb / name).write_text(value)
+        node = devices / f"bus/usb/002/{number:03d}"
+        node.parent.mkdir(parents=True, exist_ok=True)
+        node.touch()
+        video = video_sysfs / f"video{number}"
+        video.mkdir()
+        (video / "device").symlink_to(usb, target_is_directory=True)
+
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command, 0 if busy or command[0] != "fuser" else 1, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr("rlinf.robotics.piper_camera.subprocess.run", run)
+    monkeypatch.setattr("rlinf.robotics.piper_camera.time.sleep", lambda _: None)
+    if busy:
+        with pytest.raises(RuntimeError, match="in use"):
+            reset_piper_camera(
+                "selected",
+                usb_sysfs=usb_sysfs,
+                video_sysfs=video_sysfs,
+                device_root=devices,
+            )
+        assert len(commands) == 1
+    else:
+        reset_piper_camera(
+            "selected",
+            usb_sysfs=usb_sysfs,
+            video_sysfs=video_sysfs,
+            device_root=devices,
+        )
+        assert commands[1] == ["usbreset", "002/007"]
+    assert commands[0] == [
+        "fuser",
+        str(devices / "bus/usb/002/007"),
+        str(devices / "video7"),
+    ]
+
+
+def test_piper_camera_disconnect_waits_for_blocked_capture_before_release(monkeypatch):
+    from threading import Event, Timer
+
+    import cv2
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
+    from rlinf.robotics.piper_camera import PiperOpenCVCamera
+
+    started, finish_read = Event(), Event()
+    captures = []
+
+    class Capture:
+        def __init__(self, *args):
+            self.opened = True
+            self.reading = False
+            self.released_while_reading = False
+            self.props = {cv2.CAP_PROP_FRAME_WIDTH: 9, cv2.CAP_PROP_FRAME_HEIGHT: 8}
+            captures.append(self)
+
+        def isOpened(self):
+            return self.opened
+
+        def get(self, key):
+            return self.props.get(key, 0)
+
+        def set(self, key, value):
+            self.props[key] = value
+            return True
+
+        def read(self):
+            self.reading = True
+            started.set()
+            finish_read.wait()
+            self.reading = False
+            return True, np.zeros((8, 9, 3), np.uint8)
+
+        def release(self):
+            self.released_while_reading = self.reading
+            self.opened = False
+
+    monkeypatch.setattr(cv2, "VideoCapture", Capture)
+    camera = PiperOpenCVCamera(
+        OpenCVCameraConfig(index_or_path=0, width=9, height=8, fps=30)
+    )
+    camera.connect(warmup=False)
+    assert started.wait(1)
+    # LeRobot's original two-second join expires before this hardware read returns.
+    timer = Timer(2.2, finish_read.set)
+    timer.start()
+    try:
+        camera.disconnect()
+        assert not camera.is_connected
+        assert not captures[0].released_while_reading
+    finally:
+        finish_read.set()
+        timer.join()
+
+
+def test_piper_rollout_can_disable_extra_limits_without_disabling_input_validation():
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.piper_runtime import (
+        PiperExecutionConfig,
+        piper_action_for_robot,
+    )
+
+    config = PiperExecutionConfig(check_action_limits=False)
+    limits = (PiperArm.JOINT_LIMITS_LOWER, PiperArm.JOINT_LIMITS_UPPER)
+    target = np.array([10, -10, 10, 0, 0, 0, 80.0])
+    action = piper_action_for_robot(target, np.zeros(7), limits, config)
+    np.testing.assert_allclose(action["arm"]["joint_position"], np.deg2rad(target[:6]))
+    np.testing.assert_allclose(action["arm"]["end_effector"]["target"], [80 / 70])
+    with pytest.raises(ValueError, match="finite"):
+        piper_action_for_robot(np.full(7, np.nan), np.zeros(7), limits, config)
+    with pytest.raises(ValueError, match="boolean"):
+        PiperExecutionConfig(check_action_limits="false")
+
+
+def test_piper_policy_allows_normalization_roundoff_at_physical_bounds():
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.piper_runtime import (
+        PiperExecutionConfig,
+        piper_action_for_robot,
+    )
+
+    limits = (PiperArm.JOINT_LIMITS_LOWER, PiperArm.JOINT_LIMITS_UPPER)
+    measured = np.concatenate([np.rad2deg(limits[0]), [70.0]])
+    target = measured + np.array([-0.0001] * 6 + [0.001])
+    command = piper_action_for_robot(target, measured, limits, PiperExecutionConfig())
+    np.testing.assert_allclose(command["arm"]["joint_position"], limits[0])
+    np.testing.assert_array_equal(command["arm"]["end_effector"]["target"], [1.0])
+    assert target[6] > 70  # The caller's prediction remains unchanged.
+    target[6] = 70.1
+    with pytest.raises(ValueError, match="stroke"):
+        piper_action_for_robot(target, measured, limits, PiperExecutionConfig())
+
+
+@pytest.mark.parametrize("high_follow, mode", [(False, "j"), (True, "js")])
+def test_piper_policy_executes_mock_sdk_in_radians_and_metres_and_closes(
+    high_follow, mode
+):
+    import io
+
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics import PiperRobot
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.piper_runtime import (
+        PiperExecutionConfig,
+        PiperSession,
+        rollout_piper,
+    )
+
+    class Camera:
+        is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def disconnect(self):
+            self.is_connected = False
+
+        def read_latest(self, max_age_ms):
+            return np.zeros((8, 9, 3), np.uint8)
+
+    class Policy:
+        action_horizon = 2
+        fps = 1000
+
+        def infer(self, observation, task):
+            np.testing.assert_allclose(observation["observation.state"], np.zeros(7))
+            return np.array(
+                [[1, 1, -1, 0, 0, 0, 10], [2, 2, -2, 0, 0, 0, 20]], np.float32
+            )
+
+    with mocked_sdks():
+        arm = PiperArm.declare(
+            "can0", firmware="v189", high_follow=high_follow, speed_percent=100
+        )
+        robot = PiperRobot(arm=arm)
+        cameras = {name: Camera() for name in ("front", "front_2", "wrist")}
+        session = PiperSession(robot, cameras, PiperExecutionConfig(fps=1000))
+        # Capture fake SDK traces before driver disconnect releases its handle.
+        sent = []
+        original_execute = session.execute
+
+        def execute(target):
+            result = original_execute(target)
+            sent.append((arm._robot.sent[-1], arm._gripper.sent[-1]))
+            assert arm._robot.sent_modes[-1] == mode
+            assert arm._robot.speed_percent == 100
+            assert arm._robot.get_arm_status().msg.mode_feedback == 1
+            return result
+
+        session.execute = execute
+        log = io.StringIO()
+        assert (
+            rollout_piper(
+                Policy(), session, "insert USB", steps=2, replan_steps=2, log=log
+            )
+            == 2
+        )
+        np.testing.assert_allclose(sent[1][0], np.deg2rad([2, 2, -2, 0, 0, 0]))
+        assert sent[1][1]["value"] == pytest.approx(0.020)
+        assert sent[1][1]["force"] == pytest.approx(1.0)
+        assert not session.is_connected and not robot.is_connected
+        assert not any(camera.is_connected for camera in cameras.values())
+        assert log.getvalue().count('"event": "action"') == 2
+        session.close()
+
+
+def test_piper_follower_refuses_unacknowledged_joint_mode(monkeypatch):
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.arms.piper import PiperArm
+
+    with mocked_sdks():
+        from pyAgxArm import AgxArmFactory, create_agx_arm_config
+
+        device = AgxArmFactory.create_arm(create_agx_arm_config())
+        device.accepts_motion_mode = False
+        monkeypatch.setattr(
+            AgxArmFactory, "create_arm", lambda *_args, **_kwargs: device
+        )
+        monkeypatch.setattr(PiperArm, "FEEDBACK_TIMEOUT_S", 0.02)
+        arm = PiperArm.declare("can0", firmware="v189", high_follow=True)
+        with pytest.raises(RuntimeError, match="did not acknowledge CAN joint mode"):
+            arm.connect()
+        assert device.sent == []
+        assert not device.is_connected()
+
+
+@pytest.mark.parametrize("replan_steps", [None, 2])
+def test_piper_rollout_matches_evo_action_queue_and_tick_budget(
+    monkeypatch, tmp_path, replan_steps
+):
+    import io
+    import json
+    from types import SimpleNamespace
+
+    from rlinf.robotics.piper_runtime import PiperExecutionConfig, rollout_piper
+
+    clock = SimpleNamespace(now=0.0)
+
+    def advance(seconds):
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        "rlinf.robotics.piper_runtime.time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now, time=lambda: clock.now, sleep=advance
+        ),
+    )
+
+    class Session:
+        config = PiperExecutionConfig()
+        closed = False
+        observed = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+        def observe(self):
+            self.observed += 1
+            advance(0.002)
+            return {
+                "observation.state": np.full(7, self.observed),
+                "observation.images.front": np.full((2, 3, 3), self.observed, np.uint8),
+            }
+
+        def execute(self, target):
+            advance(0.001)
+            return np.zeros(7)
+
+    class Policy:
+        action_horizon = 3
+        fps = 30
+        calls = 0
+
+        def infer(self, observation, task):
+            self.calls += 1
+            advance(0.1)
+            return np.tile(np.arange(3)[:, None] + self.calls * 10, (1, 7))
+
+    session, policy, log = Session(), Policy(), io.StringIO()
+    archive = tmp_path / "observations"
+    assert (
+        rollout_piper(
+            policy,
+            session,
+            "USB",
+            steps=4,
+            replan_steps=replan_steps,
+            log=log,
+            observation_dir=archive,
+        )
+        == 4
+    )
+    records = [json.loads(line) for line in log.getvalue().splitlines()]
+    actions = [row for row in records if row["event"] == "action"]
+    predictions = [row for row in records if row["event"] == "prediction"]
+    assert [row["target"][0] for row in actions] == (
+        [10, 11, 12, 20] if replan_steps is None else [10, 11, 20, 21]
+    )
+    assert policy.calls == 2 and session.observed == 4 and session.closed
+    # Evo-RL charges slow inference to the current tick; it does not append
+    # another full period of sleep after that tick's first action.
+    assert actions[1]["time"] - actions[0]["time"] == pytest.approx(0.003)
+    if replan_steps is None:
+        assert actions[2]["time"] - actions[1]["time"] == pytest.approx(1 / 30)
+    for row in predictions:
+        with np.load(row["observation_file"]) as saved:
+            assert saved["task"].item() == "USB"
+            assert saved["observation.state"][0] == row["step"] + 1
+            assert saved["observation.images.front"].dtype == np.uint8
+
+
+@pytest.mark.parametrize("inference_s", [0.58, 3.1])
+def test_piper_usb_h50_prediction_age_budget(monkeypatch, tmp_path, inference_s):
+    import io
+    import json
+
+    from omegaconf import OmegaConf
+
+    from rlinf.robotics.piper_runtime import PiperExecutionConfig, rollout_piper
+
+    clock = SimpleNamespace(now=0.0)
+
+    def advance(seconds):
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        "rlinf.robotics.piper_runtime.time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now, time=lambda: clock.now, sleep=advance
+        ),
+    )
+    hardware = OmegaConf.load(
+        Path(__file__).resolve().parents[2]
+        / "examples/embodiment/config/piper_usb_hardware.yaml"
+    )
+
+    class Session:
+        config = PiperExecutionConfig(**hardware.execution)
+        sent = 0
+        closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+        def observe(self):
+            advance(0.002)
+            return {"observation.state": np.zeros(7)}
+
+        def execute(self, target):
+            self.sent += 1
+            advance(0.001)
+            return np.zeros(7)
+
+    class Policy:
+        action_horizon = 50
+        fps = 30
+
+        def infer(self, observation, task):
+            advance(inference_s)
+            return np.zeros((50, 7))
+
+    session, log = Session(), io.StringIO()
+
+    def run():
+        return rollout_piper(
+            Policy(),
+            session,
+            "USB",
+            steps=100,
+            replan_steps=50,
+            log=log,
+            observation_dir=tmp_path / "observations",
+        )
+
+    if inference_s < 1:
+        # Reproduce the FP32 first-call latency, then consume two full H50 chunks.
+        # The former 2s hardware limit aborted the first chunk around target 45.
+        assert run() == session.sent == 100
+        records = [json.loads(line) for line in log.getvalue().splitlines()]
+        actions = [row for row in records if row["event"] == "action"]
+        assert 2 < actions[49]["prediction_age_s"] < 3
+        assert actions[50]["prediction_age_s"] < 1
+    else:
+        with pytest.raises(TimeoutError, match="chunk target 1/50"):
+            run()
+        assert session.sent == 0
+    assert session.closed
+
+
+def test_piper_session_cleans_up_after_camera_and_policy_errors():
+    import io
+
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics import PiperRobot
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.piper_runtime import (
+        PiperExecutionConfig,
+        PiperSession,
+        rollout_piper,
+    )
+
+    class Camera:
+        is_connected = False
+        broken = False
+
+        def connect(self):
+            self.is_connected = True
+            if self.broken:
+                raise RuntimeError("camera failed")
+
+        def disconnect(self):
+            self.is_connected = False
+
+        def read_latest(self, max_age_ms):
+            return np.zeros((8, 9, 3), np.uint8)
+
+    class Policy:
+        action_horizon = 1
+        fps = 30
+
+        def infer(self, observation, task):
+            raise RuntimeError("inference failed")
+
+    with mocked_sdks():
+        robot = PiperRobot(arm=PiperArm.declare("can0", firmware="v189"))
+        cameras = {name: Camera() for name in ("front", "front_2", "wrist")}
+        session = PiperSession(robot, cameras, PiperExecutionConfig())
+        cameras["front_2"].broken = True
+        with pytest.raises(RuntimeError, match="camera failed"):
+            session.__enter__()
+        assert not robot.is_connected
+        assert not any(camera.is_connected for camera in cameras.values())
+        cameras["front_2"].broken = False
+        with pytest.raises(RuntimeError, match="inference failed"):
+            rollout_piper(
+                Policy(), session, "USB", steps=1, replan_steps=1, log=io.StringIO()
+            )
+        assert not robot.is_connected
+        assert not any(camera.is_connected for camera in cameras.values())
+
+
+def test_piper_rejects_stale_sdk_feedback_when_required():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.arms.piper import PiperArm
+
+    with mocked_sdks():
+        arm = PiperArm.declare("can0", firmware="v189", max_feedback_age_s=0.5)
+        arm.connect()
+        try:
+            # The mock SDK timestamp is zero: a connected device is not proof of fresh data.
+            with pytest.raises(RuntimeError, match="Stale Piper"):
+                arm.get_state()
+        finally:
+            arm.disconnect()
+
+
+def test_piper_can_selection_uses_serial_and_rejects_ambiguity(tmp_path):
+    from rlinf.robotics.piper_runtime import resolve_piper_channel
+
+    usb = tmp_path / "usb"
+    usb.mkdir()
+    (usb / "serial").write_text("follower\n")
+    net = tmp_path / "net"
+    (net / "can3").mkdir(parents=True)
+    (net / "can3/device").symlink_to(usb, target_is_directory=True)
+    assert resolve_piper_channel("follower", sysfs=net) == "can3"
+    with pytest.raises(ValueError, match="found"):
+        resolve_piper_channel("leader", sysfs=net)
+    (net / "can5").mkdir()
+    (net / "can5/device").symlink_to(usb, target_is_directory=True)
+    with pytest.raises(ValueError, match="found"):
+        resolve_piper_channel("follower", sysfs=net)
+
+
+def test_piper_leader_explicit_modes_feedback_and_cleanup():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+
+    with mocked_sdks() as sdk:
+        leader = PiperLeader("can-hil", config=PiperLeaderConfig(startup_sleep_s=0))
+        leader.connect()
+        device = sdk["piper_sdk"].devices[-1]
+        target = np.array([5, 10, -12, 1, 2, 3, 25.123])
+        leader.send_feedback(target)
+        np.testing.assert_allclose(leader.read_target(), target)
+        np.testing.assert_allclose(
+            leader.get_observation()["joint_position"], np.deg2rad(target[:6])
+        )
+        assert not leader.manual
+        leader.set_manual_control(True)
+        assert leader.manual and not device.gripper_enabled
+        assert any(kind == "torque" for kind, _ in device.commands)
+        with pytest.raises(RuntimeError, match="Mirroring"):
+            leader.send_feedback(target)
+        leader.set_manual_control(False)
+        assert not leader.manual and device.gripper_enabled
+        assert device.mode[1] == 1
+        assert [args[0] for kind, args in device.commands if kind == "role"] == [0xFC]
+        leader.disconnect()
+        leader.disconnect()
+        assert device.closed and device.mode[1] == 1
+        leader.connect()
+        leader.disconnect()
+
+
+def test_piper_leader_failed_takeover_restores_hold_and_stale_read_fails():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+
+    with mocked_sdks() as sdk:
+        leader = PiperLeader(
+            "can-hil",
+            config=PiperLeaderConfig(startup_sleep_s=0, enable_timeout_s=0.02),
+        )
+        leader.connect()
+        device = sdk["piper_sdk"].devices[-1]
+        device.fail_mit = True
+        with pytest.raises(OSError, match="bus fault"):
+            leader.set_manual_control(True)
+        assert not leader.manual and device.mode[1] == 1 and device.gripper_enabled
+        device.stale = True
+        with pytest.raises(TimeoutError, match="stale"):
+            leader.read_target()
+        leader.disconnect()
+        assert device.closed
+
+
+def test_piper_leader_background_fault_restores_hold_and_is_reported():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop import TeleopDevice
+
+    with mocked_sdks() as sdk:
+        leader = TeleopDevice.named("piper_leader")(
+            "can-hil", config={"startup_sleep_s": 0}
+        )
+        leader.connect()
+        device = sdk["piper_sdk"].devices[-1]
+        try:
+            leader.set_manual_control(True)
+            device.fail_mit = True
+            deadline = time.monotonic() + 1
+            while device.mode[1] != 1 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert device.mode[1] == 1
+            with pytest.raises(RuntimeError, match="loop failed"):
+                leader.read_target()
+        finally:
+            leader.disconnect()
+        assert device.closed
+
+
+def test_piper_takeover_rejects_misalignment_and_alignment_can_be_aborted():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader
+    from rlinf.robotics.piper_intervention import PiperIntervention
+
+    with mocked_sdks() as sdk:
+        control = PiperIntervention(
+            PiperLeader("can-hil", config={"startup_sleep_s": 0})
+        )
+        control.connect()
+        try:
+            with pytest.raises(ValueError, match="not aligned"):
+                control.toggle(np.full(7, 90))
+            assert control.mode == "policy" and not control.leader.manual
+            with pytest.raises(KeyboardInterrupt):
+                control.align(np.full(7, 90), 30, abort=lambda: True)
+            device = sdk["piper_sdk"].devices[-1]
+            np.testing.assert_array_equal(device.target, np.zeros(7))
+        finally:
+            control.close()
+
+
+def test_piper_leader_claim_prevents_two_owners():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+
+    with mocked_sdks():
+        cfg = PiperLeaderConfig(startup_sleep_s=0)
+        first, second = (
+            PiperLeader("can-hil", config=cfg),
+            PiperLeader("can-hil", config=cfg),
+        )
+        first.connect()
+        try:
+            with pytest.raises(RuntimeError, match="already"):
+                second.connect()
+            assert first.is_connected
+        finally:
+            first.disconnect()
+        second.connect()
+        second.disconnect()

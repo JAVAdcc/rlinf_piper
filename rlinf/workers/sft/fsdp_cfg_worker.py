@@ -20,13 +20,14 @@ CfgMixtureDataset for weighted sampling across datasets.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils._pytree import tree_map
 
 from rlinf.data.datasets.recap.cfg_model import (
@@ -92,6 +93,30 @@ class FSDPCfgWorker(FSDPSftWorker):
         self._data_epoch = 0
         self._data_iter_offset = 0
 
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save the training state and Piper inference assets when applicable."""
+        super().save_checkpoint(save_path, step)
+        if self._rank == 0 and self.cfg.actor.model.openpi.config_name == "pi05_piper":
+            from rlinf.models.embodiment.piper_inference import (
+                save_piper_inference_assets,
+            )
+
+            rates = {
+                float(
+                    json.loads((Path(ds.dataset_path) / "meta/info.json").read_text())[
+                        "fps"
+                    ]
+                )
+                for ds in self.cfg.data.train_data_paths
+            }
+            if len(rates) != 1:
+                raise ValueError(
+                    "Piper deployment requires one consistent dataset frame rate."
+                )
+            save_piper_inference_assets(
+                save_path, self.cfg.actor.model, fps=rates.pop()
+            )
+
     @staticmethod
     def _load_advantages_lookup(
         data_path: str,
@@ -155,17 +180,36 @@ class FSDPCfgWorker(FSDPSftWorker):
                 "Each dataset should have 'dataset_path' and optionally 'episodes' and 'weight' fields."
             )
 
+        from rlinf.data.storage.lerobot.metadata import load_task_descriptions
+
         first_path = datasets_config[0]["dataset_path"]
         config = get_openpi_config(
             openpi_cfg.config_name,
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
+            data_kwargs=OmegaConf.to_container(
+                self.cfg.actor.model.openpi_data, resolve=True
+            )
+            if self.cfg.actor.model.get("openpi_data") is not None
+            else None,
         )
         data_config = config.data.create(config.assets_dirs, config.model)
 
         model_transforms = self._build_model_transforms(data_config)
-        norm_stats = data_config.norm_stats or {}
+        from rlinf.models.embodiment.openpi.transforms.pipeline import (
+            select_openpi_norm_stats,
+        )
+
+        norm_stats = (
+            select_openpi_norm_stats(
+                data_config.norm_stats,
+                norm_stats_path=OmegaConf.select(
+                    self.cfg, "actor.model.openpi_data.norm_stats_path"
+                ),
+            )
+            or {}
+        )
 
         datasets_with_weights = []
         for ds_config in datasets_config:
@@ -197,7 +241,11 @@ class FSDPCfgWorker(FSDPSftWorker):
             if data_config.prompt_from_task:
                 base_dataset = openpi_data_loader.TransformedDataset(
                     base_dataset,
-                    [transforms.PromptFromLeRobotTask(dataset_meta.tasks)],
+                    [
+                        transforms.PromptFromLeRobotTask(
+                            load_task_descriptions(dataset_root)
+                        )
+                    ],
                 )
 
             # RepackTransform strips all keys except OpenPI required ones,

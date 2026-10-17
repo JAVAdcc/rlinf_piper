@@ -14,10 +14,10 @@
 import os
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 
-def get_model(cfg: DictConfig, torch_dtype=None):
+def get_model(cfg: DictConfig, torch_dtype=None, *, strict_weights: bool = False):
     import glob
 
     import openpi.shared.download as download
@@ -32,7 +32,14 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
 
     config_name = getattr(cfg.openpi, "config_name", None)
-    actor_train_config = get_openpi_config(config_name)
+    data_kwargs = (
+        OmegaConf.to_container(cfg.openpi_data, resolve=True)
+        if cfg.get("openpi_data") is not None
+        else None
+    )
+    actor_train_config = get_openpi_config(
+        config_name, model_path=cfg.model_path, data_kwargs=data_kwargs
+    )
     actor_model_config = actor_train_config.model
     actor_model_config = OpenPi0Config(**actor_model_config.__dict__)
     override_config_kwargs = cfg.openpi
@@ -55,12 +62,20 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.freeze_vlm()
 
     if os.path.exists(full_weights_path):
-        model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        model_state_dict = torch.load(
+            full_weights_path, map_location="cpu", weights_only=True
+        )
+        model.load_state_dict(model_state_dict, strict=strict_weights)
     elif os.path.exists(actor_full_weights_path):
-        model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        model_state_dict = torch.load(
+            actor_full_weights_path, map_location="cpu", weights_only=True
+        )
+        model.load_state_dict(model_state_dict, strict=strict_weights)
     else:
+        if strict_weights:
+            raise FileNotFoundError(
+                "Local CFG inference requires model_state_dict/full_weights.pt from training."
+            )
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not weight_paths:
             weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
@@ -73,7 +88,16 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
     if data_config.asset_id is None:
         raise ValueError("Asset id is required to load norm stats.")
-    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+    if data_kwargs and data_kwargs.get("norm_stats_path"):
+        from rlinf.models.embodiment.openpi.transforms.pipeline import (
+            select_openpi_norm_stats,
+        )
+
+        norm_stats = select_openpi_norm_stats(
+            data_config.norm_stats, norm_stats_path=data_kwargs["norm_stats_path"]
+        )
+    else:
+        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
 
     repack_transforms = transforms.Group()
     default_prompt = None

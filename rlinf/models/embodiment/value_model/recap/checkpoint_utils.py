@@ -169,6 +169,12 @@ def build_input_transforms(
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(libero_policy.LiberoInputs(model_type=model_type_enum))
 
+    elif env_type == "piper":
+        from rlinf.models.embodiment.openpi.policies.piper_policy import PiperInputs
+
+        input_transforms.append(PiperInputs())
+        input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
+
     elif env_type in ("franka", "franka_co_train"):
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(

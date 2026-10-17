@@ -220,7 +220,7 @@ Franka 真机配置中，``keyboard_reward_wrapper: rlt_policy_switch`` 会提�
 ``ref_chunk``；按下 ``b`` 之后，实际执行 Stage 2 actor 的动作。
 
 ManiSkill joint 配置中，``env.*.rlt_policy_switch`` 使用任务信息自动产生
-``rlt_switch_flags``（actor/ref 阶段）和 ``intervene_flag``（expert 接管请求）。
+``rlt_switch_flags``\ （actor/ref 阶段）和 ``intervene_flag``\ （expert 接管请求）。
 HF rollout route 根据这些标记在整 chunk 级别选择 actor action、VLA
 ``ref_chunk`` 或 expert action，并把 ``record_transition``、``actor_switch`` 和
 ``intervention_requested`` 写入 ``forward_inputs``，供 replay 和监控使用。
@@ -778,3 +778,116 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
 - Stage 1、Stage 2 和 checkpoint assets 中的 ``norm_stats.json`` 必须来自同一套数据语义和同一个 ``repo_id``。推荐通过 ``openpi_data.norm_stats_path`` 显式指定，避免 Stage 1 checkpoint 未写入 norm stats 时加载失败。
 - ``rollout.rlt_feature_model.model_path`` 应指向 Stage 1 FSDP 检查点下的 ``actor`` 目录，例如 ``.../checkpoints/global_step_<step>/actor``。不要把 RLT Stage 1 checkpoint 转成裸 ``model.safetensors`` 再给 Stage 2 使用，因为 RLT token module 保存在完整 wrapper checkpoint 中。
 - 添加仿真示例时，可以新建仿真环境配置，保留 ``loss_type: rlt_ac`` 和 ``rollout.rlt_feature_model``，再把真机阶段切换逻辑替换成适合仿真的逻辑。
+
+使用 Evo-RL Piper 数据和本地机械臂
+--------------------------------------------------------------------------------
+
+单臂 Piper 可以沿用本页的 RLinf 原生 RLT 两阶段流程：先在 LeRobot v3 数据上训练 Stage 1，再用冻结的 Stage 1 和在线采集的数据更新 Stage 2 actor/critic。``piper_rlt_stage1`` 和 ``piper_rlt_stage2`` 使用已有的 RLT 模型、更新逻辑与 replay 路径；RECAP 的 value 训练和 advantage 标注不参与这条流程。
+
+准备 Stage 1 数据
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+在 RLinf OpenPI 环境中使用 LeRobot 0.4.4。准备工具要求七维绝对关节目标（六个角度值和一个毫米夹爪宽度）、同序 state，以及 ``front / front_2 / wrist`` 或 ``base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb`` 三路 RGB 图像。它创建独立元数据目录，通过链接复用轨迹和视频，按十步动作窗口计算模型单位下的统计。
+
+.. code-block:: bash
+
+   export REPO_PATH="$PWD"
+   export PIPER_DATA_PATH=/path/to/prepared/piper_rlt
+   python -m toolkits.lerobot.prepare_piper \
+     --source /path/to/Evo-RL/data/usb_new_merged \
+     --output "$PIPER_DATA_PATH"
+   export PI05_MODEL_PATH=/path/to/pi05_base_pytorch
+   bash examples/sft/run_vla_sft.sh piper_rlt_stage1
+
+输出目录必须是新目录。传到服务器时，需要同步链接指向的实际数据和视频，或在服务器重新准备目录。正式训练应选择质量合适的示范数据；数据格式兼容不代表录制中的失败动作适合 SFT。初始配置只运行 100 步，用于检查训练链路，正式实验需调整训练步数与优化器调度。
+
+Stage 1 每次保存完整 checkpoint 后，会在 ``actor/`` 下写入 ``piper_inference.json`` 和 ``assets/piper/norm_stats.json``。下载完整 ``actor/`` 目录，保留 ``model_state_dict/full_weights.pt`` 中的 VLA 与 ``rlt_module.*`` 权重。元数据包含模型配置、数据帧率及归一化校验信息，部署时不再引用服务器上的模型或数据路径。推理环境仍需要 OpenPI tokenizer 资源；首次使用可下载，离线机器需预先准备缓存。
+
+离线检查和本地 rollout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+先用录制样本运行冻结 Stage 1 的参考 policy。以下命令只读取数据并保存预测，不打开相机或 CAN：
+
+.. code-block:: bash
+
+   export PIPER_STAGE1_PATH=/path/to/downloaded/stage1/actor
+   python -m toolkits.piper.run_policy infer \
+     --checkpoint "$PIPER_STAGE1_PATH" \
+     --dataset "$PIPER_DATA_PATH" --frame 0
+
+每次命令创建独立结果目录，保存参数、观测和 ``prediction.json``。执行真机 rollout 时，配置 ``examples/embodiment/config/piper_usb_hardware.yaml`` 中的 follower USB CAN 序列号、相机 USB 身份和夹爪行程。示例按相机序列号和 USB 接口选择 RGB 节点：Gemini 335 的 RGB 接口为 ``04``，深度接口为 ``00``，避免 USB 重新枚举后设备别名指错接口。也可用显式 ``index_or_path`` 路径替代 USB 身份。相机位置仍须与训练一致。示例为两台 Gemini 开启 ``reset_on_connect``，用于恢复重复运行后的彩色流：采集前先确认选定的 USB/video 节点未被占用，再只复位这两台相机并重新定位 RGB 节点；需要 ``fuser``、``usbreset``、``udevadm`` 及 USB 写权限。腕部相机和 CAN 设备不参与复位。所有相机提供新帧后才连接 follower。``front_2`` 是第二个外部视角，映射到模型的 left 槽位。
+
+.. code-block:: bash
+
+   python -m toolkits.piper.run_policy rollout \
+     --checkpoint "$PIPER_STAGE1_PATH" \
+     --hardware examples/embodiment/config/piper_usb_hardware.yaml \
+     --task "pick up the two USB cables and insert them into the USB port on the outlet." \
+     --steps 900 --save-observations
+
+USB 硬件示例采用 Evo-RL USB 推理配置的 ``high_follow: true``、``speed_percent: 100`` 和 ``gripper_force: 1.0``。底层使用 pyAgxArm 的 ``move_js``，对应 ``MotionCtrl_2(1, 1, 100, 0xAD)`` 加绝对关节目标；这里是关节跟随模式，不是直接发送力矩的 ``move_mit``。夹爪力度在线路上仍为 1000。通用 ``PiperArm`` 和未指定 ``high_follow`` 的其他硬件配置保留原有 ``move_j`` 行为。本地 rollout 和 Stage 2 使用相同的硬件配置入口。
+
+执行命令会使能配置指定的 follower，并开始发送 policy 动作，不执行归零轨迹。循环对齐 Evo-RL 的同步 ``select_action`` 队列：每个控制周期读取观测，队列空时预测，发送一个目标，最后只等待该周期剩余时间；观测、推理、日志和发送都计入周期耗时。推理仍会造成间隔变长，不保证连续 30 Hz。默认消费完整动作块后再预测，可用 ``--replan-steps`` 覆盖。``pi05_piper`` 的 horizon 为 10，且不使用离散 state 提示词；``pi05_piper_h50_state`` 的 horizon 为 50，并启用离散 state 输入。加载器按 checkpoint 中的配置选择对应数据变换和 RLT 归一化动作分支，不应修改 ``piper_inference.json`` 中的配置名来切换模型。
+
+USB 配置的 ``execution.max_prediction_age_s`` 设为 3.0 秒。它限制从采集观测到当前动作的累计时间，包括推理、记录和动作块播放，并非只限制推理耗时。H50 在 30 Hz 下播放约需 1.67 秒，另加推理耗时；首次预测耗时 0.58 秒时，原来的 2 秒上限会在动作块结束前触发。超过上限仍会停止 rollout，报错会显示实际耗时和动作块进度。
+
+``--steps`` 是发送目标的总数，跑满即结束，不表示任务完成。任务文本必须与所用数据一致；上面的文本对应 ``usb_light`` 两根 USB 线。Ctrl-C 或异常会释放连接，电机保持最后目标。执行器检查反馈时效、关节范围及相对实测位置的单步变化。``trace.jsonl`` 是诊断记录，不是在线 replay 数据集。``--save-observations`` 将每次预测的三路 RGB、原始 state 和 task 保存到 ``observations/step_*.npz``，并在 prediction 记录中写入文件路径，供离线重放；磁盘写入也计入控制周期。
+
+跟随模式在最后一次设置速度之后重新声明，并等待控制器回报 CAN 控制、关节运动模式和正常状态，再开始发送目标。SDK 的速度设置会发送运动模式字段为 ``0xFF`` 的帧；不能仅凭电机使能成功判断运动模式已就绪。
+
+添加 ``--no-action-limits`` 可以关闭 rollout 层额外的目标范围及单步幅度检查。Piper 底层驱动仍按机械行程裁剪指令，非有限值和输入时效检查继续生效。每次运行的 ``hardware.yaml`` 会保存实际使用的设置。
+
+交互式 Stage 1 成功率评测
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+在本地 rollout 命令中增加 ``--interactive --num-episodes 20``，可连续评测 20 条。
+保持运行终端获得键盘焦点，轻按右方向键开始一条，按 ``s`` 标记成功或 ``f`` 标记失败；
+无需回车。首条也等待右键。标记后停止发送新目标，机械臂保持最后目标，人工恢复场景后再按右键。
+默认不会自动归零或释放电机。同步推理期间的按键会在推理结束后、下一个动作发送前处理。
+
+``--steps`` 是每条的动作上限；达到上限后等待 ``s``/``f``，不会自动记失败。
+模型、相机和机械臂连接在全部条目间复用。每条记录保存在 ``episode_001/`` 等目录，
+包含 ``trace.jsonl``、``result.json``，以及启用 ``--save-observations`` 时的观测文件。
+根目录 ``summary.json`` 每条更新成功数、失败数及成功率，分母仅包含已标记的条目。
+Ctrl-C 或采样故障终止评测并保留部分统计；未评分、中断及故障条目不计为失败。
+``--no-action-limits`` 继续适用于评测的 policy 动作。
+
+需要评分后自动回位时，增加 ``--reset-after-episode initial``：记录首次按右键开始前的
+关节位置和夹爪开度，之后每条（包括最后一条）按 ``s``/``f`` 后先张开夹爪，再回到
+记录的关节位置，最后恢复夹爪开度。``--reset-after-episode zero`` 改为关节零位和闭合夹爪。
+默认 ``none`` 保持原行为。复位保持 CAN 和相机连接，无需切换示教模式；期间不能开始下一条。
+复位流程参考 Evo-RL 的 ``_move_robot_to_zero_pose`` 和 ``prepare_for_reset``：
+先重新声明关节控制模式并确认电机使能，再从实测起点按固定时长线性插值。
+``--reset-duration-s`` 默认 3 秒；``--reset-gripper-duration-s`` 默认 0.5 秒，
+分别用于张开和恢复夹爪，默认共约 4 秒。每个发送周期计入 I/O 耗时，不补发追赶。
+初始反馈不再受旧的 5 度回退门槛限制；发送目标仍裁剪到驱动原有限位，
+控制器状态、反馈时效、数据形状及有限值检查仍然有效，控制器故障不会自动清除。
+不控制 leader，也不切换示教模式或重建相机/CAN 连接。
+
+日志中的 ``trajectory_sent`` 表示轨迹已经发送完，不声称机械臂已精确到位。
+最终实测姿态和误差写入每条 ``result.json`` 及 ``reset.jsonl``；操作员确认姿态并恢复物品后再按右键。
+``reset_pose.json`` 保存固定回位目标。复位期间的按键不会泄漏到下一条。
+复位失败时先保存评分并暂停，连接保持打开，处理故障后按 ``r`` 重试同一条的复位，
+按 ``q`` 或 Ctrl-C 退出；右键不能越过失败状态开启下一条。重试不重复计分，
+日志写入 ``reset_retry_02.jsonl`` 等独立文件。其他采样异常仍终止评测并保留结果。
+
+
+运行原生 RLT 在线训练
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``PiperPolicyEnv-v1`` 将三路 RGB 和七维原始 state 送入冻结 Stage 1。特征模型输出 ``z_rl``、七维归一化 ``proprio`` 和归一化 ``ref_chunk``；actor、critic 和 replay 始终使用同一归一化动作空间。环境执行端通过 Stage 1 的统计还原绝对角度和毫米，再转换为驱动需要的弧度及夹爪开度比例。
+
+.. code-block:: bash
+
+   bash examples/embodiment/run_realworld_async.sh piper_rlt_stage2
+
+该配置在连接机械臂的单节点上运行现有 RLT online worker。启动前，设置 ``PIPER_STAGE1_PATH``，核对硬件配置，并按键盘文档设置 ``RLINF_KEYBOARD_DEVICE``。每个 episode 等待 ``a`` 开始，先执行 Stage 1 参考动作；``b`` 切换为 Stage 2 actor，``c`` 标记成功，``q`` 标记失败。成功终止 reward 为 1，其余为 0；超时为 truncation。reset 等待人工准备场景，不发送复位轨迹，也未接入 leader 接管。训练中的 actor/reference 路由与 transition 记录规则沿用原生 real-world RLT。
+
+Stage 2 checkpoint 自动保存 ``piper_rlt_actor.json``，绑定所用 Stage 1 的标识。评估训练后的 actor 时，在上面的 ``infer`` 或 ``rollout`` 命令中增加 ``--actor /path/to/stage2/actor``；必须同时保留对应 Stage 1。加载器拒绝不匹配的 Stage 1/Stage 2 组合。
+
+通用接口和验证范围
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+相机映射与单位转换由 ``PiperInputs / PiperOutputs`` 复用；本地控制由 ``PiperSession.observe()`` 和 ``execute()`` 提供，独立于算法。其他算法可复用这些接口，但仍需实现各自的 policy 和更新逻辑。``--backend cfg`` 可加载前述 RECAP/CFG checkpoint；它不能替代 RLT Stage 1。
+
+当前适配通过真实数据读取、训练/在线预处理一致性、checkpoint 元数据迁移、原生 RLT actor 路由、mock SDK 动作与清理、dummy 环境 episode 测试。完整 GPU 训练、真实权重推理和真机在线学习效果仍需在对应环境中验证。

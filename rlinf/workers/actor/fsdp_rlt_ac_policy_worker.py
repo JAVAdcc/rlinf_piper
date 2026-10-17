@@ -44,6 +44,23 @@ class RLTACLossMixin:
     critic target, Q1 actor objective, and BC regularization.
     """
 
+    def save_checkpoint(self, save_base_path, step):
+        """Save actor state and the Piper Stage 1 binding when configured."""
+        super().save_checkpoint(save_base_path, step)
+        feature = self.cfg.rollout.get("rlt_feature_model")
+        if (
+            self._rank == 0
+            and feature is not None
+            and feature.openpi.config_name in ("pi05_piper", "pi05_piper_h50_state")
+        ):
+            from rlinf.models.embodiment.piper_inference import (
+                save_piper_rlt_actor_assets,
+            )
+
+            save_piper_rlt_actor_assets(
+                save_base_path, self.cfg.actor.model, feature.model_path
+            )
+
     @staticmethod
     def _flatten_chunk(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() <= 2:
@@ -379,6 +396,38 @@ class RLTACLossMixin:
 class RLTACReplayMixin:
     """Shared rollout-to-replay ingestion for sync and async RLT AC workers."""
 
+    def _critical_phase_trajectory(self, trajectory: Trajectory) -> Trajectory | None:
+        """Select recorded chunks while retaining their original next observations."""
+        flat = self.replay_buffer._flatten_trajectory(trajectory)
+        flags = flat.get("forward_inputs", {}).get("record_transition")
+        if not isinstance(flags, torch.Tensor):
+            raise ValueError("Critical-phase replay requires record_transition flags.")
+        count = flat["actions"].shape[0]
+        if flags.shape[0] != count:
+            raise ValueError("Critical-phase flags must match the action chunks.")
+        mask = flags.reshape(count, -1).bool().all(dim=-1)
+        if not mask.any():
+            return None
+
+        def select(value):
+            if isinstance(value, dict):
+                return {key: select(tensor) for key, tensor in value.items()}
+            if value.shape[0] != count:
+                raise ValueError(
+                    "RLT replay fields must be aligned with action chunks."
+                )
+            return value[mask].detach().unsqueeze(1).cpu().contiguous()
+
+        filtered = Trajectory(
+            max_episode_length=trajectory.max_episode_length,
+            model_weights_id=trajectory.model_weights_id,
+        )
+        # Replay flattening already removes each rollout epoch's initial done slot.
+        # Do not shift terminal flags again or reconstruct next_obs after filtering.
+        for name, value in flat.items():
+            setattr(filtered, name, select(value))
+        return filtered
+
     @staticmethod
     def _trajectory_transition_count(traj: Trajectory) -> int:
         if traj.actions is None:
@@ -638,6 +687,12 @@ class RLTACReplayMixin:
 
             return len(replay_list), completed
 
+        if self.cfg.algorithm.replay_buffer.get("critical_phase_only", False):
+            recv_list = [
+                filtered
+                for trajectory in recv_list
+                if (filtered := self._critical_phase_trajectory(trajectory)) is not None
+            ]
         self.replay_buffer.add_trajectories(recv_list)
 
         if self.demo_buffer is not None:

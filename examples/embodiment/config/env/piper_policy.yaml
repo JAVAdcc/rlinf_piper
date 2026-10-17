@@ -1,0 +1,32 @@
+env_type: real
+total_num_envs: 1
+auto_reset: true
+ignore_terminations: false
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+teleop: none
+keyboard_intervention_wrapper: false
+keyboard_reward_wrapper: null
+no_gripper: false
+main_image_key: front
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+init_params:
+  id: PiperPolicyEnv-v1
+  num_envs: 1
+override_cfg:
+  is_dummy: false
+  task: "pick up the two USB cables and insert them into the USB port on the outlet."
+  hardware_path: ${oc.env:REPO_PATH}/examples/embodiment/config/piper_usb_hardware.yaml
+  norm_stats_path: ${oc.env:PIPER_STAGE1_PATH}/assets/piper/norm_stats.json
+  max_num_steps: 300
+  step_frequency: 30.0
+  image_width: 640
+  image_height: 480

@@ -1,0 +1,721 @@
+{
+  "created_date": "2026-10-12",
+  "destination": "/home/descfly/code/rlinf_piper",
+  "branch": "integration/piper-local-server",
+  "local_source": {
+    "path": "/home/descfly/code/RLinf",
+    "base_commit": "807e5fdd836f0c3671fd351f65faf3bce5ddaf35",
+    "includes_uncommitted_work": true,
+    "snapshot": "/home/descfly/code/rlinf_piper/.merge_sources/local",
+    "entry_count": 2196,
+    "tree_sha256": "46a24e667ddb299bc069992f72d2e73d040e10c17c8abba9b74598357d1446fd"
+  },
+  "server_source": {
+    "host": "yiming-aliserver",
+    "ssh_port": 27,
+    "path": "/home/yiming/workspace/code/piper_stage1_h50_fp32_20261002/repo",
+    "commit": null,
+    "note": "Server source snapshot contains no Git metadata.",
+    "snapshot": "/home/descfly/code/rlinf_piper/.merge_sources/server",
+    "entry_count": 2194,
+    "tree_sha256": "84c06857db2c24a6db4bcd4b78f7153b51dcac072d936dfc31f98c8bdd5d42ba"
+  },
+  "decisions": [
+    {
+      "path": "LOADER_FIX.md",
+      "source_difference": "server_only",
+      "decision": "archive_only",
+      "reason": "Server handoff retained in source snapshot; conclusions integrated into the review report.",
+      "local": null,
+      "server": {
+        "sha256": "7b5945af05f068329187a5abbfc21b0bfd805feccac50eec8a4f11ccdfaea014",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "docs/source-en/rst_source/examples/embodied/rlt.rst",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "fc5400f313cbebc5da53b8f5ceff2c5892833b433fbfc4c2a762130b29fc33bf",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "e97006404e2682823874bc4ea6bd733c301c315a7a17ef0b0d0d88872de28b47",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "fc5400f313cbebc5da53b8f5ceff2c5892833b433fbfc4c2a762130b29fc33bf",
+        "symlink": null
+      }
+    },
+    {
+      "path": "docs/source-zh/rst_source/examples/embodied/rlt.rst",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "a139d6c6a204c40c7854b23181f7330fbbf3152da27e7bb854bff605d8c5a81e",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "8d50cc8ef29920121721478154e5ceb6965443fa2b65f1cd4dd29d177eedf713",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "a139d6c6a204c40c7854b23181f7330fbbf3152da27e7bb854bff605d8c5a81e",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/embodiment/config/env/piper_policy.yaml",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "93eef38e15583225d47fc756c4c4f8f15971194f5b4afd414c86b086f82ebfae",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "74b951b06b4cc8f26727808957d0c46b2c460a4c2e0e5475dd8bfc25659e3844",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "93eef38e15583225d47fc756c4c4f8f15971194f5b4afd414c86b086f82ebfae",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/embodiment/config/piper_usb_hardware.yaml",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "ca621e04a72f5c135fe1cd6e974f21d5246f257b93a7735d32f7e5fa4ae3907e",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "3fa7a56aaa09079400347340cc26e2975c5ac67b348d8a87d939b0e8135357e1",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "ca621e04a72f5c135fe1cd6e974f21d5246f257b93a7735d32f7e5fa4ae3907e",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/sft/config/piper_rlt_stage1.yaml",
+      "source_difference": "both",
+      "decision": "merged",
+      "reason": "Preserve local train_expert_only=false; retain server explicit video backend setting.",
+      "local": {
+        "sha256": "80762772d27e120becfee134daf33683fc57d031883ef429789112b5e0335e50",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "2fefa25e6294639a8dba04c66119b6c45276d7a9116479c8db013ee2194853b2",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "d607599f4c1faeb4eb5fe93fba908b181883c47b870eb0eacc4459559a00b516",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/sft/config/piper_usb_rlt_stage1_h50_fp32.yaml",
+      "source_difference": "server_only",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": null,
+      "server": {
+        "sha256": "a3187ea1243842c933599ea179802f745cd3e9d7d9af33f57a25814b551eea74",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "a3187ea1243842c933599ea179802f745cd3e9d7d9af33f57a25814b551eea74",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/sft/config/piper_usb_rlt_stage1_h50_full_state.yaml",
+      "source_difference": "server_only",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": null,
+      "server": {
+        "sha256": "56ca0b7c7d3e603a81e344af3b84a4552216333c0b66fc3151d1b5ad56bdaf02",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "56ca0b7c7d3e603a81e344af3b84a4552216333c0b66fc3151d1b5ad56bdaf02",
+        "symlink": null
+      }
+    },
+    {
+      "path": "examples/sft/config/piper_usb_rlt_stage1_success97.yaml",
+      "source_difference": "server_only",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": null,
+      "server": {
+        "sha256": "31831b5754ca7f7f8d78882258de515219a77a4e34dc153dfeb5e4f95664dc36",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "31831b5754ca7f7f8d78882258de515219a77a4e34dc153dfeb5e4f95664dc36",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/data/datasets/openpi/lerobot_dataset.py",
+      "source_difference": "server_only",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": null,
+      "server": {
+        "sha256": "a66556bc57daf8cd17fdf0ada370b48f0b574ed38fb6a918fab54a0b4cddb452",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "a66556bc57daf8cd17fdf0ada370b48f0b574ed38fb6a918fab54a0b4cddb452",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/data/datasets/openpi/official_sft_data_loader.py",
+      "source_difference": "both",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": {
+        "sha256": "1b04b8b6fe76f5924842f4335b97d0ba6522a2f3d70e04d1482ea82d708960a3",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "7ec3707afa7d450169fe5f3f6a124a43a9b001ada71d9bdb85c7cc677595f920",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "7ec3707afa7d450169fe5f3f6a124a43a9b001ada71d9bdb85c7cc677595f920",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/hybrid_engines/fsdp/utils.py",
+      "source_difference": "both",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": {
+        "sha256": "ce3d9ddf5b2403e3eb8830940a40fec625b4b0cae8be54a55aa1b136cd5da9ee",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "55d90fd01515056fd507b01b5af5f6cf74145477f31ae4d34508aaa1365a8f73",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "1f091f5e5ac0a9deeaeeba420fe977297e031c36380e705e5536a61d0276aa85",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/models/embodiment/openpi/__init__.py",
+      "source_difference": "both",
+      "decision": "merged",
+      "reason": "Server precision/load-order fixes plus profile-scoped spatial augmentation default.",
+      "local": {
+        "sha256": "c47a9a0cfb93368d2b701dc4ab09f87ab758fbe7a6b290ab6eb7c69586c9246e",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "1da8f8c8c8e51147453fafbb9a7013212279c359b0bc93abe311fdc502106ef2",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "0748b03e72f8abf07d3863ce190b2dff02c2299087468c044f66e545fe8ee3a4",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/models/embodiment/openpi/modules/model.py",
+      "source_difference": "both",
+      "decision": "merged",
+      "reason": "Piper spatial augmentation is configurable; preserve spatial augmentation defaults for other tasks.",
+      "local": {
+        "sha256": "21d851802c1576c6f3f4bcb1a9a58b7a3f5a08a966c43208f29f682ff0315ab2",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "c042a68fc3c70b817cb473c3f6d67065d4f12e36c15a8e062208c4ff92b5467e",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "f9090cbecbb07c28927e7f9fb49b1a64896e654bf429f0a764353fb6ff793bcf",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/models/embodiment/openpi/modules/siglip.py",
+      "source_difference": "both",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": {
+        "sha256": "a5c54299435969bf200b80618a6e6a4b85b4f93792ea9c2869073782903d53b3",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "9ebd4126b429d3820f0e34caabaaad81f418b62779d85a6136b17d6247d1318d",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "9ebd4126b429d3820f0e34caabaaad81f418b62779d85a6136b17d6247d1318d",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/models/embodiment/piper_inference.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "ce6ec95fbcdf4a17e702aa8ded0334c716d66c43982a3e71c804e8b9eb8f780d",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "1f974f997361f44feb80812b569b7bd9c0268792e7c4f0b02dad77c45f8df2d9",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "ce6ec95fbcdf4a17e702aa8ded0334c716d66c43982a3e71c804e8b9eb8f780d",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/robotics/parts/arms/piper.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "8c26e1a720f755347bad265a953bdc7e5e5d9ec3463a5a082df7e186378c027f",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "79fa1035a5e4cd502703a4d9d0eb910030b0247038a390438087461b1238a175",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "8c26e1a720f755347bad265a953bdc7e5e5d9ec3463a5a082df7e186378c027f",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/robotics/piper_camera.py",
+      "source_difference": "local_only",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "d93a656b86f3dabaa733f05d8c3734860d24b4e7a9843652204ee7603cfaf8da",
+        "symlink": null
+      },
+      "server": null,
+      "merged": {
+        "sha256": "d93a656b86f3dabaa733f05d8c3734860d24b4e7a9843652204ee7603cfaf8da",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/robotics/piper_evaluation.py",
+      "source_difference": "local_only",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "36ef4dc3d1d6027c2027473dc1119529adac54aa6cd606decf209ee980a23c82",
+        "symlink": null
+      },
+      "server": null,
+      "merged": {
+        "sha256": "36ef4dc3d1d6027c2027473dc1119529adac54aa6cd606decf209ee980a23c82",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/robotics/piper_reset.py",
+      "source_difference": "local_only",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "9760082d99e8210065125b9b02f518319c75e077bab9354723ad544b25f6f34f",
+        "symlink": null
+      },
+      "server": null,
+      "merged": {
+        "sha256": "9760082d99e8210065125b9b02f518319c75e077bab9354723ad544b25f6f34f",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/robotics/piper_runtime.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "4925084181b5b8577af18214728b01ef2007541b44704f729fcfaac4fdf72e80",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "a04748d89f7c306caf4bf1930313093f157f86e86f9ff067a6aecce0e2c6fe54",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "4925084181b5b8577af18214728b01ef2007541b44704f729fcfaac4fdf72e80",
+        "symlink": null
+      }
+    },
+    {
+      "path": "rlinf/workers/sft/fsdp_vla_sft_worker.py",
+      "source_difference": "both",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": {
+        "sha256": "2f714d5983d5feda8d26274911e14f6027dd317fbe42471b46d9ea1742dfb7c6",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "53c38d7d14790cd4c127634826cd9e4740b5d3ddcefab48ed252a7a6ba0d855f",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "53c38d7d14790cd4c127634826cd9e4740b5d3ddcefab48ed252a7a6ba0d855f",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/robot_mocks/arms.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "d14902759ca426c2cdd2c5f540f96d501ceeecc2c773875f2fd1def45791c166",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "1a78245b9755b9288cd82deb08468e14518c7fd1e366035e5568d000df47cfa8",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "d14902759ca426c2cdd2c5f540f96d501ceeecc2c773875f2fd1def45791c166",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/unit_tests/.pytest_cache/.gitignore",
+      "source_difference": "server_only",
+      "decision": "excluded_cache",
+      "reason": "Runtime test cache, retained only in the server source snapshot.",
+      "local": null,
+      "server": {
+        "sha256": "3ed731b65d06150c138e2dadb0be0697550888a6b47eb8c45ecc9adba8b8e9bd",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/.pytest_cache/CACHEDIR.TAG",
+      "source_difference": "server_only",
+      "decision": "excluded_cache",
+      "reason": "Runtime test cache, retained only in the server source snapshot.",
+      "local": null,
+      "server": {
+        "sha256": "37dc88ef9a0abeddbe81053a6dd8fdfb13afb613045ea1eb4a5c815a74a3bde4",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/.pytest_cache/README.md",
+      "source_difference": "server_only",
+      "decision": "excluded_cache",
+      "reason": "Runtime test cache, retained only in the server source snapshot.",
+      "local": null,
+      "server": {
+        "sha256": "73fd6fccdd802c419a6b2d983d6c3173b7da97558ac4b589edec2dfe443db9ad",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/.pytest_cache/v/cache/lastfailed",
+      "source_difference": "server_only",
+      "decision": "excluded_cache",
+      "reason": "Runtime test cache, retained only in the server source snapshot.",
+      "local": null,
+      "server": {
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/.pytest_cache/v/cache/nodeids",
+      "source_difference": "server_only",
+      "decision": "excluded_cache",
+      "reason": "Runtime test cache, retained only in the server source snapshot.",
+      "local": null,
+      "server": {
+        "sha256": "e6062d6b8a22f3c8e32033128366cbfdd75a39e2c761288f4433698a4f1852c6",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/test_data.py",
+      "source_difference": "both",
+      "decision": "merged",
+      "reason": "Union local and server tests, plus critical-phase replay regressions.",
+      "local": {
+        "sha256": "647412a1e8a9809ab8ed3f9d6b8d8a4a56fb5050214249d3272fecd30c61646c",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "a3092fe827d1136fa26896bf50f068893c39900d172ffc8d46298d61b8a73d0d",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "15e92b51281fbbd2719d9d28ec13b454ce3855c54af70f95daf0bc5607ad5773",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/unit_tests/test_evo_lr_scheduler.py",
+      "source_difference": "server_only",
+      "decision": "folded_into_existing_test",
+      "reason": "Server scheduler cases live in tests/unit_tests/test_fsdp.py.",
+      "local": null,
+      "server": {
+        "sha256": "a6054ddcef067412b5d4bd7160176566888e19890b71b48231949283565b65c5",
+        "symlink": null
+      },
+      "merged": null
+    },
+    {
+      "path": "tests/unit_tests/test_models.py",
+      "source_difference": "both",
+      "decision": "merged",
+      "reason": "Union local and server tests, plus route warmup and non-Piper augmentation regressions.",
+      "local": {
+        "sha256": "9e8d2c218082bfd17972e40fa06876aac729889d90611d881c4156df183d626a",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "1e7681d3764eeae4a897b8eaf05044f8cb71f3b9369153677821a1f24d09f2d6",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "db7b3c97805b6de6114ff8d67c9be18308b4461a77e28780c04af80d23fe95e4",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/unit_tests/test_piper_evaluation.py",
+      "source_difference": "local_only",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "3a24701c8309a6e4989328f62c5c7e44df9ea3f2f9e29b885f439268c4e3ec85",
+        "symlink": null
+      },
+      "server": null,
+      "merged": {
+        "sha256": "3a24701c8309a6e4989328f62c5c7e44df9ea3f2f9e29b885f439268c4e3ec85",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/unit_tests/test_piper_reset.py",
+      "source_difference": "local_only",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "f4e67742809a6af70df5ecef82209abfc1c2b42d500f1d98866190f50d454bc1",
+        "symlink": null
+      },
+      "server": null,
+      "merged": {
+        "sha256": "f4e67742809a6af70df5ecef82209abfc1c2b42d500f1d98866190f50d454bc1",
+        "symlink": null
+      }
+    },
+    {
+      "path": "tests/unit_tests/test_robotics.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "e13f706579fa26c3b36b0529439da41a7ddebeefa5b8aa5a791b8fbb838b7a14",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "691b180a3e3c50af806868cf16fd396871cc87d24b69a8ea9c9ea085b8acafb6",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "e13f706579fa26c3b36b0529439da41a7ddebeefa5b8aa5a791b8fbb838b7a14",
+        "symlink": null
+      }
+    },
+    {
+      "path": "toolkits/lerobot/select_piper_success.py",
+      "source_difference": "server_only",
+      "decision": "server",
+      "reason": "Keep server training adaptation; only lint/format adjustments where needed.",
+      "local": null,
+      "server": {
+        "sha256": "fcdc2733e2b631dc67254fa1bfa4ca925c17e392a196ccb1de7f126bd420529b",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "fcdc2733e2b631dc67254fa1bfa4ca925c17e392a196ccb1de7f126bd420529b",
+        "symlink": null
+      }
+    },
+    {
+      "path": "toolkits/piper/run_policy.py",
+      "source_difference": "both",
+      "decision": "local",
+      "reason": "Preserve local Piper deployment, hardware identity, evaluation, and associated docs/tests; server change is older or formatting-only.",
+      "local": {
+        "sha256": "f5f2f81d6b31bac63baae1bbfd855d5c4ed2cb501d0047939e7571fd11ee1f6c",
+        "symlink": null
+      },
+      "server": {
+        "sha256": "d72930c8412e767f2278ae893a17d6b6da5587323a3f0f17b40f92c92c7eb983",
+        "symlink": null
+      },
+      "merged": {
+        "sha256": "f5f2f81d6b31bac63baae1bbfd855d5c4ed2cb501d0047939e7571fd11ee1f6c",
+        "symlink": null
+      }
+    }
+  ],
+  "integration_changes": [
+    {
+      "path": "rlinf/algorithms/rlt/route.py",
+      "merged": {
+        "sha256": "f8c63faea13665154f2bc3d9873ee3ef8fc36b2a34f4b31c8c592c6642c2ab0b",
+        "symlink": null
+      },
+      "reason": "Honor configured learner warmup in realworld routing while recording critical-phase reference behavior."
+    },
+    {
+      "path": "rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py",
+      "merged": {
+        "sha256": "07fb047986d1c8e27a1925001f10cbc5e1524c1b38aefa47e123fa90bdc8d1bb",
+        "symlink": null
+      },
+      "reason": "Filter realworld replay by critical phase; preserve transition alignment; save H50 Stage 2 metadata binding."
+    },
+    {
+      "path": "examples/embodiment/config/piper_rlt_stage2.yaml",
+      "merged": {
+        "sha256": "21ee1d50fc2ce33e7ed8308a0ed58ab00cd4873e88b5c22fed801906b8c2c16d",
+        "symlink": null
+      },
+      "reason": "Opt in to critical-phase-only replay in existing H10 template."
+    },
+    {
+      "path": "rlinf/models/embodiment/openpi/pi0_config.py",
+      "merged": {
+        "sha256": "65115062737c654b89d22c3c86a6d3dfbec0dc1c7a308ab1c5276311a4221bbb",
+        "symlink": null
+      },
+      "reason": "Explicit spatial_augmentation default true."
+    },
+    {
+      "path": "rlinf/models/embodiment/openpi/pi0.py",
+      "merged": {
+        "sha256": "b30f4d221cb9c678c1863ff6142850e6ee9c753c6ef61aabb0e3fc91c0dd2f52",
+        "symlink": null
+      },
+      "reason": "Pass profile spatial augmentation setting through SFT preprocessing."
+    },
+    {
+      "path": "tests/unit_tests/test_fsdp.py",
+      "merged": {
+        "sha256": "3b1b05f94e478f07af494e4085c4eda1a7bf4f0fae1d1f20a4203af4a7de5960",
+        "symlink": null
+      },
+      "reason": "Integrate server evo_cosine regression cases into the component suite."
+    },
+    {
+      "path": "toolkits/piper/eval_stage1.sh",
+      "merged": {
+        "sha256": "116fd4d0cb2cb196df35461d61c2ee7fe42c9a9ff1007e96380e51b217606995",
+        "symlink": null
+      },
+      "reason": "Reproducible workstation entry point bound to verified H50 FP32 Stage 1 assets."
+    }
+  ],
+  "checkpoint": {
+    "ssh_host": "yiming-aliserver",
+    "ssh_port": 27,
+    "server_actor": "/home/yiming/workspace/code/piper_stage1_h50_fp32_20261002/runs/20261003_005027_gth59yud/piper_usb_rlt_stage1_h50_fp32_b64_60k/checkpoints/global_step_50000/actor",
+    "existing_local_actor": "/media/descfly/新加卷/Evo-RL/outputs/train/piper_usb_rlt_stage1_h50_fp32_b64_60k/20261003_005027_gth59yud/checkpoints/global_step_50000/actor",
+    "sha256": "4a646cad16ca969b845a730cf0477b04fb0f18434925ed6963eae053d1617309",
+    "checkpoint_id": "b1f2800f7b294b4c95834ad60e0ff23d",
+    "content": "Inference assets only; distributed optimizer and loader state stay on server.",
+    "verified_date": "2026-10-12"
+  },
+  "validation": {
+    "core_tests_passed": 91,
+    "hardware_mock_tests_passed": 84,
+    "gpu_inference_parity": {
+      "merged_code": "/home/descfly/code/rlinf_piper/rlinf/__init__.py",
+      "server_code": "/home/descfly/code/rlinf_piper/.merge_sources/server/rlinf/__init__.py",
+      "checkpoint_id": "b1f2800f7b294b4c95834ad60e0ff23d",
+      "checks": [
+        {
+          "frame": 0,
+          "max_abs_action_diff": 0.0
+        },
+        {
+          "frame": 0,
+          "max_abs_action_diff": 0.0
+        },
+        {
+          "frame": 1500,
+          "max_abs_action_diff": 0.0
+        },
+        {
+          "frame": 50000,
+          "max_abs_action_diff": 0.0
+        }
+      ],
+      "exact_equal": true
+    },
+    "original_local_source": {
+      "original_source": "/home/descfly/code/RLinf",
+      "verified_file_count": 2196,
+      "changed": [],
+      "unchanged": true
+    },
+    "real_robot_trials_run": 0,
+    "distributed_training_run": false,
+    "offline_warmup_status": "Design only; full trainer/readiness/resume interface not implemented.",
+    "server_source": {
+      "date": "2026-10-12",
+      "method": "rsync recursive checksum dry run over SSH port 27",
+      "server": "yiming-aliserver:/home/yiming/workspace/code/piper_stage1_h50_fp32_20261002/repo/",
+      "snapshot": "/home/descfly/code/rlinf_piper/.merge_sources/server",
+      "excluded": [
+        ".git",
+        "__pycache__",
+        "*.pyc"
+      ],
+      "differences": [
+        ".ruff_cache/ and its generated contents only"
+      ],
+      "source_code_matches": true
+    }
+  }
+}

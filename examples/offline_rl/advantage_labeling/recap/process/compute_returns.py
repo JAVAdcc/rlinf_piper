@@ -32,7 +32,7 @@ import logging
 import math
 import shutil
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import hydra
@@ -44,6 +44,12 @@ from tqdm import tqdm
 
 # Make the rlinf package importable regardless of the cwd the user launched from.
 sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+
+from rlinf.data.storage.lerobot.metadata import (
+    load_episode_outcomes,
+    load_task_descriptions,
+    parse_success,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,91 +114,83 @@ def get_episode_boundaries(episode_indices: np.ndarray) -> list[tuple[int, int, 
     return list(zip(ep_ids.tolist(), starts.tolist(), ends.tolist()))
 
 
-def _process_single_parquet(
-    pq_file: str,
+def _read_metadata_columns(pq_file: str) -> pa.Table:
+    """Read only the scalar columns needed for return computation."""
+    pf = pq.ParquetFile(pq_file)
+    available = set(pf.schema_arrow.names)
+    return pf.read(columns=[c for c in _READ_COLUMNS if c in available])
+
+
+def compute_returns_table(
+    table: pa.Table,
     dataset_type: str,
     gamma: float,
     failure_reward: float,
     tasks: dict[int, str],
-) -> pa.Table | None:
-    """Process a single parquet file: read only metadata columns, compute returns.
+    episode_outcomes: dict[int, bool] | None = None,
+) -> pa.Table:
+    """Compute complete episodes, including those split across v3 files.
 
-    Only reads episode_index, frame_index, is_success, task_index — no images.
-
-    Returns:
-        Arrow table with (episode_index, frame_index, return, reward, prompt)
-        columns, or None if the file is empty.
+    Explicit outcome labels take precedence over the success-only SFT default.
+    Rollout episodes must have either terminal is_success or episode metadata.
     """
-    file_size = Path(pq_file).stat().st_size
-    if file_size == 0:
-        raise RuntimeError(
-            f"Corrupted 0-byte parquet file: {pq_file}. "
-            "Please fix or remove this file before running compute_returns."
-        )
-
-    pf = pq.ParquetFile(pq_file)
-    available = set(pf.schema_arrow.names)
-    cols_to_read = [c for c in _READ_COLUMNS if c in available]
-
-    table = pq.read_table(pq_file, columns=cols_to_read)
-    n = table.num_rows
-    if n == 0:
-        return None
-
-    col_names = table.column_names
-
-    ep_indices = table.column("episode_index").to_numpy().astype(np.int64, copy=False)
-    frame_indices = table.column("frame_index").to_numpy().astype(np.int64, copy=False)
-    episodes = get_episode_boundaries(ep_indices)
-
-    is_success_col = None
-    if "is_success" in col_names:
-        is_success_col = table.column("is_success").to_pylist()
-    elif dataset_type != "sft":
-        raise ValueError(
-            f"Column 'is_success' not found in {pq_file}. "
-            f"Non-SFT datasets (dataset_type={dataset_type!r}) require 'is_success' "
-            "to correctly distinguish successful and failed episodes."
-        )
-
-    returns_arr = np.empty(n, dtype=np.float32)
-    rewards_arr = np.empty(n, dtype=np.float32)
-
-    for _, ep_start, ep_end in episodes:
-        ep_length = ep_end - ep_start
-
-        if dataset_type == "sft":
-            is_success = True
+    if dataset_type not in ("sft", "rollout"):
+        raise ValueError(f"Unknown dataset type: {dataset_type!r}")
+    if not np.isfinite(gamma) or not 0 <= gamma <= 1:
+        raise ValueError("gamma must be finite and in [0, 1].")
+    if not np.isfinite(failure_reward):
+        raise ValueError("failure_reward must be finite.")
+    table = table.sort_by(
+        [("episode_index", "ascending"), ("frame_index", "ascending")]
+    )
+    ep_indices = table["episode_index"].to_numpy().astype(np.int64)
+    frame_indices = table["frame_index"].to_numpy().astype(np.int64)
+    returns_arr = np.empty(len(table), dtype=np.float32)
+    rewards_arr = np.empty(len(table), dtype=np.float32)
+    outcomes = episode_outcomes or {}
+    success_values = (
+        table["is_success"].to_pylist() if "is_success" in table.column_names else None
+    )
+    for episode, start, end in get_episode_boundaries(ep_indices):
+        if not np.array_equal(frame_indices[start:end], np.arange(end - start)):
+            raise ValueError(
+                f"Episode {episode} has missing, duplicate or non-zero-start frame indices."
+            )
+        terminal = success_values[end - 1] if success_values is not None else None
+        if terminal is not None:
+            success = parse_success(terminal)
+            if episode in outcomes and outcomes[episode] != success:
+                raise ValueError(f"Conflicting success labels for episode {episode}.")
+        elif episode in outcomes:
+            success = outcomes[episode]
+        elif dataset_type == "sft":
+            success = True
         else:
-            is_success = bool(is_success_col[ep_end - 1])
-
-        ep_returns, ep_rewards = compute_returns_for_episode(
-            episode_length=ep_length,
-            is_success=is_success,
-            gamma=gamma,
-            failure_reward=failure_reward,
+            raise ValueError(
+                f"Episode {episode} needs is_success or metadata episode_success."
+            )
+        returns_arr[start:end], rewards_arr[start:end] = compute_returns_for_episode(
+            end - start, success, gamma, failure_reward
         )
-        returns_arr[ep_start:ep_end] = ep_returns
-        rewards_arr[ep_start:ep_end] = ep_rewards
 
-    if "task" in col_names:
-        prompts_list = [str(t) for t in table.column("task").to_pylist()]
-    elif "task_index" in col_names:
-        task_indices = table.column("task_index").to_pylist()
-        prompts_list = [tasks.get(int(idx), "perform the task") for idx in task_indices]
+    if "task" in table.column_names:
+        prompts = [str(value) for value in table["task"].to_pylist()]
+    elif "task_index" in table.column_names:
+        prompts = [
+            tasks.get(int(index), "perform the task")
+            for index in table["task_index"].to_pylist()
+        ]
     else:
-        prompts_list = ["perform the task"] * n
-
-    result = pa.table(
+        prompts = ["perform the task"] * len(table)
+    return pa.table(
         {
-            "episode_index": pa.array(ep_indices),
-            "frame_index": pa.array(frame_indices),
-            "return": pa.array(returns_arr),
-            "reward": pa.array(rewards_arr),
-            "prompt": pa.array(prompts_list, type=pa.string()),
+            "episode_index": ep_indices,
+            "frame_index": frame_indices,
+            "return": returns_arr,
+            "reward": rewards_arr,
+            "prompt": prompts,
         }
     )
-    return result
 
 
 def process_dataset(
@@ -243,60 +241,27 @@ def process_dataset(
     parquet_files = sorted(str(p) for p in data_dir.rglob("*.parquet"))
     logger.info(f"Found {len(parquet_files)} parquet files")
 
-    tasks: dict[int, str] = {}
-    tasks_path = output_path / "meta" / "tasks.jsonl"
-    if tasks_path.exists():
-        with open(tasks_path, "r") as f:
-            for line in f:
-                entry = json.loads(line.strip())
-                task_idx = entry.get("task_index", len(tasks))
-                task_desc = entry.get("task", "")
-                tasks[task_idx] = task_desc
-
-    # PyArrow releases GIL during I/O, so threads achieve true parallelism
-    result_tables: list[pa.Table] = []
-
-    effective_workers = min(num_workers, len(parquet_files))
-    if effective_workers <= 1:
-        for pq_file in tqdm(parquet_files, desc="Processing parquet files"):
-            tbl = _process_single_parquet(
-                pq_file, dataset_type, gamma, failure_reward, tasks
+    tasks = load_task_descriptions(output_path)
+    outcomes = load_episode_outcomes(output_path)
+    if not parquet_files:
+        raise ValueError(f"No parquet data found: {data_dir}")
+    # Read tiny metadata columns concurrently, then group globally: v3 file
+    # boundaries need not coincide with episode boundaries.
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(num_workers, len(parquet_files)))
+    ) as pool:
+        tables = list(
+            tqdm(
+                pool.map(_read_metadata_columns, parquet_files),
+                total=len(parquet_files),
             )
-            if tbl is not None:
-                result_tables.append(tbl)
-    else:
-        logger.info(f"Using {effective_workers} parallel threads")
-        futures = {}
-        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
-            for pq_file in parquet_files:
-                fut = pool.submit(
-                    _process_single_parquet,
-                    pq_file,
-                    dataset_type,
-                    gamma,
-                    failure_reward,
-                    tasks,
-                )
-                futures[fut] = pq_file
-
-            with tqdm(total=len(futures), desc="Processing parquet files") as pbar:
-                for fut in as_completed(futures):
-                    try:
-                        tbl = fut.result()
-                    except Exception as e:
-                        failed_file = futures[fut]
-                        raise RuntimeError(f"Failed to process {failed_file}") from e
-                    if tbl is not None:
-                        result_tables.append(tbl)
-                    pbar.update(1)
-
-    if not result_tables:
-        raise ValueError(
-            f"No data found in dataset: {output_path}. "
-            "All parquet files are empty or missing."
         )
-
-    combined = pa.concat_tables(result_tables)
+    table = pa.concat_tables(tables, promote_options="default")
+    if len(table) == 0:
+        raise ValueError(f"No data found in dataset: {output_path}")
+    combined = compute_returns_table(
+        table, dataset_type, gamma, failure_reward, tasks, outcomes
+    )
     sidecar_filename = f"returns_{tag}.parquet" if tag else "returns.parquet"
     sidecar_path = output_path / "meta" / sidecar_filename
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)

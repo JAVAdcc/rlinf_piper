@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 from pathlib import Path
@@ -27,7 +26,9 @@ try:  # lerobot >= 0.2 layout
     from lerobot.datasets.utils import hf_transform_to_torch
 except ModuleNotFoundError:  # lerobot < 0.2
     from lerobot.common.datasets.utils import hf_transform_to_torch
-from PIL import Image as PILImage
+
+from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch  # noqa: F401
+from rlinf.data.storage.lerobot.metadata import load_task_descriptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,6 @@ def cast_image_features(hf_dataset):
         hf_dataset.set_transform(hf_transform_to_torch)
 
     return hf_dataset
-
-
-def decode_image_struct_batch(batch: dict) -> dict:
-    """Decode Image-feature struct dicts before ``hf_transform_to_torch``."""
-    for key in list(batch.keys()):
-        vals = batch[key]
-        if vals and isinstance(vals[0], dict) and "bytes" in vals[0]:
-            batch[key] = [PILImage.open(io.BytesIO(v["bytes"])) for v in vals]
-    return hf_transform_to_torch(batch)
 
 
 def load_return_stats_from_dataset(
@@ -116,27 +108,3 @@ def load_returns_sidecar(
 
     logger.info(f"Loaded returns sidecar: {sidecar_path} ({len(sidecar)} episodes)")
     return sidecar
-
-
-def load_task_descriptions(dataset_path: str | Path) -> dict[int, str]:
-    """Load task descriptions from ``meta/tasks.jsonl`` or ``meta/tasks.parquet``."""
-    meta = Path(dataset_path) / "meta"
-    jsonl = meta / "tasks.jsonl"
-    if jsonl.exists():
-        tasks = {}
-        with open(jsonl, "r") as f:
-            for line in f:
-                if line.strip():
-                    data = json.loads(line.strip())
-                    tasks[data.get("task_index", len(tasks))] = data.get("task", "")
-        return tasks
-
-    parquet = meta / "tasks.parquet"
-    if parquet.exists():
-        import pandas as pd
-
-        df = pd.read_parquet(parquet)
-        if "task_index" in df.columns and "task" in df.columns:
-            return {int(r["task_index"]): str(r["task"]) for _, r in df.iterrows()}
-
-    return {}

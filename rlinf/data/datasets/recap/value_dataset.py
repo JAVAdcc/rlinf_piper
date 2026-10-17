@@ -312,6 +312,18 @@ class ValueDataset(Dataset):
         robot = robot_type.lower()
 
         transforms_list = []
+        if robot == "piper":
+            from rlinf.models.embodiment.openpi.policies.piper_policy import PiperInputs
+
+            if action_dim < 7:
+                raise ValueError("Piper requires action_dim >= 7.")
+            return _openpi_transforms.compose(
+                [
+                    PiperInputs(),
+                    _openpi_transforms.InjectDefaultPrompt(default_prompt),
+                    _openpi_transforms.PadStatesAndActions(action_dim),
+                ]
+            )
         repack_keys = _REPACK_KEYS.get(robot)
         if repack_keys is None:
             raise ValueError(

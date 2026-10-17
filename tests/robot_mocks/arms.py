@@ -638,6 +638,7 @@ def pyagxarm() -> dict[str, types.ModuleType]:
         enables = True
         #: What get_firmware() reports; None models an arm that will not say.
         firmware_version = "S-V1.8-9"
+        accepts_motion_mode = True
 
         class OPTIONS:
             class EFFECTOR:
@@ -656,6 +657,10 @@ def pyagxarm() -> dict[str, types.ModuleType]:
             self._connected = False
             self.effector = None
             self.speed_percent = None
+            self.motion_mode = None
+            self.mode_feedback = 0xFF
+            self.auto_set_motion_mode_enabled = True
+            self.sent_modes = []
             self.sent: list[list[float]] = []
             self.cleared = 0
             self.enabled = False
@@ -710,9 +715,16 @@ def pyagxarm() -> dict[str, types.ModuleType]:
 
         def set_speed_percent(self, percent=100):
             self.speed_percent = percent
+            # The real SDK sends move_mode=0xFF; the deployed Piper reports it.
+            self.mode_feedback = 0xFF
 
         def set_motion_mode(self, motion_mode="p"):
             self.motion_mode = motion_mode
+            if self.accepts_motion_mode:
+                self.mode_feedback = 1 if motion_mode in ("j", "js") else 0
+
+        def set_auto_set_motion_mode_enabled(self, enabled):
+            self.auto_set_motion_mode_enabled = enabled
 
         def get_joint_angles(self):
             # Nothing is reported until the read thread runs.
@@ -726,11 +738,24 @@ def pyagxarm() -> dict[str, types.ModuleType]:
 
         def get_arm_status(self):
             status = types.SimpleNamespace(
-                ctrl_mode=1, arm_status=0, mode_feedback=1, motion_status=0
+                ctrl_mode=1,
+                arm_status=0,
+                mode_feedback=self.mode_feedback,
+                motion_status=0,
             )
             return Message(status) if self._connected else None
 
         def move_j(self, joints):
+            if self.auto_set_motion_mode_enabled:
+                self.set_motion_mode("j")
+            self.sent_modes.append(self.motion_mode)
+            self.sent.append(list(joints))
+            self.joints = list(joints)
+
+        def move_js(self, joints):
+            if self.auto_set_motion_mode_enabled:
+                self.set_motion_mode("js")
+            self.sent_modes.append(self.motion_mode)
             self.sent.append(list(joints))
             self.joints = list(joints)
 

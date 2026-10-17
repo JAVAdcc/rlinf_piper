@@ -116,6 +116,12 @@ class RLTRoute(ABC):
 class RealworldRLTRoute(RLTRoute):
     """Actor/ref routing for realworld RLT (keyboard or env switch flags)."""
 
+    def __init__(self, *, use_schedule: bool = False, warmup_updates: int = 0):
+        if warmup_updates < 0:
+            raise ValueError("RLT warmup_updates must be nonnegative.")
+        self.use_schedule = use_schedule
+        self.warmup_updates = warmup_updates
+
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
         result = ctx.result
@@ -124,11 +130,14 @@ class RealworldRLTRoute(RLTRoute):
             ctx.rlt_switch_flags,
             default=ctx.default_actor_switch,
         )
+        actor_switch = rlt_switch_flags
+        if self.use_schedule and int(ctx.version) < self.warmup_updates:
+            actor_switch = torch.zeros_like(rlt_switch_flags)
         ref_actions = result["forward_inputs"]["ref_chunk"].to(
             device=actions.device, dtype=actions.dtype
         )
         routed_actions = torch.where(
-            rlt_switch_flags,
+            actor_switch,
             actions,
             ref_actions[:, : actions.shape[1], : actions.shape[2]],
         ).contiguous()
@@ -138,9 +147,11 @@ class RealworldRLTRoute(RLTRoute):
         result["forward_inputs"]["record_transition"] = rlt_switch_flags.reshape(
             actions.shape[0], -1
         )[:, :1].to(torch.bool)
-        result["forward_inputs"]["actor_switch"] = result["forward_inputs"][
-            "record_transition"
-        ]
+        # Critical-phase reference actions also train the warmup critic/actor.
+        # Recording must not depend on permission to execute the learned actor.
+        result["forward_inputs"]["actor_switch"] = actor_switch.reshape(
+            actions.shape[0], -1
+        )[:, :1].to(torch.bool)
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
@@ -227,14 +238,6 @@ class SimulatorRLTRoute(RLTRoute):
                 routed_actions,
             ).contiguous()
             intervene_flags[expert_takeover] = True
-            ref_chunk = forward_inputs["ref_chunk"]
-            ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
-            ref_actions[:, :chunk_len] = torch.where(
-                expert_takeover[:, None, None],
-                expert_actions,
-                ref_actions[:, :chunk_len],
-            )
-            forward_inputs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
 
         forward_inputs["action"] = _flatten_action_chunk(routed_actions).detach()
         forward_inputs["record_transition"] = critical_phase[:, None]
@@ -245,10 +248,13 @@ class SimulatorRLTRoute(RLTRoute):
 
 
 def build_rlt_route(cfg: Any) -> RLTRoute:
+    schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
     if use_simulator_transition_replay(cfg):
-        schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
         )
-    return RealworldRLTRoute()
+    return RealworldRLTRoute(
+        use_schedule=bool(schedule_cfg.get("enable", False)),
+        warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+    )

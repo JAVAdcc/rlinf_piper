@@ -1,0 +1,92 @@
+# Single-arm Evo-RL Piper smoke run; see the RECAP documentation.
+defaults:
+- model/recap_value_model@actor.model
+- hybrid_engines/fsdp@actor.fsdp_config
+- _self_
+- override hydra/job_logging: stdout
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+  - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+runner:
+  task_type: sft
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: piper_recap_value
+    logger_backends:
+    - tensorboard
+  max_epochs: -1
+  max_steps: 100
+  val_check_interval: -1
+  save_interval: 100
+data:
+  tag: piper
+  train_data_paths:
+  - dataset_path: ${oc.env:PIPER_DATA_PATH}
+    type: rollout
+    robot_type: piper
+    model_type: pi05
+    weight: 1.0
+  eval_data_paths: []
+  train_num_workers: 2
+  eval_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: false
+  include_state: true
+  gamma: 1.0
+  action_horizon: 10
+  normalize_to_minus_one_zero: true
+  include_next_obs: false
+  action_dim: 7
+  robot_type: piper
+  model_type: pi05
+  balance_weights: true
+  seed: 42
+algorithm:
+  adv_type: gae
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 8
+  seed: 0
+  model:
+    precision: bf16
+    siglip_path: ${oc.env:SIGLIP_MODEL_PATH}
+    gemma3_path: ${oc.env:GEMMA_MODEL_PATH}
+    tokenizer_path: ${oc.env:GEMMA_MODEL_PATH}
+    freeze_vlm: false
+    action_dim: 7
+    action_horizon: 10
+  optim:
+    lr: 5.0e-05
+    value_lr: 0.0001
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: constant
+    lr_warmup_steps: 10
+    total_training_steps: 100
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    use_orig_params: false
+    gradient_checkpointing: true
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false

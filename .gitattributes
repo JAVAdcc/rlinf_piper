@@ -1,0 +1,2 @@
+# Preserve the vendored model bytes for the source hash documented alongside it.
+rlinf/robotics/parts/teleop/assets/piper_no_gripper.urdf -text -whitespace

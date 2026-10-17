@@ -73,6 +73,8 @@ class PiperArm(BaseArm):
             cannot be reached to ask. Pin it with ``"default"`` for S-V1.8-2
             and older, then ``"v183"``, ``"v188"``, ``"v189"``.
         speed_percent: Percentage of maximum speed for commanded motion.
+        high_follow: Use joint follower mode (J + MIT), as Evo-RL's Piper
+            follower does. False retains the planned joint motion mode.
         gripper_force: Gripping force in newtons, up to 3.0.
         gripper_max_width: Stroke at full opening, in metres. Set at the
             factory to either 0.07 or 0.1.
@@ -113,9 +115,11 @@ class PiperArm(BaseArm):
         model: str = "piper",
         firmware: Optional[str] = None,
         speed_percent: int = 30,
+        high_follow: bool = False,
         gripper_force: float = 1.0,
         gripper_max_width: float = 0.07,
         with_gripper: bool = True,
+        max_feedback_age_s: Optional[float] = None,
     ) -> None:
         self._logger = get_logger()
         self._channel = channel
@@ -124,9 +128,17 @@ class PiperArm(BaseArm):
         self._model = model
         self._firmware = firmware
         self._speed_percent = int(np.clip(speed_percent, 1, 100))
+        if not isinstance(high_follow, bool):
+            raise ValueError("high_follow must be a boolean.")
+        self._high_follow = high_follow
         self._gripper_force = float(np.clip(gripper_force, 0.0, 3.0))
         self._gripper_max_width = float(gripper_max_width)
         self._with_gripper = with_gripper
+        if max_feedback_age_s is not None and (
+            not np.isfinite(max_feedback_age_s) or max_feedback_age_s <= 0
+        ):
+            raise ValueError("max_feedback_age_s must be positive and finite.")
+        self._max_feedback_age_s = max_feedback_age_s
         self._robot: Any = None
         self._gripper: Any = None
         self._limits_lower = self.JOINT_LIMITS_LOWER
@@ -164,13 +176,20 @@ class PiperArm(BaseArm):
                 "model",
                 "firmware",
                 "speed_percent",
+                "high_follow",
                 "gripper_force",
                 "gripper_max_width",
                 "with_gripper",
+                "max_feedback_age_s",
             )
             if key in placement
         }
         return cls(address, **settings, **placement)
+
+    @property
+    def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return copies of this variant's lower and upper joint limits in radians."""
+        return self._limits_lower.copy(), self._limits_upper.copy()
 
     @property
     def action_features(self) -> Features:
@@ -210,8 +229,19 @@ class PiperArm(BaseArm):
             robot.connect()
             self._robot = robot
             self._adopt_joint_limits(config)
+            if self._high_follow:
+                # Evo-RL sends MotionCtrl_2(1, 1, speed, 0xAD) before enabling.
+                # JS is this joint-follower mode; plain MIT is torque control.
+                robot.set_speed_percent(self._speed_percent)
+                robot.set_motion_mode("js")
+                robot.set_auto_set_motion_mode_enabled(False)
             self._enable(robot)
             robot.set_speed_percent(self._speed_percent)
+            if self._high_follow:
+                # set_speed_percent sends move_mode=0xFF. This firmware reports
+                # that value back and ignores joint targets until J is restored.
+                robot.set_motion_mode("js")
+                self._await_joint_mode(robot)
             self._await_feedback(robot)
         except BaseException:
             self._release(self._robot)
@@ -298,6 +328,28 @@ class PiperArm(BaseArm):
                 )
             time.sleep(self.POLL_S)
 
+    def _await_joint_mode(self, robot: Any) -> None:
+        """Require CAN joint-mode feedback before submitting follower targets."""
+        deadline = time.monotonic() + self.FEEDBACK_TIMEOUT_S
+        actual = None
+        while True:
+            reading = robot.get_arm_status()
+            if reading is not None:
+                status = reading.msg
+                actual = (status.ctrl_mode, status.mode_feedback, status.arm_status)
+                if actual == (1, 1, 0):
+                    self._logger.info(
+                        "Piper acknowledged CAN joint mode (ctrl=1, mode=1, status=0)"
+                    )
+                    return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Piper did not acknowledge CAN joint mode; "
+                    f"(ctrl_mode, mode_feedback, arm_status)={actual}. "
+                    "No policy target was sent."
+                )
+            time.sleep(self.POLL_S)
+
     def _await_feedback(self, robot: Any) -> None:
         """Wait for the first joint frame, so a read never starts empty.
 
@@ -356,6 +408,10 @@ class PiperArm(BaseArm):
                 "The CAN feed was live when it connected, so check the bus and "
                 "that the arm is still powered."
             )
+        if self._max_feedback_age_s is not None:
+            age = time.time() - reading.timestamp
+            if not np.isfinite(age) or not 0 <= age <= self._max_feedback_age_s:
+                raise RuntimeError(f"Stale Piper {what} feedback (age={age:.3f}s).")
         return reading.msg
 
     def _tcp_pose(self) -> np.ndarray:
@@ -405,8 +461,8 @@ class PiperArm(BaseArm):
                 f"{target.shape}."
             )
         target = np.clip(target, self._limits_lower, self._limits_upper)
-        # move_j selects joint mode itself.
-        self._robot.move_j([float(value) for value in target])
+        move = self._robot.move_js if self._high_follow else self._robot.move_j
+        move([float(value) for value in target])
         return target
 
     def move_gripper(self, target: "Sequence[float]") -> None:
@@ -442,6 +498,38 @@ class PiperArm(BaseArm):
         """
         self.move_joints(positions)
         self.wait_until_still(duration)
+
+    def prepare_for_reset(self) -> None:
+        """Reassert position control and enable in-session, as Evo-RL does."""
+        if self._robot is None:
+            raise RuntimeError("Connect Piper before preparing a reset.")
+        status = self._require("arm status", self._robot.get_arm_status())
+        if status.ctrl_mode == 2:
+            raise RuntimeError(
+                "Piper is in teaching mode; restore follower mode before resetting."
+            )
+        if status.arm_status != 0:
+            raise RuntimeError(
+                f"Piper controller fault before reset: {status.arm_status}."
+            )
+        held = self._joint_reading()
+        if held.shape != (6,) or not np.isfinite(held).all():
+            raise ValueError("Cannot prepare reset without six finite joint readings.")
+        self._robot.set_speed_percent(self._speed_percent)
+        self._robot.set_motion_mode("js" if self._high_follow else "j")
+        self.move_joints(held)
+        self._enable(self._robot)
+        self._await_joint_mode(self._robot)
+        self.check_reset_control()
+
+    def check_reset_control(self) -> None:
+        """Fail on missing/stale status, control-mode drift, or controller fault."""
+        if self._robot is None:
+            raise RuntimeError("Piper reset session is disconnected.")
+        status = self._require("arm status", self._robot.get_arm_status())
+        actual = (status.ctrl_mode, status.mode_feedback, status.arm_status)
+        if actual != (1, 1, 0):
+            raise RuntimeError(f"Piper reset control/status fault: {actual}.")
 
     def clear_errors(self) -> None:
         """Clear latched joint faults, without cutting motor power."""

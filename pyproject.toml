@@ -77,6 +77,11 @@ Documentation = "https://rlinf.readthedocs.io/"
 "Bug Report" = "https://github.com/RLinf/RLinf/issues"
 
 [project.optional-dependencies]
+piper-hil = [
+    "numpy>=1.26,<2",
+    "pin==2.7.0",
+    "piper_sdk @ git+https://github.com/Reimagine-Robotics/piper_sdk.git@83814f1d38d764dc4e2cf144396ff03fae1e5311",
+]
 agentic = [
     "numpy==2.2",
     # uvloop is not compatible with simulators, put it here
@@ -102,6 +107,7 @@ embodied = [
 
 [tool.uv]
 conflicts = [
+    [{ extra = "agentic" }, { extra = "piper-hil" }],
     [
       { extra = "agentic" },
       { extra = "embodied" }
@@ -132,7 +138,7 @@ include = ["rlinf*"]
 exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
 
 [tool.setuptools.package-data]
-rlinf = ["**/*.yaml", "**/*.yml"]
+rlinf = ["**/*.yaml", "**/*.yml", "robotics/parts/teleop/assets/*.urdf"]
 
 [tool.ruff]
 line-length = 88

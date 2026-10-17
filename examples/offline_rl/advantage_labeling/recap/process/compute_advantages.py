@@ -27,7 +27,6 @@ Usage:
 """
 
 import gc
-import json
 import logging
 import os
 
@@ -255,7 +254,7 @@ def load_lerobot_dataset(
     Returns:
         Tuple of (dataset, tasks_dict, metadata, returns_sidecar)
     """
-    meta = LeRobotDatasetMetadata(str(dataset_path))
+    meta = LeRobotDatasetMetadata(dataset_path.name, root=dataset_path)
 
     logger.info(f"Dataset features: {list(meta.features.keys())}")
 
@@ -288,20 +287,15 @@ def load_lerobot_dataset(
     logger.info(f"  FPS: {meta.fps}")
 
     dataset = LeRobotDataset(
-        str(dataset_path),
+        dataset_path.name,
+        root=dataset_path,
         download_videos=False,
     )
     dataset.hf_dataset.set_transform(decode_image_struct_batch)
 
-    tasks = {}
-    tasks_path = dataset_path / "meta" / "tasks.jsonl"
-    if tasks_path.exists():
-        with open(tasks_path, "r") as f:
-            for line in f:
-                entry = json.loads(line.strip())
-                task_idx = entry.get("task_index", len(tasks))
-                task_desc = entry.get("task", "")
-                tasks[task_idx] = task_desc
+    from rlinf.data.storage.lerobot.metadata import load_task_descriptions
+
+    tasks = load_task_descriptions(dataset_path)
 
     logger.info(
         f"Loaded dataset: {len(dataset)} samples, {meta.total_episodes} episodes"
@@ -325,6 +319,13 @@ def build_obs(
     Returns:
         Raw observation dict compatible with ValueCriticModel.infer()
     """
+    if robot_type == "piper":
+        # Keep source units/keys; the checkpoint applies PiperInputs once.
+        obs = dict(sample)
+        if obs.get("task") is None and obs.get("prompt") is None:
+            task_index = int(to_scalar(sample["task_index"]))
+            obs["prompt"] = tasks[task_index]
+        return obs
     if robot_type not in KEY_MAPPINGS:
         raise ValueError(
             f"Unknown robot_type {robot_type!r}. "

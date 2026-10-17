@@ -637,6 +637,35 @@ def get_lr_scheduler(
             min_lr_rate=min_lr_rate,
             min_lr=min_lr,
         )
+    elif lr_scheduler == "evo_cosine":
+        # Match Evo-RL's CosineDecayWithWarmupSchedulerConfig. Here
+        # num_training_steps denotes the decay endpoint, independently of the
+        # runner's total updates. Evo uses absolute step / decay_steps (it does
+        # not subtract warmup) and holds min_lr after the endpoint.
+        from torch.optim.lr_scheduler import LambdaLR
+
+        if num_training_steps <= 0 or not 0 <= num_warmup_steps < num_training_steps:
+            raise ValueError("evo_cosine requires 0 <= warmup < positive decay steps")
+        base_lr = optimizer.param_groups[0]["lr"]
+        if base_lr <= 0:
+            raise ValueError("evo_cosine requires a positive peak learning rate")
+        min_mult = min_lr_rate if min_lr_rate is not None else min_lr / base_lr
+        if not 0 <= min_mult <= 1:
+            raise ValueError(
+                "evo_cosine minimum learning rate must be between 0 and peak"
+            )
+
+        def lr_lambda(current_step):
+            if current_step < num_warmup_steps:
+                if current_step <= 0:
+                    return 1.0 / (num_warmup_steps + 1)
+                frac = 1.0 - current_step / num_warmup_steps
+                return (1.0 / (num_warmup_steps + 1) - 1.0) * frac + 1.0
+            step = min(current_step, num_training_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * step / num_training_steps))
+            return (1.0 - min_mult) * cosine + min_mult
+
+        return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
     elif lr_scheduler in ("openpi_cosine", "ref_warmup_cosine"):
         # Warmup starts at peak/(warmup+1) (not 0), ramps linearly to the peak at
         # `num_warmup_steps`, then cosine-decays to `min_lr` over the remaining

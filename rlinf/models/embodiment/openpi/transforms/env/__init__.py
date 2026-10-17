@@ -28,6 +28,17 @@ def repack_env_obs(
     select_state: Callable,
 ) -> dict:
     """Map an env observation dict to ``observation/*`` keys for ``config_name``."""
+    if config_name in ("pi05_piper", "pi05_piper_h50_state"):
+        extra = env_obs["extra_view_images"]
+        if extra.shape[1] != 2:
+            raise ValueError("Piper requires front_2 and wrist as its two extra views.")
+        return {
+            "observation.state": select_state(env_obs["states"]),
+            "observation.images.front": env_obs["main_images"],
+            "observation.images.front_2": extra[:, 0],
+            "observation.images.wrist": extra[:, 1],
+            "prompt": env_obs["task_descriptions"],
+        }
     if "calvin" in config_name:
         return calvin.repack_env_obs(env_obs, select_state=select_state)
     return default.repack_env_obs(env_obs, select_state=select_state)

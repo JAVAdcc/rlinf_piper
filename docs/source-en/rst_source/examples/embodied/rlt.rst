@@ -811,7 +811,7 @@ The RL Token training result on the peg_insertion task in RLinf is shown below.
    </div>
 
 Practical Notes
----------------
+--------------------------------------------------------------------------------
 
 - Keep Stage 1 and Stage 2 data settings consistent: ``repo_id``,
   ``config_name``, ``action_dim``, ``proprio_dim``, ``ref_num_action_chunks``,
@@ -840,3 +840,127 @@ Practical Notes
 - To add a simulator example, create a simulator environment config, keep
   ``loss_type: rlt_ac`` and ``rollout.rlt_feature_model``, and replace the
   real-robot phase-switching logic with simulator-appropriate behavior.
+
+Use Evo-RL Piper Data and Local Hardware
+--------------------------------------------------------------------------------
+
+Single-arm Piper follows the native RLinf RLT pipeline: train Stage 1 on LeRobot v3 recordings, then freeze it and update the Stage 2 actor/critic from online experience. The ``piper_rlt_stage1`` and ``piper_rlt_stage2`` recipes reuse the existing RLT models, learner, and replay path. RECAP value training and advantage labeling are separate workflows.
+
+Prepare Stage 1 Data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use LeRobot 0.4.4 in the RLinf OpenPI environment. The preparer expects seven absolute targets (six joint angles in degrees and gripper width in millimetres), the corresponding state layout, and three RGB views named ``front / front_2 / wrist`` or ``base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb``. It copies metadata, links trajectories and videos, and computes normalization in model units using ten-step action windows.
+
+.. code-block:: bash
+
+   export REPO_PATH="$PWD"
+   export PIPER_DATA_PATH=/path/to/prepared/piper_rlt
+   python -m toolkits.lerobot.prepare_piper \
+     --source /path/to/Evo-RL/data/usb_new_merged \
+     --output "$PIPER_DATA_PATH"
+   export PI05_MODEL_PATH=/path/to/pi05_base_pytorch
+   bash examples/sft/run_vla_sft.sh piper_rlt_stage1
+
+Choose a new output directory. When transferring it to a server, copy the actual trajectory/video files or recreate valid links there. Curate suitable demonstrations for a full run: format compatibility does not make failed recorded actions good SFT targets. The initial recipe runs 100 steps to exercise training; adjust the step count and optimizer schedule for experiments.
+
+Add ``--interactive --num-episodes 20`` to the local rollout command to evaluate
+20 trials. Keep the terminal focused. Tap Right to start each trial (including
+the first), then press ``s`` for success or ``f`` for failure without Enter.
+Scoring stops new targets; the arm holds its last target while the operator
+restores the scene. By default, no reset trajectory or motor release is performed. Keys
+entered during synchronous inference are handled before the next target is sent.
+
+``--steps`` caps actions per trial. At the limit, wait for a manual score rather
+than counting a failure. Model and hardware connections are reused. Each
+``episode_001/`` directory contains its trace, result, and optionally observations.
+``summary.json`` is updated after each trial; success rate uses only scored trials.
+Ctrl-C or a fault aborts evaluation and preserves partial results. Unscored,
+interrupted, and faulted trials are excluded. ``--no-action-limits`` applies to
+all trials when supplied.
+
+Add ``--reset-after-episode initial`` to capture the pose immediately before the
+first trial and return after every score, including the last. The sequence opens
+the gripper, returns the joints, then restores its initial opening. Select
+``zero`` for zero joints and a closed gripper, or ``none`` (default) for no reset.
+Connections remain open. The implementation follows Evo-RL's
+``_move_robot_to_zero_pose`` and ``prepare_for_reset``: reassert joint control,
+confirm motor enable, then linearly interpolate from measured position.
+``--reset-duration-s`` defaults to 3 seconds and
+``--reset-gripper-duration-s`` to 0.5 seconds for each gripper stage.
+Each tick includes its I/O time; slow ticks do not cause catch-up bursts.
+The former 5-degree start-recovery gate is removed. Sent targets still use the
+driver's original travel clipping; controller status, fresh feedback and finite
+value checks remain. Controller faults are not automatically cleared. Leaders,
+teaching mode and camera/CAN connection ownership are unchanged.
+
+``trajectory_sent`` means transmission completed, not verified physical arrival.
+Final measured pose and error are recorded in ``result.json`` and ``reset.jsonl``.
+Check the pose and restore the scene before the next Right press. The fixed
+return target is saved in ``reset_pose.json``. Reset-time keys are discarded.
+If reset faults, the score is saved and connections remain open: resolve the
+fault, then press ``r`` to retry reset, or ``q`` / Ctrl-C to exit. Right cannot
+skip a failed reset. Retries do not duplicate scores and have separate logs
+such as ``reset_retry_02.jsonl``. Other rollout faults still end evaluation.
+
+
+Each Stage 1 full checkpoint includes ``piper_inference.json`` and ``assets/piper/norm_stats.json`` under ``actor/``. Download the complete actor directory, preserving the VLA and ``rlt_module.*`` tensors in ``model_state_dict/full_weights.pt``. The metadata carries model settings, dataset frame rate, and normalization validation information, so local inference does not depend on server-side model/data paths. OpenPI tokenizer resources are still required: allow the initial download or prepare their cache on an offline machine.
+
+The local loader supports ``pi05_piper`` (10-step horizon, no discrete state
+prompt) and ``pi05_piper_h50_state`` (50-step horizon, discrete state input).
+It selects the observation transforms and normalized RLT action branch using
+the checkpoint configuration. Keep the exported ``piper_inference.json``
+configuration name unchanged.
+
+Check Recorded Inputs and Run Locally
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Start with the frozen Stage 1 reference policy on one recorded observation. This command reads the dataset and saves predictions without opening cameras or CAN:
+
+.. code-block:: bash
+
+   export PIPER_STAGE1_PATH=/path/to/downloaded/stage1/actor
+   python -m toolkits.piper.run_policy infer \
+     --checkpoint "$PIPER_STAGE1_PATH" \
+     --dataset "$PIPER_DATA_PATH" --frame 0
+
+Each invocation creates a fresh result directory containing arguments, the observation, and ``prediction.json``. For physical rollout, set the follower USB CAN serial, camera USB identities, and gripper stroke in ``examples/embodiment/config/piper_usb_hardware.yaml``. The example selects each RGB capture node by USB serial and interface: Gemini 335 uses interface ``04``, while its depth interface is ``00``. This avoids ambiguous device aliases after USB re-enumeration. Explicit ``index_or_path`` camera paths remain supported as an alternative to USB identity. Cameras must retain their training placement. The example enables ``reset_on_connect`` for the two Gemini cameras to recover color streaming between runs. Before capture, it checks that the selected USB/video nodes are idle, resets only those cameras, and resolves their RGB nodes again; it requires ``fuser``, ``usbreset``, ``udevadm``, and USB write permission. Wrist and CAN devices are not reset. All cameras must provide fresh frames before the follower connects. ``front_2`` is a second external view mapped into the model's left slot.
+
+.. code-block:: bash
+
+   python -m toolkits.piper.run_policy rollout \
+     --checkpoint "$PIPER_STAGE1_PATH" \
+     --hardware examples/embodiment/config/piper_usb_hardware.yaml \
+     --task "pick up the two USB cables and insert them into the USB port on the outlet." \
+     --steps 900 --save-observations
+
+The USB hardware example uses Evo-RL's USB inference settings: ``high_follow: true``, ``speed_percent: 100``, and ``gripper_force: 1.0``. pyAgxArm's ``move_js`` corresponds to ``MotionCtrl_2(1, 1, 100, 0xAD)`` followed by absolute joint targets. This is joint follower mode, not direct torque commands through ``move_mit``. The gripper's wire effort remains 1000. Generic ``PiperArm`` instances and hardware configurations without ``high_follow`` retain planned ``move_j`` commands. Local rollout and Stage 2 share this hardware construction path.
+
+This command enables the configured follower and starts sending policy targets without a homing trajectory. The loop follows Evo-RL's synchronous ``select_action`` queue: observe on each tick, predict when the queue is empty, send one target, then sleep only for the remaining tick budget. Observation, inference, logging, and submission all count toward that budget. Inference still introduces gaps; continuous 30 Hz is not guaranteed. By default, consume the full policy horizon before predicting again; override with ``--replan-steps``. The horizon is 10 for ``pi05_piper`` and 50 for ``pi05_piper_h50_state``; use the checkpoint configuration.
+
+The USB example sets ``execution.max_prediction_age_s: 3.0``. This bounds the total age since observation, including inference, recording and chunk playback, rather than inference alone. At 30 Hz, an H50 chunk needs about 1.67 seconds of playback in addition to inference; a 0.58-second first prediction can exceed the former 2-second limit before the chunk ends. Excessively old predictions still stop rollout, with elapsed time and chunk progress in the error.
+
+``--steps`` counts submitted targets; reaching it ends the run without judging task success. Match the task text to the dataset; the example text describes ``usb_light`` with two USB cables. Ctrl-C or a failure closes connections while motors retain the last target. The executor checks feedback freshness, joint travel, and per-command changes from measured positions. ``trace.jsonl`` contains diagnostics rather than an online replay dataset. ``--save-observations`` saves each prediction's three RGB views, raw state, and task to ``observations/step_*.npz`` and records the file path in the prediction trace for offline replay. Disk writes also count toward the tick budget.
+
+Follower mode is reasserted after the final speed setting. Target submission waits for feedback confirming CAN control, joint motion mode, and normal status. The SDK's speed setter sends a frame with motion mode ``0xFF``, so enabled motors alone do not confirm that joint control is ready.
+
+Add ``--no-action-limits`` to disable the rollout layer's extra target-range and per-command step checks. Piper's underlying driver still clips commands to mechanical travel; finite-value and stale-input checks remain active. The effective setting is saved in each run's ``hardware.yaml``.
+
+Run Native RLT Online Training
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``PiperPolicyEnv-v1`` supplies three RGB views and seven raw state values to frozen Stage 1. The feature model returns ``z_rl``, seven normalized ``proprio`` values, and normalized ``ref_chunk`` actions. Actor, critic, and replay share those normalized action coordinates. At execution, the environment uses Stage 1 statistics to recover absolute degrees/mm, then converts to driver radians and gripper opening fraction.
+
+.. code-block:: bash
+
+   bash examples/embodiment/run_realworld_async.sh piper_rlt_stage2
+
+The recipe runs existing RLT online workers on a single workstation connected to Piper. Set ``PIPER_STAGE1_PATH``, check the hardware configuration, and select ``RLINF_KEYBOARD_DEVICE`` as described in the keyboard documentation. Each episode waits for ``a`` to start with Stage 1 reference actions; ``b`` selects the Stage 2 actor, ``c`` reports success, and ``q`` reports failure. Successful termination yields reward 1; other rewards are 0. Timeout is a truncation. Reset waits for manual scene preparation and sends no reset trajectory; leader takeover is not connected. Actor/reference routing and transition recording retain native real-world RLT semantics.
+
+Stage 2 checkpoints include ``piper_rlt_actor.json`` bound to the Stage 1 identifier used in training. Add ``--actor /path/to/stage2/actor`` to either local command to evaluate the learned actor. Retain the corresponding Stage 1 directory; the loader rejects mismatched Stage 1/Stage 2 pairs.
+
+Shared Interfaces and Validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``PiperInputs / PiperOutputs`` share camera and unit conversion. ``PiperSession.observe()`` and ``execute()`` provide algorithm-independent local I/O. Other algorithms can reuse these interfaces but still need their own policy and learner integration. ``--backend cfg`` loads a RECAP/CFG checkpoint; that checkpoint cannot substitute for RLT Stage 1.
+
+Validation covers real dataset reading, training/online preprocessing agreement, checkpoint metadata relocation, native RLT actor routing, mock SDK execution and cleanup, and dummy environment episodes. Full GPU training, inference with real trained weights, and physical online-learning performance still require validation in the deployment environment.

@@ -1,0 +1,85 @@
+# Single-arm Evo-RL Piper smoke run; see the RECAP documentation.
+defaults:
+- model/pi0_5@actor.model
+- hybrid_engines/fsdp@actor.fsdp_config
+- _self_
+- override hydra/job_logging: stdout
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+  - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+runner:
+  task_type: sft
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: piper_recap_cfg
+    logger_backends:
+    - tensorboard
+  max_epochs: -1
+  max_steps: 100
+  val_check_interval: -1
+  save_interval: 100
+data:
+  num_workers: 2
+  advantage_tag: piper
+  balance_dataset_weights: true
+  seed: 42
+  train_data_paths:
+  - dataset_path: ${oc.env:PIPER_DATA_PATH}
+    type: rollout
+    weight: 1.0
+algorithm:
+  adv_type: gae
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 8
+  seed: 0
+  model:
+    precision: null
+    model_path: ${oc.env:PI05_MODEL_PATH}
+    model_type: cfg_model
+    add_value_head: false
+    openpi:
+      config_name: pi05_piper
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: true
+      guidance_type: positive
+      positive_only_conditional: true
+      num_images_in_input: 3
+    openpi_data:
+      norm_stats_path: ${oc.env:PIPER_DATA_PATH}/meta/norm_stats.json
+  optim:
+    lr: 1.0e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: cosine
+    lr_warmup_steps: 10
+    total_training_steps: 100
+    min_lr: 0.0
+  fsdp_config:
+    save_full_model_weights: true
+    strategy: fsdp
+    sharding_strategy: no_shard
+    use_orig_params: false
+    gradient_checkpointing: true
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false

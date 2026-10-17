@@ -140,6 +140,17 @@ class Pi0Eval(EnvIO, Pi0):
             prefix_mask,
             kv_cache,
         )
+        if self.config_name in ("pi05_piper", "pi05_piper_h50_state"):
+            # RLT's tanh actor and replay use normalized action coordinates.
+            # The Piper environment decodes them to absolute degrees/mm once.
+            return {
+                "z_rl": z_rl,
+                "proprio": observation.state[..., :7].to(dtype=torch.float32),
+                "ref_chunk": model_actions[:, : self.action_chunk, :7].to(
+                    dtype=torch.float32
+                ),
+            }
+
         ref_chunk = self.output_transform(
             {"actions": model_actions, "state": observation.state}
         )["actions"]

@@ -358,6 +358,14 @@ class RealWorldEnv(gym.Env):
                     intervene_action[env_id] = env_intervene_action.copy()
         infos["intervene_action"] = to_tensor(intervene_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
+        if "executed_action" in infos:
+            if not np.asarray(infos.get("_executed_action", True)).all():
+                raise ValueError(
+                    "Confirmed actions must be supplied by every environment."
+                )
+            infos["executed_action"] = to_tensor(
+                np.asarray(infos["executed_action"], dtype=actions.dtype)
+            )
         if "rlt_switch_flags" in infos:
             infos["rlt_switch_flags"] = to_tensor(
                 np.asarray(infos["rlt_switch_flags"], dtype=bool)
@@ -399,6 +407,7 @@ class RealWorldEnv(gym.Env):
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
         raw_chunk_rlt_switch_flags = []
+        raw_chunk_executed_actions = []
         self._notify_action_chunk_begin()
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
@@ -407,6 +416,8 @@ class RealWorldEnv(gym.Env):
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
+            if "executed_action" in infos:
+                raw_chunk_executed_actions.append(infos["executed_action"])
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
@@ -430,6 +441,14 @@ class RealWorldEnv(gym.Env):
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         infos_last = infos_list[-1] if infos_list else {}
+        if raw_chunk_executed_actions:
+            if len(raw_chunk_executed_actions) != chunk_size:
+                raise ValueError(
+                    "Confirmed actions must be supplied for every chunk slot."
+                )
+            infos_last["executed_action"] = torch.stack(
+                raw_chunk_executed_actions, dim=1
+            ).reshape(self.num_envs, -1)
         if raw_chunk_intervene_actions:
             infos_last["intervene_action"] = torch.stack(
                 raw_chunk_intervene_actions, dim=1

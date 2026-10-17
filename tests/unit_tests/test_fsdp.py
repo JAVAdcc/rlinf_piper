@@ -45,9 +45,15 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy
 
-from rlinf.hybrid_engines.fsdp.utils import apply_fsdp2_to_model, create_device_mesh
+from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.hybrid_engines.fsdp.utils import (
+    apply_fsdp2_to_model,
+    create_device_mesh,
+    get_lr_scheduler,
+)
 from rlinf.scheduler import Worker
 from rlinf.scheduler.cluster import Cluster
 
@@ -313,3 +319,55 @@ def test_a_model_can_keep_its_embeddings_in_the_enclosing_unit(single_rank_env):
     policy = _shard(policy)
 
     assert not isinstance(policy.block.head.table, FSDPModule)
+
+
+def _make_evo_scheduler():
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=2.5e-5)
+    cfg = OmegaConf.create(
+        {
+            "lr_scheduler": "evo_cosine",
+            "total_training_steps": 30000,
+            "lr_warmup_steps": 1000,
+            "min_lr": 2.5e-6,
+        }
+    )
+    scheduler = FSDPModelManager.build_lr_scheduler(None, optimizer, cfg)
+    return optimizer, scheduler
+
+
+def test_evo_scheduler_boundary_values_and_no_rebound():
+    _, scheduler = _make_evo_scheduler()
+    assert scheduler.get_last_lr()[0] == pytest.approx(2.5e-5 / 1001)
+    factor = scheduler.lr_lambdas[0]
+    # Absolute step 15000 is halfway through Evo's 30000-step cosine.
+    assert 2.5e-5 * factor(15000) == pytest.approx(1.375e-5)
+    assert factor(1000) < factor(999)  # Evo's small warmup/cosine boundary drop.
+    for step in (30000, 30001, 45000, 60000):
+        assert 2.5e-5 * factor(step) == pytest.approx(2.5e-6)
+    values = [factor(step) for step in range(1000, 60001)]
+    assert all(a >= b for a, b in zip(values, values[1:]))
+
+
+def test_evo_scheduler_state_restore_matches_next_update():
+    optimizer, scheduler = _make_evo_scheduler()
+    for _ in range(1003):
+        optimizer.step()
+        scheduler.step()
+    saved_optim, saved_scheduler = optimizer.state_dict(), scheduler.state_dict()
+    restored_optim, restored_scheduler = _make_evo_scheduler()
+    restored_optim.load_state_dict(saved_optim)
+    restored_scheduler.load_state_dict(saved_scheduler)
+    for _ in range(4):
+        optimizer.step()
+        scheduler.step()
+        restored_optim.step()
+        restored_scheduler.step()
+        assert restored_scheduler.get_last_lr() == scheduler.get_last_lr()
+        assert restored_scheduler.last_epoch == scheduler.last_epoch
+
+
+@pytest.mark.parametrize("warmup,decay", [(1000, 0), (1000, 1000), (-1, 30000)])
+def test_evo_scheduler_rejects_invalid_duration(warmup, decay):
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=2.5e-5)
+    with pytest.raises(ValueError, match="warmup"):
+        get_lr_scheduler("evo_cosine", optimizer, warmup, decay, min_lr=2.5e-6)

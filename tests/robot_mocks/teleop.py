@@ -22,6 +22,7 @@ Devices report an idle state by default. Tests can supply motion directly::
 
 from __future__ import annotations
 
+import time
 import types
 from typing import Any
 
@@ -254,6 +255,105 @@ def keyboard() -> types.ModuleType:
     )
 
 
+def piper_leader() -> types.ModuleType:
+    """Piper CAN SDK with fresh feedback, explicit mode and injected bus faults."""
+    fake = module("piper_sdk")
+    fake.devices = []
+
+    class Device:
+        def __init__(self, **kwargs):
+            self.config = kwargs
+            self.target = np.zeros(7)
+            self.commands = []
+            self.closed = True
+            self.stale = False
+            self.enable_ok = True
+            self.fail_mit = False
+            self.mode = None
+            self.gripper_enabled = True
+            self.bus_created = kwargs.get("can_auto_init", True)
+            fake.devices.append(self)
+
+        def CreateCanBus(
+            self,
+            can_name,
+            bustype="socketcan",
+            expected_bitrate=1000000,
+            judge_flag=False,
+        ):
+            self.bus_created = True
+            self.commands.append(
+                ("create_bus", (can_name, bustype, expected_bitrate, judge_flag))
+            )
+
+        def ConnectPort(self):
+            if not self.bus_created:
+                raise ValueError(
+                    "CreateCanBus must precede ConnectPort when can_auto_init=False"
+                )
+            self.closed = False
+
+        def DisconnectPort(self):
+            self.closed = True
+
+        def MasterSlaveConfig(self, *args):
+            self.commands.append(("role", args))
+
+        def MotionCtrl_2(self, *args):
+            self.mode = args
+            self.commands.append(("mode", args))
+
+        def JointCtrl(self, *args):
+            self.target[:6] = np.asarray(args) / 1000
+            self.commands.append(("position", args))
+
+        def GripperCtrl(self, position, effort, status, code):
+            self.target[6] = position / 1000
+            self.gripper_enabled = status in (1, 3)
+
+        def EnablePiper(self):
+            return self.enable_ok
+
+        def GetArmEnableStatus(self):
+            return [self.enable_ok] * 6
+
+        def GetArmJointMsgs(self):
+            return types.SimpleNamespace(
+                time_stamp=0 if self.stale else time.time(),
+                joint_state=types.SimpleNamespace(
+                    **{
+                        f"joint_{i + 1}": round(value * 1000)
+                        for i, value in enumerate(self.target[:6])
+                    }
+                ),
+            )
+
+        def GetArmGripperMsgs(self):
+            return types.SimpleNamespace(
+                time_stamp=0 if self.stale else time.time(),
+                gripper_state=types.SimpleNamespace(
+                    grippers_angle=round(self.target[6] * 1000)
+                ),
+            )
+
+        def GetArmHighSpdInfoMsgs(self):
+            return types.SimpleNamespace(
+                **{
+                    f"motor_{i}": types.SimpleNamespace(motor_speed=0)
+                    for i in range(1, 7)
+                }
+            )
+
+        def JointMitCtrl(self, *args):
+            if self.fail_mit:
+                raise OSError("Injected MIT bus fault")
+            self.commands.append(("torque", args))
+
+    fake.C_PiperInterface_V2 = Device
+    fake.LogLevel = types.SimpleNamespace(WARNING=30)
+    return fake
+
+
 def modules(**_: Any) -> dict[str, types.ModuleType]:
     """Return fake teleoperation SDKs keyed by import name."""
     zmq = vr()
@@ -263,6 +363,7 @@ def modules(**_: Any) -> dict[str, types.ModuleType]:
         # The transport imports the submodule name to catch its timeout.
         "zmq.error": zmq.error,
         "evdev": keyboard(),
+        "piper_sdk": piper_leader(),
     }
     made.update(gello())
     made.update(glove())

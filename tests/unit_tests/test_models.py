@@ -51,6 +51,202 @@ from rlinf.utils.env_helpers.delay_sampler import (
 )
 
 
+@pytest.mark.parametrize("parameter_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_openpi_stem_preserves_float32_values_gradients_and_checkpoint_keys(
+    parameter_dtype, with_bias
+):
+    from rlinf.models.embodiment.openpi.modules.siglip import Float32Conv2d
+
+    stem = Float32Conv2d(3, 8, kernel_size=2, stride=2, bias=with_bias).to(
+        parameter_dtype
+    )
+    reference = torch.nn.Conv2d(3, 8, kernel_size=2, stride=2, bias=with_bias).to(
+        parameter_dtype
+    )
+    reference.load_state_dict(stem.state_dict(), strict=True)
+    actual_input = torch.randn(2, 3, 8, 8, requires_grad=True)
+    reference_input = actual_input.detach().clone().requires_grad_(True)
+    actual = stem(actual_input)
+    expected = torch.nn.functional.conv2d(
+        reference_input.float(),
+        reference.weight.float(),
+        None if reference.bias is None else reference.bias.float(),
+        stride=reference.stride,
+        padding=reference.padding,
+    )
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    actual.square().mean().backward()
+    expected.square().mean().backward()
+    assert torch.equal(actual_input.grad, reference_input.grad)
+    for actual_parameter, reference_parameter in zip(
+        stem.parameters(), reference.parameters(), strict=True
+    ):
+        assert torch.equal(actual_parameter.grad, reference_parameter.grad)
+
+
+def test_openpi_siglip_forward_enters_stem_module_hooks(monkeypatch):
+    from rlinf.models.embodiment.openpi.modules import siglip
+
+    monkeypatch.setattr(
+        siglip,
+        "_decode_variant",
+        lambda _: {
+            "width": 8,
+            "depth": 1,
+            "num_heads": 2,
+            "mlp_dim": 16,
+            "patch_size": (14, 14),
+        },
+    )
+    vision = siglip.SigLIPViT()
+    entered = []
+    hook = vision.stem.register_forward_hook(lambda *_: entered.append(True))
+    try:
+        tokens, _ = vision(torch.randn(1, 224, 224, 3))
+        tokens.square().mean().backward()
+    finally:
+        hook.remove()
+    assert entered == [True]
+    assert tokens.shape == (1, 256, 8)
+    assert vision.stem.weight.grad is not None
+    assert torch.count_nonzero(vision.stem.weight.grad) > 0
+
+
+@pytest.mark.parametrize("train_expert_only", [False, True])
+def test_openpi_sft_factory_preserves_action_and_rlt_training(
+    tmp_path, train_expert_only
+):
+    """Exercise checkpoint loading and freezing without allocating model weights."""
+    from rlinf.models.embodiment.openpi import get_model as build_openpi
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+    from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+
+    with torch.device("meta"):
+        original = Pi0(
+            Pi0Config(pi05=True, action_horizon=10),
+            rlt_cfg=OpenPiPytorchRLTConfig(use_rlt=True),
+        )
+    torch.save(original.state_dict(), tmp_path / "full_weights.pt")
+    cfg = OmegaConf.create(
+        {
+            "model_path": str(tmp_path),
+            "precision": "fp32",
+            "action_dim": 7,
+            "num_action_chunks": 10,
+            "num_steps": 4,
+            "openpi": {
+                "task": "sft",
+                "train_expert_only": train_expert_only,
+                "use_rlt": True,
+                "torch_compile": False,
+                "action_horizon": 10,
+                "model_action_dim": 32,
+                "paligemma_variant": "gemma_2b",
+                "action_expert_variant": "gemma_300m",
+            },
+        }
+    )
+    with torch.device("meta"):
+        loaded = build_openpi(cfg)
+    loaded.train()
+    backbone = list(loaded.img.parameters()) + list(loaded.llm.embedder.parameters())
+    expert = []
+    for block in loaded.llm.layers:
+        for modules in (
+            block.pre_attention_norms,
+            block.pre_ffw_norms,
+            block.mlps,
+            block.attn.q_proj,
+            block.attn.k_proj,
+            block.attn.v_proj,
+            block.attn.o_proj,
+        ):
+            for index, destination in ((0, backbone), (1, expert)):
+                if modules[index] is not None:
+                    destination.extend(modules[index].parameters())
+    for index, destination in ((0, backbone), (1, expert)):
+        if loaded.llm.final_norms[index] is not None:
+            destination.extend(loaded.llm.final_norms[index].parameters())
+    for module in (
+        loaded.action_in_proj,
+        loaded.action_out_proj,
+        loaded.time_mlp_in,
+        loaded.time_mlp_out,
+        loaded.rlt_module,
+    ):
+        expert.extend(module.parameters())
+    assert backbone and expert
+    assert all(p.requires_grad == (not train_expert_only) for p in backbone)
+    assert all(p.requires_grad for p in expert)
+    assert {id(p) for p in backbone + expert} == {id(p) for p in loaded.parameters()}
+
+
+@pytest.mark.parametrize("precision", [None, "bf16", "fp32"])
+@pytest.mark.parametrize("checkpoint_format", ["pt", "safetensors"])
+def test_openpi_factory_loads_saved_values_after_final_storage_dtype_is_set(
+    tmp_path, monkeypatch, precision, checkpoint_format
+):
+    from safetensors.torch import save_file
+
+    from rlinf.models.embodiment.openpi import get_model as build_openpi
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    def small_model_init(self, config, **kwargs):
+        # Keep the real Pi0 dtype conversion and real factory/checkpoint loaders.
+        torch.nn.Module.__init__(self)
+        self.llm = torch.nn.Linear(3, 3)
+        self.img = torch.nn.Module()
+        self.img.stem = torch.nn.Linear(3, 3)
+        self.img.pos_embedding = torch.nn.Parameter(torch.empty(3))
+        self.img.projection = torch.nn.Linear(3, 3)
+        self.action_out_proj = torch.nn.Linear(3, 3)
+
+    monkeypatch.setattr(Pi0, "__init__", small_model_init)
+    source = Pi0(None)
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.copy_(
+                torch.linspace(0.1234567, 0.2345678, parameter.numel()).reshape_as(
+                    parameter
+                )
+            )
+    saved = source.state_dict()
+    if checkpoint_format == "pt":
+        torch.save(saved, tmp_path / "full_weights.pt")
+    else:
+        save_file(saved, tmp_path / "model.safetensors")
+    cfg = OmegaConf.create(
+        {
+            "model_path": str(tmp_path),
+            "precision": precision,
+            "action_dim": 7,
+            "num_action_chunks": 50,
+            "num_steps": 10,
+            "openpi": {
+                "task": "sft",
+                "use_rlt": False,
+                "torch_compile": False,
+                "train_expert_only": False,
+                "action_horizon": 50,
+                "model_action_dim": 32,
+                "paligemma_variant": "gemma_2b",
+                "action_expert_variant": "gemma_300m",
+            },
+        }
+    )
+    loaded = build_openpi(cfg)
+    for name, value in loaded.state_dict().items():
+        fp32 = precision == "fp32" or name.startswith(
+            ("img.stem.", "img.pos_embedding", "action_out_proj.")
+        )
+        expected_dtype = torch.float32 if fp32 else torch.bfloat16
+        assert value.dtype == expected_dtype, name
+        assert torch.equal(value, saved[name].to(expected_dtype)), name
+
+
 class _DummyModel:
     def __init__(self):
         self.device = None
@@ -1358,3 +1554,618 @@ def test_cosmos3_sglang_response_keeps_every_env_in_input_order():
     assert actions.shape == (2, 16, 7)
     assert torch.all(actions[0, :, 6] == -0.5)
     assert torch.all(actions[1, :, 6] == 0.5)
+
+
+def _piper_test_checkpoint(tmp_path, config_name="pi05_piper"):
+    import json
+
+    from rlinf.models.embodiment.piper_inference import save_piper_inference_assets
+
+    root = tmp_path / "actor"
+    (root / "model_state_dict").mkdir(parents=True)
+    torch.save(
+        {"rlt_module.weight": torch.ones(2)}, root / "model_state_dict/full_weights.pt"
+    )
+    stats = tmp_path / "norm_stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    key: {
+                        "mean": [0.0] * 7,
+                        "std": [1.0] * 7,
+                        "q01": [0.0] * 7,
+                        "q99": [1.0] * 6 + [0.07],
+                    }
+                    for key in ("state", "actions")
+                }
+            }
+        )
+    )
+    cfg = OmegaConf.create(
+        {
+            "model_type": "openpi",
+            "model_path": "/server/base",
+            "precision": "bf16",
+            "openpi": {"config_name": config_name, "task": "sft", "use_rlt": True},
+            "openpi_data": {"norm_stats_path": str(stats)},
+        }
+    )
+    save_piper_inference_assets(root, cfg, fps=30)
+    return root
+
+
+@pytest.mark.parametrize("config_name", ["pi05_piper", "pi05_piper_h50_state"])
+def test_piper_checkpoint_assets_survive_relocation_and_detect_mismatched_stats(
+    tmp_path,
+    config_name,
+):
+    import shutil
+
+    from rlinf.models.embodiment.piper_inference import load_piper_inference_config
+
+    root = _piper_test_checkpoint(tmp_path, config_name)
+    download = tmp_path / "download/actor"
+    shutil.copytree(root, download)
+    cfg, manifest = load_piper_inference_config(download.parent)
+    assert cfg.model_path == str(download)
+    assert manifest["fps"] == 30
+    assert cfg.openpi.config_name == config_name
+    assert cfg.openpi_data.norm_stats_path == str(
+        download / "assets/piper/norm_stats.json"
+    )
+    stats = download / "assets/piper/norm_stats.json"
+    stats.write_text(stats.read_text() + " ")
+    with pytest.raises(ValueError, match="Normalization does not match"):
+        load_piper_inference_config(download)
+
+
+def test_piper_rlt_actor_metadata_binds_the_exact_stage1(tmp_path):
+    import json
+
+    from rlinf.models.embodiment.piper_inference import (
+        load_piper_inference_config,
+        save_piper_rlt_actor_assets,
+    )
+
+    root = _piper_test_checkpoint(tmp_path)
+    actor_config = OmegaConf.create(
+        {
+            "model_type": "rlt_mlp_policy",
+            "z_dim": 8,
+            "proprio_dim": 7,
+            "action_dim": 7,
+            "num_action_chunks": 2,
+        }
+    )
+    save_piper_rlt_actor_assets(root, actor_config, root)
+    metadata = json.loads((root / "piper_rlt_actor.json").read_text())
+    _, manifest = load_piper_inference_config(root)
+    assert metadata["stage1_checkpoint_id"] == manifest["checkpoint_id"]
+    assert metadata["model"]["model_type"] == "rlt_mlp_policy"
+
+
+def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.models.embodiment.openpi.policies.piper_policy import PiperActionCodec
+    from rlinf.models.embodiment.piper_inference import PiperRLTPolicy
+
+    root = _piper_test_checkpoint(tmp_path)
+    codec = PiperActionCodec(root / "assets/piper/norm_stats.json")
+    features = {
+        "z_rl": torch.zeros(1, 8),
+        "proprio": torch.zeros(1, 7),
+        "ref_chunk": torch.zeros(1, 2, 7),
+    }
+
+    class FeatureModel:
+        def extract_rlt_obs(self, obs):
+            assert obs["extra_view_images"].shape == (1, 2, 8, 9, 3)
+            return features
+
+    policy = PiperRLTPolicy.__new__(PiperRLTPolicy)
+    policy.feature_model = FeatureModel()
+    policy.actor = RLTMLPPolicy(
+        z_dim=8, proprio_dim=7, action_dim=7, num_action_chunks=2
+    )
+    policy.actor.eval()
+    policy.codec = codec
+    policy.action_horizon = 2
+    sample = {"observation.state": np.zeros(7)}
+    for name in ("front", "front_2", "wrist"):
+        sample[f"observation.images.{name}"] = np.zeros((8, 9, 3), np.uint8)
+    expected, _ = policy.actor.predict_action_batch(features, mode="eval")
+    np.testing.assert_allclose(
+        policy.infer(sample, "insert USB"), codec.decode(expected[0].numpy()), atol=1e-5
+    )
+    policy.actor = None
+    np.testing.assert_allclose(
+        policy.infer(sample, "insert USB"), codec.decode(np.zeros((2, 7))), atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("config_name", ["pi05_piper", "pi05_piper_h50_state"])
+def test_piper_train_and_online_observation_transforms_agree(tmp_path, config_name):
+    from openpi.transforms import compose
+
+    from rlinf.models.embodiment.openpi.transforms.apply import apply_input_transform
+    from rlinf.models.embodiment.openpi.transforms.env import repack_env_obs
+    from rlinf.models.embodiment.openpi.transforms.pipeline import (
+        build_openpi_transforms,
+    )
+    from rlinf.models.embodiment.piper_inference import piper_env_observation
+
+    root = _piper_test_checkpoint(tmp_path, config_name)
+    kwargs = {"norm_stats_path": str(root / "assets/piper/norm_stats.json")}
+    inputs, _ = build_openpi_transforms(str(root), config_name, kwargs)
+    sample = {
+        "observation.state": np.array([0, 30, -30, 0, 0, 0, 35], np.float32),
+        "prompt": "insert USB",
+    }
+    for i, name in enumerate(("front", "front_2", "wrist")):
+        sample[f"observation.images.{name}"] = np.full((8, 9, 3), i * 50, np.uint8)
+    expected = compose(inputs)(sample.copy())
+    online = repack_env_obs(
+        config_name,
+        piper_env_observation(sample, "insert USB"),
+        select_state=lambda x: x,
+    )
+    actual = apply_input_transform(compose(inputs), online)
+    np.testing.assert_allclose(actual["state"][0], expected["state"])
+    for key in expected["image"]:
+        np.testing.assert_array_equal(actual["image"][key][0], expected["image"][key])
+    np.testing.assert_array_equal(
+        actual["tokenized_prompt"][0], expected["tokenized_prompt"]
+    )
+
+
+@pytest.mark.parametrize("train", [False, True])
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_piper_preprocessing_preserves_full_camera_pixels(train, channels_last):
+    from rlinf.models.embodiment.openpi.modules.model import (
+        Observation,
+        preprocess_observation,
+    )
+
+    # Distinct pixels include all borders: any crop or resize of a crop changes them.
+    image = torch.linspace(-1, 1, 2 * 3 * 224 * 224).reshape(2, 3, 224, 224)
+    source = image.permute(0, 2, 3, 1) if channels_last else image
+    keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    observation = Observation(
+        images={key: source.clone() for key in keys},
+        image_masks={key: torch.ones(2, dtype=torch.bool) for key in keys},
+        state=torch.zeros(2, 32),
+    )
+    result = preprocess_observation(
+        observation, train=train, spatial_augmentation=False
+    )
+    for key in keys:
+        torch.testing.assert_close(
+            result.images[key], image.permute(0, 2, 3, 1), rtol=0, atol=0
+        )
+        torch.testing.assert_close(observation.images[key], source, rtol=0, atol=0)
+
+
+def test_piper_ten_step_sampler_preserves_fifty_step_action_horizon():
+    from types import SimpleNamespace
+
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+
+    observation = Pi0Config(pi05=True, action_horizon=50).fake_obs()
+    times = []
+
+    def suffix(obs, actions, time, cache, mask):
+        times.append(float(time[0]))
+        return torch.ones_like(actions)
+
+    # Constant velocity has an exact endpoint; this checks the actual Euler loop.
+    sampler = SimpleNamespace(
+        build_prefix_cache=lambda obs: (None, None, None),
+        run_suffix=suffix,
+        velocity_from_suffix=lambda value: value,
+    )
+    actions = Pi0.sample_actions(
+        sampler, observation, num_steps=10, noise=torch.zeros(1, 50, 32)
+    )
+    assert len(times) == 10
+    assert times[0] == pytest.approx(1.0) and times[-1] == pytest.approx(0.1)
+    torch.testing.assert_close(actions, -torch.ones(1, 50, 32))
+
+
+@pytest.mark.parametrize("train", [False, True])
+@pytest.mark.parametrize("height,width", [(224, 112), (112, 448)])
+def test_piper_preprocessing_preserves_rectangular_camera_borders(train, height, width):
+    from rlinf.models.embodiment.openpi.modules.model import (
+        Observation,
+        preprocess_observation,
+    )
+
+    image = torch.full((1, 3, height, width), -1.0)
+    image[:, :, :4, :] = image[:, :, -4:, :] = 1.0
+    image[:, :, :, :4] = image[:, :, :, -4:] = 1.0
+    keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    observation = Observation(
+        images={key: image.clone() for key in keys},
+        image_masks={},
+        state=torch.zeros(1, 32),
+    )
+    result = preprocess_observation(
+        observation, train=train, spatial_augmentation=False
+    )
+    # Expected content rectangle: full height for portrait, 56 px high for landscape.
+    top, bottom, left, right = (0, 224, 56, 168) if height == 224 else (84, 140, 0, 224)
+    for key in keys:
+        output = result.images[key]
+        assert tuple(output.shape) == (1, 224, 224, 3)
+        content = output[:, top:bottom, left:right, :]
+        assert torch.all(content[:, 0, :, :] == 1)
+        assert torch.all(content[:, -1, :, :] == 1)
+        assert torch.all(content[:, :, 0, :] == 1)
+        assert torch.all(content[:, :, -1, :] == 1)
+        assert torch.all(content[:, content.shape[1] // 2, content.shape[2] // 2] == -1)
+
+
+def test_piper_preprocessing_rng_keeps_camera_border_positions():
+    from rlinf.models.embodiment.openpi.modules.model import (
+        Observation,
+        preprocess_observation,
+    )
+
+    # Black/white markers survive the existing positive color jitter unchanged.
+    image = torch.full((1, 3, 224, 224), -1.0)
+    image[:, :, :4, :] = image[:, :, -4:, :] = 1.0
+    image[:, :, :, :4] = image[:, :, :, -4:] = 1.0
+    keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    observation = Observation(
+        images={key: image.clone() for key in keys},
+        image_masks={},
+        state=torch.zeros(1, 32),
+    )
+    result = preprocess_observation(
+        observation,
+        train=True,
+        rng=torch.Generator().manual_seed(42),
+        spatial_augmentation=False,
+    )
+    for key in keys:
+        torch.testing.assert_close(
+            result.images[key], image.permute(0, 2, 3, 1), rtol=0, atol=0
+        )
+
+
+def test_piper_h50_worker_saves_inference_assets(tmp_path, monkeypatch):
+    import json
+
+    from rlinf.models.embodiment.piper_inference import load_piper_inference_config
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    root = _piper_test_checkpoint(tmp_path, "pi05_piper_h50_state")
+    model_cfg, _ = load_piper_inference_config(root)
+    (root / "piper_inference.json").unlink()
+    data = tmp_path / "data"
+    (data / "meta").mkdir(parents=True)
+    (data / "meta/info.json").write_text(json.dumps({"fps": 30}))
+    # Full distributed weight serialization is outside this CPU asset-path test.
+    monkeypatch.setattr(FSDPSftWorker, "save_checkpoint", lambda *a, **kw: None)
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create(
+        {"actor": {"model": model_cfg}, "data": {"train_data_paths": str(data)}}
+    )
+    worker._rank = 0
+    worker.data_loader = None
+    worker.save_checkpoint(str(root), step=10000)
+    restored, _ = load_piper_inference_config(root)
+    assert restored.openpi.config_name == "pi05_piper_h50_state"
+
+
+@pytest.mark.parametrize("config_name", ["pi05_piper", "pi05_piper_h50_state"])
+def test_piper_extract_rlt_features_keeps_normalized_units(config_name):
+    from types import SimpleNamespace
+
+    from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
+    from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval
+
+    observation = Pi0Config(pi05=True, action_horizon=50).fake_obs()
+    observation.state[:, :7] = torch.linspace(-0.6, 0.6, 7)
+    normalized_actions = torch.linspace(-0.8, 0.8, 50 * 32).reshape(1, 50, 32)
+
+    def unexpected_decode(*args):
+        raise AssertionError(
+            "RLT features must remain normalized; deployment decodes once"
+        )
+
+    feature_model = SimpleNamespace(
+        config_name=config_name,
+        action_chunk=50,
+        _require_rlt=lambda: None,
+        env_obs_to_observation=lambda obs: observation,
+        build_prefix_cache=lambda obs: (
+            torch.zeros(1, 2, 8),
+            torch.ones(1, 2, dtype=torch.bool),
+            None,
+        ),
+        _select_rlt_prefix_embeddings=lambda prefix, mask, prompt: (prefix, mask),
+        _encode_rlt_flat=lambda prefix, mask: torch.zeros(1, 8),
+        _sample_actions_from_prefix_cache=lambda *args: normalized_actions,
+        output_transform=unexpected_decode,
+    )
+    result = Pi0Eval.extract_rlt_obs(
+        feature_model, {"states": torch.full((1, 7), 99.0)}
+    )
+    torch.testing.assert_close(result["proprio"], observation.state[:, :7])
+    torch.testing.assert_close(result["ref_chunk"], normalized_actions[:, :, :7])
+    assert result["ref_chunk"].shape == (1, 50, 7)
+
+
+@pytest.mark.parametrize(
+    "config_name,horizon,with_state",
+    [("pi05_piper", 10, False), ("pi05_piper_h50_state", 50, True)],
+)
+def test_piper_registered_profile_and_rlt_actions_stay_normalized(
+    monkeypatch, config_name, horizon, with_state
+):
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.tasks import eval as eval_module
+
+    config = get_openpi_config(config_name)
+    assert config.model.action_horizon == horizon
+    assert config.model.discrete_state_input is with_state
+    observation = SimpleNamespace(
+        state=torch.full((1, 32), 0.25), tokenized_prompt=None
+    )
+    actions = torch.full((1, horizon, 32), 0.5)
+    model = SimpleNamespace(
+        config_name=config_name,
+        action_chunk=horizon,
+        _require_rlt=lambda: None,
+        env_obs_to_observation=lambda _: observation,
+        build_prefix_cache=lambda _: (None, None, None),
+        _select_rlt_prefix_embeddings=lambda *args: (None, None),
+        _encode_rlt_flat=lambda *args: torch.zeros(1, 8),
+        _sample_actions_from_prefix_cache=lambda *args: actions,
+        output_transform=MagicMock(side_effect=AssertionError("Double decode")),
+    )
+    monkeypatch.setattr(
+        eval_module, "preprocess_observation", lambda obs, **kwargs: obs
+    )
+    features = eval_module.Pi0Eval.extract_rlt_obs(model, {})
+    assert features["ref_chunk"].shape == (1, horizon, 7)
+    torch.testing.assert_close(features["ref_chunk"], actions[..., :7])
+    torch.testing.assert_close(features["proprio"], observation.state[..., :7])
+    model.output_transform.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [29999, 30000, 30001])
+@pytest.mark.parametrize("critical", [False, True])
+def test_piper_rlt_warmup_records_reference_before_actor_takeover(version, critical):
+    from rlinf.algorithms.rlt.route import RLTRouteContext, build_rlt_route
+
+    cfg = OmegaConf.create(
+        {
+            "env": {"train": {"env_type": "real"}},
+            "algorithm": {
+                "rlt_schedule": {
+                    "enable": True,
+                    "warmup_post_collect_updates": 30000,
+                }
+            },
+        }
+    )
+    actor_actions = torch.full((1, 10, 7), 0.5)
+    reference = torch.full((1, 50, 7), -0.25)
+    ctx = RLTRouteContext(
+        env_obs={},
+        rlt_obs={"ref_chunk": reference},
+        student_actions=actor_actions,
+        result={"forward_inputs": {"ref_chunk": reference}},
+        mode="train",
+        rlt_switch_flags=torch.tensor([critical]),
+        version=version,
+    )
+    output = build_rlt_route(cfg).route(ctx)
+    active = critical and version >= 30000
+    torch.testing.assert_close(
+        output.actions, actor_actions if active else reference[:, :10]
+    )
+    forward = output.result["forward_inputs"]
+    assert forward["record_transition"].item() == critical
+    assert forward["actor_switch"].item() == active
+    torch.testing.assert_close(forward["action"], output.actions.flatten(1))
+
+
+def test_rlt_simulator_expert_target_preserves_frozen_reference_input():
+    from types import SimpleNamespace
+
+    from rlinf.algorithms.rlt.route import RLTRouteContext, SimulatorRLTRoute
+
+    reference = torch.zeros(1, 3, 7)
+    expert = torch.full((1, 3, 7), 2.0)
+    ctx = RLTRouteContext(
+        env_obs={},
+        rlt_obs={"ref_chunk": reference},
+        student_actions=torch.ones_like(reference),
+        result={"forward_inputs": {"ref_chunk": reference}},
+        mode="train",
+        rlt_switch_flags=torch.tensor([True]),
+        intervene_requested=torch.tensor([True]),
+        expert_model=SimpleNamespace(predict_action_batch=lambda **kw: (expert, {})),
+    )
+    output = SimulatorRLTRoute(use_schedule=False, warmup_updates=0).route(ctx)
+    torch.testing.assert_close(output.actions, expert)
+    torch.testing.assert_close(output.result["forward_inputs"]["ref_chunk"], reference)
+    assert output.result["intervene_flags"].all()
+
+
+def test_openpi_non_piper_spatial_augmentation_remains_enabled():
+    from rlinf.models.embodiment.openpi.modules.model import (
+        Observation,
+        preprocess_observation,
+    )
+
+    image = torch.linspace(-1, 1, 224 * 224 * 3).reshape(1, 224, 224, 3)
+    observation = Observation(
+        images={"base_0_rgb": image}, image_masks={}, state=torch.zeros(1, 32)
+    )
+    augmented = preprocess_observation(
+        observation, train=True, image_keys=("base_0_rgb",)
+    )
+    assert not torch.equal(augmented.images["base_0_rgb"], image)
+    preserved = preprocess_observation(
+        observation,
+        train=True,
+        image_keys=("base_0_rgb",),
+        spatial_augmentation=False,
+    )
+    torch.testing.assert_close(preserved.images["base_0_rgb"], image, rtol=0, atol=0)
+
+
+def test_piper_warmup_loss_masks_padding_and_discounts_real_ticks():
+    from rlinf.runners.rlt_warmup_runner import discounted_target, masked_behavior_loss
+
+    prediction = torch.zeros(2, 21, requires_grad=True)
+    batch = {
+        "actions": torch.ones(2, 3, 7),
+        "curr_obs": {"ref_chunk": torch.zeros(2, 3, 7)},
+        "human": torch.tensor([[True, False, True], [False, False, False]]),
+        "valid_steps": torch.tensor([2, 1]),
+        "discount_steps": torch.tensor([2, 1]),
+        "terminated": torch.tensor([True, False]),
+        "rewards": torch.tensor([1.0, 0.0]),
+    }
+    loss = masked_behavior_loss(prediction, batch)
+    assert float(loss.detach()) == pytest.approx(1 / 3)
+    loss.backward()
+    assert not prediction.grad[0, 14:].any()
+    assert not prediction.grad[1, 7:].any()
+    target = discounted_target(batch, torch.tensor([100.0, 2.0]), gamma=0.5)
+    torch.testing.assert_close(target, torch.tensor([0.5, 1.0]))
+
+
+def test_piper_warmup_target_includes_reference_gaps_and_scores_only_the_task_end():
+    from rlinf.runners.rlt_warmup_runner import discounted_target
+
+    batch = {
+        "valid_steps": torch.tensor([5, 3]),
+        "discount_steps": torch.tensor([12, 6]),
+        "terminated": torch.tensor([False, True]),
+        "rewards": torch.tensor([0.0, 1.0]),
+    }
+    target = discounted_target(batch, torch.tensor([2.0, 100.0]), gamma=0.5)
+    torch.testing.assert_close(target, torch.tensor([0.5**12 * 2, 0.5**5]))
+
+
+def test_piper_warmup_gate_requires_validation_of_the_exported_update():
+    from rlinf.runners.rlt_warmup_runner import offline_warmup_passed
+
+    history = [{"step": step, "passed": True, "scheduled": True} for step in (2, 4, 6)]
+    assert offline_warmup_passed(
+        history, step=6, budget=6, interval=2, required_passes=3
+    )
+    assert not offline_warmup_passed(
+        history, step=6, budget=7, interval=2, required_passes=3
+    )
+    # The final optimizer update must not inherit readiness from older weights.
+    assert not offline_warmup_passed(
+        history, step=7, budget=7, interval=2, required_passes=3
+    )
+    history.append({"step": 7, "passed": False, "scheduled": False})
+    assert not offline_warmup_passed(
+        history, step=7, budget=7, interval=2, required_passes=3
+    )
+    history[-1]["passed"] = True
+    assert offline_warmup_passed(
+        history, step=7, budget=7, interval=2, required_passes=3
+    )
+
+
+def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
+    piper_warmup_cache, tmp_path
+):
+    import copy
+    import json
+
+    from rlinf.models.embodiment.mlp_policy import get_model as get_actor
+    from rlinf.runners.rlt_warmup_runner import (
+        RLTWarmupRunner,
+        WarmupConfig,
+        WarmupTraining,
+    )
+
+    cfg = WarmupConfig(
+        cache=str(piper_warmup_cache),
+        output=str(tmp_path / "full"),
+        hardware=str(
+            Path(__file__).resolve().parents[2]
+            / "examples/embodiment/config/piper_usb_hardware.yaml"
+        ),
+        device="cpu",
+        threads=1,
+        training=WarmupTraining(
+            bc_steps=2,
+            critic_steps=2,
+            joint_steps=4,
+            batch_size=4,
+            eval_every=2,
+            save_every=2,
+        ),
+    )
+    runner = RLTWarmupRunner(cfg)
+    q_before = copy.deepcopy(runner.model.q_head.state_dict())
+    actor_before = copy.deepcopy(runner.model.backbone.state_dict())
+    runner.update()
+    runner.update()
+    for key, value in runner.model.q_head.state_dict().items():
+        torch.testing.assert_close(value, q_before[key], rtol=0, atol=0)
+    assert any(
+        not torch.equal(value, actor_before[key])
+        for key, value in runner.model.backbone.state_dict().items()
+    )
+    actor_before = copy.deepcopy(runner.model.backbone.state_dict())
+    runner.update()
+    runner.update()
+    for key, value in runner.model.backbone.state_dict().items():
+        torch.testing.assert_close(value, actor_before[key], rtol=0, atol=0)
+    assert any(
+        not torch.equal(value, q_before[key])
+        for key, value in runner.model.q_head.state_dict().items()
+    )
+    # Full public run and interrupted/resumed run must produce identical weights and counters.
+    full = RLTWarmupRunner(cfg)
+    report = full.run()
+    resumed_cfg = copy.deepcopy(cfg)
+    resumed_cfg.output = str(tmp_path / "resumed")
+    RLTWarmupRunner(resumed_cfg).run(until_step=3)
+    resumed = RLTWarmupRunner(resumed_cfg)
+    restored_report = resumed.run(resume=True)
+    assert report["actor_steps"] == restored_report["actor_steps"] == 3
+    assert report["critic_steps"] == restored_report["critic_steps"] == 6
+    for key, value in full.model.state_dict().items():
+        torch.testing.assert_close(
+            value, resumed.model.state_dict()[key], rtol=0, atol=0
+        )
+    assert full.replay.rng_state() == resumed.replay.rng_state()
+    assert (
+        not report["ready_for_deterministic_eval"]
+        and not report["ready_for_online_exploration"]
+    )
+    assert not report["validation"]["checks"]["real_data"]
+    metadata = json.loads((Path(report["actor"]) / "piper_rlt_actor.json").read_text())
+    exported = get_actor(OmegaConf.create(metadata["model"]), torch_dtype=torch.float32)
+    exported.load_state_dict(
+        torch.load(
+            Path(report["actor"]) / "model_state_dict/full_weights.pt",
+            weights_only=True,
+        )
+    )
+    batch = full.replay.sample(4)
+    torch.testing.assert_close(
+        exported.sac_forward(batch["curr_obs"], deterministic=True)[0],
+        full.model.sac_forward(batch["curr_obs"], deterministic=True)[0],
+        rtol=0,
+        atol=0,
+    )
+    resumed_cfg.training.gamma = 0.9
+    with pytest.raises(ValueError, match="config, implementation or cache changed"):
+        RLTWarmupRunner(resumed_cfg).run(resume=True)

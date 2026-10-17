@@ -37,6 +37,7 @@ class Pi0Config:
     pi05: bool = False
     discrete_state_input: bool | None = None
     pcd: bool = False
+    spatial_augmentation: bool = True
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:

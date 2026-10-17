@@ -1,0 +1,61 @@
+# Evo-RL USB follower and RGB interfaces, selected independently of video numbering.
+usb_serial: "003F00334648571220363032"
+firmware: v189
+# Evo-RL ORDER.md USB inference: MotionCtrl_2(1, 1, 100, 0xAD).
+speed_percent: 100
+high_follow: true
+gripper_force: 1.0  # SDK force * 1000 = Evo-RL gripper_effort_default 1000.
+# Opt in with --teleop piper_leader. This is the USB task leader from Evo-RL ORDER.
+teleop:
+  type: none
+  usb_serial: "004F003C4648571020363032"
+  intervention:
+    key: i
+    alignment_duration_s: 3.0
+    max_joint_gap_deg: 10.0
+    max_gripper_gap_mm: 15.0
+    toggle_cooldown_s: 0.3
+  gravity_comp_control_hz: 200.0
+  gravity_comp_tx_ratio: [0.0, 1.05, 1.1, 1.0, 1.4, 1.0]
+  gravity_comp_payload_mass_kg: 0.5
+  gravity_comp_payload_com_m: [-0.00017, 0.00007, 0.03784]
+  gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
+  gravity_comp_torque_limit: 8.0
+execution:
+  fps: 30.0
+  gripper_max_width_m: 0.07
+  max_joint_step_deg: 5.0
+  max_gripper_step_mm: 20.0
+  max_camera_age_s: 0.5
+  # Includes inference, recording and playback of 50 targets at 30 Hz.
+  max_prediction_age_s: 3.0
+cameras:
+  front:
+    usb_serial: CP0A163001Z7
+    usb_interface: "04"  # Gemini 335 RGB; interface 00 is the depth interface.
+    reset_on_connect: true
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+    backend: 200  # OpenCV V4L2
+    warmup_s: 3
+  front_2:
+    usb_serial: CP0A163001KD
+    usb_interface: "04"
+    reset_on_connect: true
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+    backend: 200
+    warmup_s: 3
+  wrist:
+    usb_serial: CC1N16202SD
+    usb_interface: "00"
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+    backend: 200
+    warmup_s: 3

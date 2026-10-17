@@ -801,3 +801,49 @@ RECAP 支持迭代优化：使用 Step 4 训练的策略模型采集新数据，
        ├── advantage.py                          # 分位数阈值 + 布尔标签
        ├── distributed.py                        # 分片推理辅助
        └── mixture_config.py                     # meta/mixture_config.yaml tag I/O
+
+使用 Evo-RL 的 Piper 数据
+--------------------------------------------------------------------------------
+
+通过 ``pi05_piper`` 数据配置，可以用现有 Evo-RL 单臂 LeRobot v3 录制数据训练 RECAP。该配置使用绝对关节目标：归一化前，将源数据中的关节角度和夹爪毫米转换成弧度和米；policy 输出变换再还原为角度和毫米，供 Evo-RL 执行器使用。接入 RLinf 机器人执行器时，还需要转换为其要求的夹爪开度比例。
+
+适配器要求七个具名数值，顺序为 ``joint_1.pos`` 至 ``joint_6.pos``，最后是 ``gripper.pos``，以及三路 RGB 图像。相机字段位于 ``observation.images`` 下，支持 ``base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb`` 和 Evo-RL USB 数据的 ``front / front_2 / wrist`` 两套名称。映射沿用 Evo-RL：``front_2`` 实际是第二个外部视角，模型槽位名仍为 ``left_wrist_0_rgb``。混合录制数据前应核对实际相机位置。14 维双臂数据需要单独适配。
+
+准备数据
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+激活 RLinf 的 OpenPI 环境，并使用 LeRobot 0.4.4 读取 v3 数据。仅用于硬件检查的环境不具备 GPU 训练条件。在仓库根目录创建独立的数据准备目录：
+
+.. code-block:: bash
+
+   export REPO_PATH="$PWD"
+   export PIPER_DATA_PATH=/path/to/prepared/usb_iter2_recap
+   python -m toolkits.lerobot.prepare_piper_recap \
+     --source /path/to/Evo-RL/data/eval_usb_light_iter2_rollout+hil \
+     --output "$PIPER_DATA_PATH"
+
+命令复制元数据，通过链接复用原始数据和视频，并在新目录生成 ``meta/returns_piper.parquet`` 与 ``meta/norm_stats.json``。原目录需要保持可访问；输出目录已存在时命令会报错。准备工具检查 state/action 的七个具名字段，并按 policy 的十步动作窗口，在模型单位下计算归一化统计。
+
+回报计算读取 episode 元数据中的 ``episode_success``\ （``success`` 或 ``failure``），或终止帧的 ``is_success``。未知或冲突标签会报错；即使声明为 ``sft``，明确标注的失败也不会被当作成功。示例对混合成败数据使用 ``type: rollout``。跨 Parquet 文件的 episode 会先合并再计算回报；任务文本同时支持 v3 ``tasks.parquet`` 和 v2 ``tasks.jsonl``。初始奖励为每帧 -1、成功终止帧 0、失败终止帧 -300。可通过 ``--failure-reward`` 调整耗时与成功的权衡，这个初始值尚未针对 USB 任务调优。
+
+执行三个训练阶段
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+设置基础模型路径后训练 value：
+
+.. code-block:: bash
+
+   export SIGLIP_MODEL_PATH=/path/to/siglip2-so400m-patch14-224
+   export GEMMA_MODEL_PATH=/path/to/gemma-3-270m
+   export PI05_MODEL_PATH=/path/to/pi05_base_pytorch
+   bash examples/offline_rl/advantage_labeling/recap/run_value_sft.sh piper_recap_value
+
+``PI05_MODEL_PATH`` 应指向 RLinf CFG 模型使用的 OpenPI PyTorch 权重，权重 key 以 ``paligemma_with_expert.*`` 为前缀；它与 RLinf 的裸 ``Pi0`` 导出格式（``img.* / llm.*``）不同。此流程不转换 Evo-RL checkpoint。value checkpoint 保存后，计算 advantage，再训练 policy：
+
+.. code-block:: bash
+
+   export PIPER_VALUE_CHECKPOINT=/path/to/value_checkpoint
+   bash examples/offline_rl/advantage_labeling/recap/process/run_compute_advantages.sh piper_recap_advantages --nproc 1
+   bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh piper_recap_cfg
+
+两个配置使用 ``piper`` sidecar 标签；CFG 数据读取和模型推理变换使用同一个显式 ``openpi_data.norm_stats_path``。policy 初始只训练动作 expert，冻结 VLM；示例以 micro-batch 1、global batch 8、100 个训练步检查管线。正式实验需调整 ``runner.max_steps``、优化器调度和 checkpoint 间隔。报告效果前，应划分留出的 episode 或设置独立评估集；初始配置关闭验证，不产生成功率评估。以上命令仅执行离线训练，不连接机械臂。

@@ -1,0 +1,4 @@
+# Pinocchio 2.7 retains NumPy 1.26 compatibility in the Piper SFT environment.
+numpy>=1.26,<2
+pin==2.7.0
+piper_sdk @ git+https://github.com/Reimagine-Robotics/piper_sdk.git@83814f1d38d764dc4e2cf144396ff03fae1e5311

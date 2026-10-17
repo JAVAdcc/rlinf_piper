@@ -1651,7 +1651,7 @@ def test_history_reward_assignment_matches_main_across_chunks():
 
 
 @pytest.mark.parametrize("loss_type", ["rlt_ac", "rlt_td3"])
-def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type):
+def test_rlt_interventions_change_actions_but_preserve_reference_inputs(loss_type):
     collector = _make(_config(algorithm={"loss_type": loss_type}))
     key = TrajectoryKey(3, 0, 0, 0, 0)
     current_ref_chunk = torch.tensor([[1.0, 2.0]])
@@ -1668,6 +1668,7 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
             },
             prev_logprobs=torch.zeros(1, 1),
             prev_values=torch.zeros(1, 1),
+            intervene_flags=torch.zeros(1, 1, dtype=torch.bool),
         ),
     )
     env = EnvPart(
@@ -1694,9 +1695,46 @@ def test_rlt_output_matches_main_transition_and_intervention_behavior(loss_type)
 
     assert set(trajectory.curr_obs) == {"z_rl", "proprio", "ref_chunk"}
     assert set(trajectory.next_obs) == {"z_rl", "proprio", "ref_chunk"}
-    assert torch.equal(trajectory.curr_obs["ref_chunk"][0], intervened_chunk)
+    assert torch.equal(trajectory.curr_obs["ref_chunk"][0], current_ref_chunk)
+    assert torch.equal(trajectory.actions[0], intervened_chunk)
+    assert trajectory.intervene_flags.all()
+    assert torch.equal(policy.output.forward_inputs["ref_chunk"], current_ref_chunk)
     assert torch.equal(
         trajectory.next_obs["ref_chunk"][0], torch.tensor([[11.0, 12.0]])
+    )
+
+
+def test_confirmed_commands_and_human_flags_survive_transport_and_replay():
+    key = TrajectoryKey(3, 0, 0, 0, 0)
+    policy = _policy(key)
+    policy.output.forward_inputs = {
+        "action": torch.tensor([[10.0, 20.0]]),
+        "model_action": torch.tensor([[10.0, 20.0]]),
+    }
+    policy.output.intervene_flags = torch.zeros(1, 2, dtype=torch.bool)
+    env = _env_part(key)
+    env.transition = EnvTransition(
+        executed_actions=torch.tensor([[1.0, 2.0]]),
+        intervene_actions=torch.tensor([[float("nan"), 3.0]]),
+        intervene_flags=torch.tensor([[False, True]]),
+    )
+    # Transport must carry confirmed nonhuman commands independently of labels.
+    env.transition = EnvTransition.merge(env.transition.split([1]))
+    step = TrajectoryStep.from_parts(
+        policy,
+        env,
+        rewards=None,
+        collect_prev_infos=False,
+        collect_transitions=False,
+        enable_rlt=False,
+        include_final_value=False,
+    )
+    torch.testing.assert_close(step.actions, torch.tensor([[1.0, 3.0]]))
+    assert step.intervene_flags.tolist() == [[False, True]]
+    torch.testing.assert_close(step.forward_inputs["action"], step.actions)
+    assert "model_action" not in step.forward_inputs
+    torch.testing.assert_close(
+        policy.output.forward_inputs["action"], torch.tensor([[10.0, 20.0]])
     )
 
 
@@ -2834,3 +2872,1306 @@ def test_vlm_trend_batch_video_metadata_stays_nested_per_sample():
     assert metadata[0][0].total_num_frames == 5
     assert metadata[0][0].frames_indices == [0, 1, 2, 3, 4]
     assert metadata[1][1].total_num_frames == 5
+
+
+@pytest.mark.parametrize("legacy_names", [False, True])
+def test_piper_data_transform_preserves_views_and_absolute_actions(legacy_names):
+    from rlinf.models.embodiment.openpi.policies.piper_policy import (
+        PiperInputs,
+        PiperOutputs,
+    )
+
+    names = (
+        ("front", "front_2", "wrist")
+        if legacy_names
+        else ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    )
+    frame = {
+        "observation.state": np.array([180, 90, -90, 0, 45, -45, 70]),
+        "action": np.array([[90, 45, -45, 0, 30, -30, 35]] * 10),
+        "task": "insert the USB cable",
+    }
+    for i, name in enumerate(names):
+        frame[f"observation.images.{name}"] = np.full(
+            (3, 8, 9), (i + 1) / 255, np.float32
+        )
+    original = copy.deepcopy(frame)
+    sample = PiperInputs()(frame)
+    np.testing.assert_allclose(
+        sample["state"],
+        [np.pi, np.pi / 2, -np.pi / 2, 0, np.pi / 4, -np.pi / 4, 0.07],
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        sample["actions"][0, [0, 6]], [np.pi / 2, 0.035], rtol=1e-6
+    )
+    for i, image in enumerate(sample["image"].values()):
+        assert image.shape == (8, 9, 3)
+        assert image.dtype == np.uint8
+        assert np.all(image == i + 1)
+    assert all(sample["image_mask"].values())
+    assert sample["prompt"] == frame["task"]
+    padded = np.pad(sample["actions"], ((0, 0), (0, 25)))
+    np.testing.assert_allclose(
+        PiperOutputs()({"actions": padded})["actions"], frame["action"], atol=1e-5
+    )
+    np.testing.assert_array_equal(frame["action"], original["action"])
+
+
+@pytest.mark.parametrize("values", [np.zeros(14), np.zeros(6), [float("nan")] * 7])
+def test_piper_data_rejects_wrong_embodiment_and_nonfinite_values(values):
+    from rlinf.models.embodiment.openpi.policies.piper_policy import (
+        piper_to_model_units,
+    )
+
+    with pytest.raises(ValueError):
+        piper_to_model_units(values)
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [(True, True), (0, False), ("success", True), ("failure", False), ("false", False)],
+)
+def test_lerobot_episode_success_is_explicit(label, expected):
+    from rlinf.data.storage.lerobot.metadata import parse_success
+
+    assert parse_success(label) is expected
+
+
+@pytest.mark.parametrize("label", [None, "unknown", "", 2, float("nan")])
+def test_lerobot_unknown_outcome_is_not_assumed_successful(label):
+    from rlinf.data.storage.lerobot.metadata import parse_success
+
+    with pytest.raises(ValueError, match="Unknown"):
+        parse_success(label)
+
+
+def test_recap_returns_cover_v3_split_episodes_and_metadata_labels(tmp_path):
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from examples.offline_rl.advantage_labeling.recap.process.compute_returns import (
+        process_dataset,
+    )
+    from rlinf.data.storage.lerobot.metadata import load_task_descriptions
+
+    (tmp_path / "data/chunk-000").mkdir(parents=True)
+    (tmp_path / "meta/episodes/chunk-000").mkdir(parents=True)
+    # Episode 0 crosses a file boundary; file ordering is deliberately reversed.
+    for name, episodes, frames in [
+        ("file-001", [0, 0], [0, 1]),
+        ("file-000", [0, 1, 1], [2, 0, 1]),
+    ]:
+        pq.write_table(
+            pa.table(
+                {
+                    "episode_index": episodes,
+                    "frame_index": frames,
+                    "task_index": [0] * len(frames),
+                }
+            ),
+            tmp_path / f"data/chunk-000/{name}.parquet",
+        )
+    pq.write_table(
+        pa.table({"episode_index": [0, 1], "episode_success": ["success", "failure"]}),
+        tmp_path / "meta/episodes/chunk-000/file-000.parquet",
+    )
+    pd.DataFrame({"task_index": [0]}, index=["insert USB"]).to_parquet(
+        tmp_path / "meta/tasks.parquet"
+    )
+    assert load_task_descriptions(tmp_path) == {0: "insert USB"}
+    process_dataset(tmp_path, None, "rollout", 1, -10, tag="test")
+    table = pq.read_table(tmp_path / "meta/returns_test.parquet")
+    assert table["return"].to_pylist() == [-2, -1, 0, -11, -10]
+    assert table["reward"].to_pylist() == [-1, -1, 0, -1, -10]
+    assert table["prompt"].to_pylist() == ["insert USB"] * 5
+    # Explicit failures must not become successes even under an SFT declaration.
+    process_dataset(tmp_path, None, "sft", 1, -10, tag="sft")
+    assert (
+        pq.read_table(tmp_path / "meta/returns_sft.parquet")["reward"].to_pylist()[-1]
+        == -10
+    )
+
+
+@pytest.mark.parametrize("frames", [[0, 0], [0, 2], [1, 2]])
+def test_recap_returns_refuse_duplicate_or_missing_frames(frames):
+    import pyarrow as pa
+
+    from examples.offline_rl.advantage_labeling.recap.process.compute_returns import (
+        compute_returns_table,
+    )
+
+    table = pa.table({"episode_index": [0, 0], "frame_index": frames})
+    with pytest.raises(ValueError, match="frame indices"):
+        compute_returns_table(table, "sft", 1, -10, {})
+
+
+def test_recap_returns_reject_missing_and_conflicting_outcomes():
+    import pyarrow as pa
+
+    from examples.offline_rl.advantage_labeling.recap.process.compute_returns import (
+        compute_returns_table,
+    )
+
+    table = pa.table({"episode_index": [0], "frame_index": [0]})
+    with pytest.raises(ValueError, match="needs is_success"):
+        compute_returns_table(table, "rollout", 1, -10, {})
+    table = table.append_column("is_success", pa.array([False]))
+    with pytest.raises(ValueError, match="Conflicting"):
+        compute_returns_table(table, "rollout", 1, -10, {}, {0: True})
+    assert compute_returns_table(table, "rollout", 0.9, -10, {})[
+        "reward"
+    ].to_pylist() == [-10]
+
+
+def test_piper_value_training_and_inference_use_same_transform():
+    pytest.importorskip("openpi")
+    from openpi.transforms import compose
+
+    from rlinf.data.datasets.recap.value_dataset import ValueDataset
+    from rlinf.models.embodiment.value_model.recap.checkpoint_utils import (
+        build_input_transforms,
+    )
+
+    sample = {
+        "observation.state": np.array([10, 20, 30, 40, 50, 60, 35]),
+        "task": "insert USB",
+    }
+    for name in ("front", "front_2", "wrist"):
+        sample[f"observation.images.{name}"] = np.zeros((8, 9, 3), np.uint8)
+    train = ValueDataset._build_transform("piper", "pi05", 7, None)(
+        copy.deepcopy(sample)
+    )
+    infer = compose(build_input_transforms("piper", "pi05", 7, None, None, True))(
+        copy.deepcopy(sample)
+    )
+    np.testing.assert_array_equal(train["state"], infer["state"])
+    assert train["prompt"] == infer["prompt"]
+    for key in train["image"]:
+        np.testing.assert_array_equal(train["image"][key], infer["image"][key])
+
+
+def test_piper_camera_aliases_are_unambiguous():
+    from rlinf.models.embodiment.openpi.policies.piper_policy import PiperInputs
+
+    image = np.zeros((8, 9, 3), np.uint8)
+    with pytest.raises(ValueError, match="exactly one"):
+        PiperInputs()(
+            {"observation.images.front": image, "observation.images.base_0_rgb": image}
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        PiperInputs()({})
+
+
+def test_piper_prompt_falls_back_from_null_sidecar_feature():
+    from rlinf.models.embodiment.openpi.policies.piper_policy import PiperInputs
+
+    sample = {"observation.state": np.zeros(7), "prompt": None, "task": "insert USB"}
+    for name in ("front", "front_2", "wrist"):
+        sample[f"observation.images.{name}"] = np.zeros((8, 9, 3), np.uint8)
+    assert PiperInputs()(sample)["prompt"] == "insert USB"
+
+
+def test_piper_recap_configs_resolve_dataset_and_normalization(monkeypatch):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    root = Path(__file__).resolve().parents[2]
+    for key, value in {
+        "REPO_PATH": str(root),
+        "PIPER_DATA_PATH": "/test/piper",
+        "SIGLIP_MODEL_PATH": "/test/siglip",
+        "GEMMA_MODEL_PATH": "/test/gemma",
+        "PI05_MODEL_PATH": "/test/pi05",
+        "PIPER_VALUE_CHECKPOINT": "/test/value",
+    }.items():
+        monkeypatch.setenv(key, value)
+    with initialize_config_dir(
+        version_base=None, config_dir=str(root / "examples/offline_rl/config")
+    ):
+        for name in ("piper_recap_value", "piper_recap_advantages", "piper_recap_cfg"):
+            cfg = compose(config_name=name)
+            OmegaConf.to_container(cfg, resolve=True)
+            assert cfg.data.train_data_paths[0].dataset_path == "/test/piper"
+            assert cfg.data.train_data_paths[0].type == "rollout"
+            if name == "piper_recap_cfg":
+                assert cfg.actor.model.openpi.config_name == "pi05_piper"
+                assert (
+                    cfg.actor.model.openpi_data.norm_stats_path
+                    == "/test/piper/meta/norm_stats.json"
+                )
+
+
+def test_piper_preparation_preserves_source_and_refuses_existing_output(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from toolkits.lerobot.prepare_piper_recap import prepare_dataset
+
+    source = tmp_path / "source"
+    output = tmp_path / "prepared"
+    (source / "meta/episodes/chunk-000").mkdir(parents=True)
+    (source / "data/chunk-000").mkdir(parents=True)
+    (source / "videos").mkdir()
+    names = [f"joint_{i}.pos" for i in range(1, 7)] + ["gripper.pos"]
+    features = {
+        key: {"shape": [7], "names": names} for key in ("action", "observation.state")
+    }
+    for name in ("front", "front_2", "wrist"):
+        features[f"observation.images.{name}"] = {"shape": [8, 9, 3]}
+    info = json.dumps(
+        {
+            "robot_type": "piper_follower",
+            "features": features,
+            "total_frames": 4,
+            "total_episodes": 2,
+            "fps": 30,
+        }
+    )
+    (source / "meta/info.json").write_text(info)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0, 0, 1, 1],
+                "frame_index": [0, 1, 0, 1],
+                "action": [[90.0] * 6 + [35.0]] * 4,
+                "observation.state": [[0.0] * 7] * 4,
+            }
+        ),
+        source / "data/chunk-000/file-000.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0, 1],
+                "length": [2, 2],
+                "episode_success": ["success", "failure"],
+            }
+        ),
+        source / "meta/episodes/chunk-000/file-000.parquet",
+    )
+    report = prepare_dataset(source, output, failure_reward=-10)
+    assert report["frames"] == 4
+    assert (source / "meta/info.json").read_text() == info
+    assert not (source / "meta/returns_piper.parquet").exists()
+    assert (output / "data").is_symlink()
+    assert (output / "videos").resolve() == source / "videos"
+    stats = json.loads((output / "meta/norm_stats.json").read_text())["norm_stats"]
+    np.testing.assert_allclose(
+        stats["actions"]["mean"], [np.pi / 2] * 6 + [0.035], rtol=1e-6
+    )
+    assert pq.read_table(output / "meta/returns_piper.parquet")[
+        "return"
+    ].to_pylist() == [-1, 0, -11, -10]
+    with pytest.raises(FileExistsError):
+        prepare_dataset(source, output)
+    with pytest.raises(ValueError, match="outside"):
+        prepare_dataset(source, source / "nested")
+
+
+def test_piper_success_selection_preserves_episode_and_video_boundaries(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from toolkits.lerobot.select_piper_success import select_success
+
+    selected = []
+    originals = {}
+    for source_number in range(2):
+        root = tmp_path / f"source_{source_number}"
+        (root / "meta/episodes").mkdir(parents=True)
+        (root / "data").mkdir()
+        features = {
+            key: {"dtype": "float32", "shape": [7]}
+            for key in ("action", "observation.state")
+        }
+        features.update(
+            {
+                key: {"dtype": "int64", "shape": [1]}
+                for key in ("frame_index", "episode_index", "index", "task_index")
+            }
+        )
+        features["timestamp"] = {"dtype": "float32", "shape": [1]}
+        features["observation.depths.front"] = {"dtype": "uint16", "shape": [1, 1]}
+        episodes = []
+        for camera in ("front", "front_2", "wrist"):
+            features[f"observation.images.{camera}"] = {
+                "dtype": "video",
+                "shape": [2, 2, 3],
+            }
+            # The selector links external media; decoding is covered by the real-data probe.
+            (root / f"{camera}.mp4").write_bytes(bytes([source_number]))
+        info = {
+            "codebase_version": "v3.0",
+            "robot_type": "piper_follower",
+            "fps": 30,
+            "features": features,
+            "data_path": "data/file-{file_index}.parquet",
+            "video_path": "{video_key}.mp4",
+        }
+        for camera in ("front", "front_2", "wrist"):
+            (root / f"{camera}.mp4").rename(root / f"observation.images.{camera}.mp4")
+        (root / "meta/info.json").write_text(json.dumps(info))
+        pq.write_table(
+            pa.table({"task_index": [0], "__index_level_0__": ["insert USB"]}),
+            root / "meta/tasks.parquet",
+        )
+        for ep_index in range(2):
+            ep = {
+                "episode_index": ep_index,
+                "episode_success": "success" if ep_index else "failure",
+                "length": 2,
+                "tasks": ["insert USB"],
+                "data/chunk_index": 0,
+                "data/file_index": ep_index,
+            }
+            for camera in ("front", "front_2", "wrist"):
+                prefix = f"videos/observation.images.{camera}"
+                ep.update(
+                    {
+                        f"{prefix}/chunk_index": 0,
+                        f"{prefix}/file_index": 0,
+                        f"{prefix}/from_timestamp": ep_index / 15,
+                        f"{prefix}/to_timestamp": (ep_index + 1) / 15,
+                    }
+                )
+            episodes.append(ep)
+            pq.write_table(
+                pa.table(
+                    {
+                        "action": [[source_number + ep_index] * 7] * 2,
+                        "observation.state": [[source_number] * 7] * 2,
+                        "timestamp": [0.0, 1 / 30],
+                        "frame_index": [0, 1],
+                        "episode_index": [ep_index] * 2,
+                        "index": [ep_index * 2, ep_index * 2 + 1],
+                        "task_index": [0, 0],
+                        "observation.depths.front": [[[42]], [[42]]],
+                    }
+                ),
+                root / f"data/file-{ep_index}.parquet",
+            )
+        pq.write_table(
+            pa.Table.from_pylist(episodes), root / "meta/episodes/file.parquet"
+        )
+        selected.append(
+            {"source_dataset": str(root), "source_episode_index": 1, "frames": 2}
+        )
+        originals.update({p: p.read_bytes() for p in root.rglob("*") if p.is_file()})
+    manifest = tmp_path / "selection.json"
+    manifest.write_text(json.dumps({"selected_episodes": selected}))
+    output = tmp_path / "output"
+    report = select_success(manifest, output)
+    assert report["episodes"] == 2 and report["frames"] == 4
+    rows = pq.read_table(
+        output / "meta/episodes/chunk-000/file-000.parquet"
+    ).to_pylist()
+    assert [r["dataset_from_index"] for r in rows] == [0, 2]
+    for index, row in enumerate(rows):
+        assert row["episode_success"] == "success"
+        assert row["videos/observation.images.front/from_timestamp"] == 1 / 15
+        video = (
+            output / f"videos/observation.images.front/chunk-000/file-{index:03}.mp4"
+        )
+        assert (
+            video.resolve() == tmp_path / f"source_{index}/observation.images.front.mp4"
+        )
+        table = pq.read_table(output / f"data/chunk-000/file-{index:03}.parquet")
+        assert table["episode_index"].to_pylist() == [index, index]
+        assert table["index"].to_pylist() == [index * 2, index * 2 + 1]
+        assert table["action"].to_pylist() == [[index + 1] * 7] * 2
+        assert "observation.depths.front" not in table.column_names
+    assert all(p.read_bytes() == data for p, data in originals.items())
+    with pytest.raises(FileExistsError):
+        select_success(manifest, output)
+    manifest.write_text(json.dumps({"selected_episodes": [selected[0], selected[0]]}))
+    with pytest.raises(ValueError, match="Duplicate"):
+        select_success(manifest, tmp_path / "duplicate")
+    alias = tmp_path / "source_alias"
+    alias.symlink_to(tmp_path / "source_0", target_is_directory=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "selected_episodes": [
+                    selected[0],
+                    {**selected[0], "source_dataset": str(alias)},
+                ]
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="Duplicate"):
+        select_success(manifest, tmp_path / "duplicate_alias")
+    selected[0]["source_episode_index"] = 0
+    manifest.write_text(json.dumps({"selected_episodes": selected}))
+    with pytest.raises(ValueError, match="success/length"):
+        select_success(manifest, tmp_path / "failure")
+    assert not (tmp_path / "failure").exists()
+
+
+@pytest.mark.parametrize(
+    "stage1_name", ["piper_rlt_stage1", "piper_usb_rlt_stage1_success97"]
+)
+def test_piper_native_rlt_configs_share_horizon_stats_and_units(
+    monkeypatch, stage1_name
+):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    root = Path(__file__).resolve().parents[2]
+    for name, value in {
+        "REPO_PATH": str(root),
+        "EMBODIED_PATH": str(root / "examples/sft"),
+        "PIPER_DATA_PATH": "/test/data",
+        "PI05_MODEL_PATH": "/test/base",
+        "PIPER_STAGE1_PATH": "/test/stage1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    with initialize_config_dir(
+        version_base=None, config_dir=str(root / "examples/sft/config")
+    ):
+        stage1 = compose(config_name=stage1_name)
+        OmegaConf.to_container(stage1, resolve=True)
+    if stage1_name == "piper_usb_rlt_stage1_success97":
+        assert stage1.actor.global_batch_size == 64
+        assert stage1.actor.micro_batch_size == 8
+        assert stage1.runner.max_steps == 60000
+        assert stage1.cluster.component_placement.actor == "0-7"
+    assert stage1.actor.model.openpi.train_expert_only == (
+        stage1_name == "piper_usb_rlt_stage1_success97"
+    )
+    monkeypatch.setenv("EMBODIED_PATH", str(root / "examples/embodiment"))
+    with initialize_config_dir(
+        version_base=None, config_dir=str(root / "examples/embodiment/config")
+    ):
+        stage2 = compose(config_name="piper_rlt_stage2")
+        OmegaConf.to_container(stage2, resolve=True)
+    assert stage1.actor.model.openpi.use_rlt
+    assert stage1.actor.model.model_type == "openpi"
+    assert stage2.algorithm.loss_type == "rlt_ac"
+    assert stage2.actor.model.proprio_dim == 7
+    assert stage2.actor.model.action_dim == 7
+    assert (
+        stage1.actor.model.openpi.action_horizon
+        == stage2.actor.model.ref_num_action_chunks
+        == 10
+    )
+    assert stage2.env.train.init_params.id == "PiperPolicyEnv-v1"
+    assert (
+        stage2.rollout.rlt_feature_model.openpi_data.norm_stats_path
+        == stage2.env.train.override_cfg.norm_stats_path
+    )
+    assert not stage2.env.train.keyboard_reward_wrapper
+
+
+@pytest.mark.parametrize("episodes", [None, [1, 2], [0, 2]])
+def test_openpi_lerobot_sequence_reads_only_requested_rows(tmp_path, episodes):
+    from openpi.training.data_loader import _import_lerobot_dataset
+
+    from rlinf.data.datasets.openpi.lerobot_dataset import LeRobotSFTDataset
+    from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch
+
+    lerobot = _import_lerobot_dataset()
+    root = tmp_path / "sequence_data"
+    writer = lerobot.LeRobotDataset.create(
+        "sequence_data",
+        root=root,
+        fps=30,
+        robot_type="piper_follower",
+        features={
+            key: {"dtype": "float32", "shape": (7,), "names": None}
+            for key in ("action", "observation.state")
+        },
+        use_videos=False,
+    )
+    for episode in range(3):
+        for frame in range(12):
+            value = np.full(7, episode * 100 + frame, dtype=np.float32)
+            writer.add_frame(
+                {
+                    "action": value,
+                    "observation.state": -value,
+                    "task": "test sequence boundaries",
+                }
+            )
+        writer.save_episode()
+    writer.finalize()
+
+    deltas = {
+        "action": [-1 / 30, 0.0, 1 / 30, 2 / 30],
+        "observation.state": [0.0, 1 / 30],
+    }
+    reader = LeRobotSFTDataset(
+        "sequence_data",
+        root=root,
+        episodes=episodes,
+        delta_timestamps=deltas,
+        download_videos=False,
+        video_backend="pyav",
+    )
+    reference = lerobot.LeRobotDataset(
+        "sequence_data",
+        root=root,
+        episodes=episodes,
+        delta_timestamps=deltas,
+        download_videos=False,
+        video_backend="pyav",
+    )
+    formatted_rows = []
+
+    def count_formatted_rows(batch):
+        formatted_rows.append(len(next(iter(batch.values()))))
+        return decode_image_struct_batch(batch)
+
+    reader.hf_dataset.set_transform(count_formatted_rows)
+    reference.hf_dataset.set_transform(decode_image_struct_batch)
+    for index in range(len(reader)):
+        actual = reader[index]
+        expected = reference[index]
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            if torch.is_tensor(actual[key]):
+                assert torch.equal(actual[key], expected[key]), (index, key)
+            else:
+                assert actual[key] == expected[key]
+        frame = int(actual["frame_index"])
+        episode = int(actual["episode_index"])
+        expected_actions = [
+            episode * 100 + min(11, max(0, frame + offset)) for offset in (-1, 0, 1, 2)
+        ]
+        torch.testing.assert_close(
+            actual["action"],
+            torch.tensor(expected_actions).float()[:, None].expand(-1, 7),
+        )
+        assert actual["action_is_pad"].tolist() == [
+            frame + offset < 0 or frame + offset > 11 for offset in (-1, 0, 1, 2)
+        ]
+    assert max(formatted_rows) == 4
+    with pytest.raises(IndexError):
+        reader[len(reader)]
+
+
+class _OpenPISamplingObservations:
+    """Carry row indices through the real OpenPI observation/batch wrappers."""
+
+    def __init__(self, size):
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, index):
+        value = np.array([index], dtype=np.float32)
+        return {
+            "image": {},
+            "image_mask": {},
+            "state": value,
+            "actions": value[None, :],
+        }
+
+
+def _make_openpi_sampling_loaders(
+    *, size=1035, world_size=8, rank=0, shuffle=True, num_workers=0
+):
+    from openpi.training.config import DataConfig
+    from openpi.training.data_loader import DataLoaderImpl, TorchDataLoader
+
+    from rlinf.data.datasets.openpi.official_sft_data_loader import OpenPISftDataLoader
+
+    dataset = _OpenPISamplingObservations(size)
+    sampler = torch.utils.data.DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        drop_last=True,
+    )
+    raw = DataLoaderImpl(
+        DataConfig(repo_id="indices-only"),
+        TorchDataLoader(
+            dataset,
+            local_batch_size=8,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=num_workers,
+            seed=42,
+            framework="pytorch",
+        ),
+    )
+    return raw, OpenPISftDataLoader(raw)
+
+
+def _openpi_sampling_indices(loader):
+    batches = []
+    iterator = iter(loader)
+    for _ in range(len(loader)):
+        observation, actions = next(iterator)
+        torch.testing.assert_close(observation.state, actions[:, 0])
+        assert observation.state.dtype == torch.float32
+        batches.append(observation.state[:, 0].to(torch.int64))
+    with pytest.raises(StopIteration):
+        next(iterator)
+    return torch.cat(batches)
+
+
+def test_openpi_sft_epochs_reshuffle_without_changing_first_pass_or_shards():
+    from itertools import islice
+
+    from rlinf.data.datasets.common.epoch import forward_set_epoch
+    from rlinf.data.datasets.openpi import (
+        get_official_openpi_sft_num_batches,
+        is_official_openpi_sft_dataloader,
+    )
+
+    all_epochs = [[], []]
+    for rank in range(8):
+        raw, loader = _make_openpi_sampling_loaders(rank=rank)
+        assert len(loader) == 16
+        assert get_official_openpi_sft_num_batches(loader) == len(loader)
+        assert get_official_openpi_sft_num_batches(raw) == len(loader)
+        assert is_official_openpi_sft_dataloader(loader)
+        assert loader.data_config() is raw.data_config()
+        reference = torch.cat(
+            [obs.state[:, 0].to(torch.int64) for obs, _ in islice(raw, len(loader))]
+        )
+        for epoch in range(2):
+            forward_set_epoch(loader, epoch)
+            all_epochs[epoch].append(_openpi_sampling_indices(loader))
+            assert loader.sampler.epoch == epoch
+        assert torch.equal(all_epochs[0][-1], reference)
+        assert not torch.equal(all_epochs[0][-1], all_epochs[1][-1])
+        forward_set_epoch(loader, 0)
+        assert torch.equal(_openpi_sampling_indices(loader), reference)
+
+    for shards in all_epochs:
+        indices = torch.cat(shards)
+        assert len(indices) == len(torch.unique(indices)) == 1024
+        assert int(indices.min()) >= 0 and int(indices.max()) < 1035
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_openpi_sft_rollover_uses_next_epoch_with_real_loader_workers(num_workers):
+    from rlinf.data.datasets.common.epoch import forward_set_epoch
+
+    _, loader = _make_openpi_sampling_loaders(size=139, num_workers=num_workers)
+    data_iter = iter(loader)
+    epochs = []
+    epoch = 0
+    for _ in range(2):
+        batches = []
+        for _ in range(len(loader)):
+            try:
+                observation, _ = next(data_iter)
+            except StopIteration:
+                epoch += 1
+                forward_set_epoch(loader, epoch)
+                data_iter = iter(loader)
+                observation, _ = next(data_iter)
+            batches.append(observation.state[:, 0].to(torch.int64))
+        epochs.append(torch.cat(batches))
+    assert epoch == loader.sampler.epoch == 1
+    assert not torch.equal(*epochs)
+    _, fresh = _make_openpi_sampling_loaders(size=139)
+    forward_set_epoch(fresh, 1)
+    assert torch.equal(epochs[1], _openpi_sampling_indices(fresh))
+
+
+def test_openpi_sft_eval_order_stays_fixed_across_epochs():
+    from rlinf.data.datasets.common.epoch import forward_set_epoch
+
+    _, loader = _make_openpi_sampling_loaders(shuffle=False)
+    first = _openpi_sampling_indices(loader)
+    forward_set_epoch(loader, 1)
+    assert torch.equal(first, _openpi_sampling_indices(loader))
+
+
+def test_openpi_sft_rejects_a_rank_without_complete_batches():
+    with pytest.raises(ValueError, match="no complete batches on this rank"):
+        _make_openpi_sampling_loaders(size=8, world_size=16)
+
+
+@pytest.mark.parametrize("num_workers,batch_offset", [(0, 0), (0, 3), (0, 8), (2, 3)])
+def test_openpi_sft_cursor_restores_inside_epoch_and_across_next_boundary(
+    num_workers, batch_offset
+):
+    from rlinf.data.datasets.common.epoch import forward_set_epoch
+
+    _, original = _make_openpi_sampling_loaders(size=515, num_workers=num_workers)
+    for epoch in range(3):
+        forward_set_epoch(original, epoch)
+        _openpi_sampling_indices(original)
+    forward_set_epoch(original, 3)
+    iterator = iter(original)
+    for _ in range(batch_offset):
+        next(iterator)
+    saved = original.checkpoint_state(3, batch_offset)
+    expected = [obs.state.clone() for obs, _ in iterator]
+    forward_set_epoch(original, 4)
+    expected.extend(obs.state.clone() for obs, _ in original)
+
+    _, restored = _make_openpi_sampling_loaders(size=515, num_workers=num_workers)
+    iterator = restored.restore_checkpoint_state(saved)
+    actual = [obs.state.clone() for obs, _ in iterator]
+    forward_set_epoch(restored, 4)
+    actual.extend(obs.state.clone() for obs, _ in restored)
+    assert len(actual) == len(expected) == 16 - batch_offset
+    for first, second in zip(actual, expected, strict=True):
+        assert torch.equal(first, second)
+
+
+def _make_openpi_checkpoint_worker(monkeypatch):
+    from contextlib import nullcontext
+
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    # Model/FSDP serialization is checked separately on the execution node.
+    monkeypatch.setattr(
+        FSDPSftWorker, "save_checkpoint", lambda *a, **kw: torch.rand(5)
+    )
+    monkeypatch.setattr(
+        FSDPSftWorker, "load_checkpoint", lambda *a, **kw: torch.rand(7)
+    )
+    monkeypatch.setattr(
+        "rlinf.workers.sft.fsdp_sft_worker.all_reduce_dict", lambda value, **kw: value
+    )
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "data": {"train_data_paths": "indices-only", "checkpoint_data_state": True},
+            "actor": {
+                "seed": 42,
+                "micro_batch_size": 8,
+                "global_batch_size": 192,
+                "model": {
+                    "precision": "fp32",
+                    "num_action_chunks": 50,
+                    "openpi": {
+                        "config_name": "test",
+                        "action_chunk": "${actor.model.num_action_chunks}",
+                    },
+                },
+            },
+        }
+    )
+    worker._rank, worker._world_size = 0, 8
+    _, worker.data_loader = _make_openpi_sampling_loaders(size=515)
+    worker.data_iter = iter(worker.data_loader)
+    worker._data_epoch = worker._data_iter_offset = 0
+    worker.gradient_accumulation = 3
+    worker.global_step = 0
+    worker.model = Mock()
+    worker.worker_timer = nullcontext
+    worker.before_micro_batch = lambda *a, **kw: nullcontext()
+    worker.grad_scaler = Mock()
+    worker.optimizer_step = lambda: (0.0, [1e-4])
+    worker.optimizer = Mock(param_groups=[{"lr": 1e-4}])
+    worker.lr_scheduler = Mock()
+    worker.observed_batches = []
+
+    def receive(batch):
+        worker.observed_batches.append(
+            (batch[0].state.clone(), torch.rand(4), np.random.rand(4), random.random())
+        )
+        return torch.tensor(0.0), {"loss": 0.0}
+
+    worker.get_train_model_output = receive
+    return worker
+
+
+def test_openpi_sft_worker_checkpoint_restores_consumed_batches_and_training_rng(
+    tmp_path, monkeypatch
+):
+    tmp_path = tmp_path / "global_step_6" / "actor"
+    tmp_path.mkdir(parents=True)
+    original = _make_openpi_checkpoint_worker(monkeypatch)
+    for _ in range(6):
+        original.run_training()
+    assert (original._data_epoch, original._data_iter_offset) == (2, 2)
+    assert original._openpi_resume_contract()["model"]["openpi"]["action_chunk"] == 50
+    original.save_checkpoint(str(tmp_path), step=6)
+    assert (tmp_path / "openpi_data_rank_0.pt").is_file()
+    original.observed_batches.clear()
+    for _ in range(4):
+        original.run_training()
+
+    restored = _make_openpi_checkpoint_worker(monkeypatch)
+    restored.load_checkpoint(str(tmp_path))
+    assert (restored._data_epoch, restored._data_iter_offset) == (2, 2)
+    for _ in range(4):
+        restored.run_training()
+    assert len(restored.observed_batches) == len(original.observed_batches) == 12
+    for actual, expected in zip(
+        restored.observed_batches, original.observed_batches, strict=True
+    ):
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+        np.testing.assert_array_equal(actual[2], expected[2])
+        assert actual[3] == expected[3]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "batch",
+        "offset",
+        "rng",
+        "rank",
+        "cpu_rng",
+        "numpy_rng",
+        "python_rng",
+        "loader_rng",
+        "cursor_step",
+        "path_step",
+    ],
+)
+def test_openpi_sft_resume_rejects_missing_or_incompatible_state_before_model_load(
+    tmp_path, monkeypatch, damage
+):
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+
+    tmp_path = tmp_path / "global_step_1" / "actor"
+    tmp_path.mkdir(parents=True)
+    original = _make_openpi_checkpoint_worker(monkeypatch)
+    original.run_training()
+    original.save_checkpoint(str(tmp_path), step=1)
+    restored = _make_openpi_checkpoint_worker(monkeypatch)
+    path = tmp_path / "openpi_data_rank_0.pt"
+    state = torch.load(path, weights_only=False)
+    if damage == "missing":
+        path.unlink()
+    else:
+        if damage == "batch":
+            restored.cfg.actor.global_batch_size = 128
+        elif damage == "offset":
+            state["loader"]["batch_offset"] = 999
+        elif damage == "rng":
+            del state["rng"]["cpu"]
+        elif damage == "rank":
+            state["loader"]["contract"]["rank"] = 1
+        elif damage == "cpu_rng":
+            state["rng"]["cpu"] = torch.zeros(3, dtype=torch.uint8)
+        elif damage == "numpy_rng":
+            state["rng"]["numpy"] = ("invalid algorithm",)
+        elif damage == "python_rng":
+            state["rng"]["random"] = (3, (1,), None)
+        elif damage == "loader_rng":
+            state["loader"]["generator_state"] = torch.zeros(3, dtype=torch.uint8)
+        elif damage == "cursor_step":
+            state["loader"]["epoch"] = 2
+        elif damage == "path_step":
+            state["step"] = 2
+            state["loader"]["batch_offset"] = 6
+        torch.save(state, path)
+    model_load = Mock()
+    monkeypatch.setattr(FSDPSftWorker, "load_checkpoint", model_load)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        restored.load_checkpoint(str(tmp_path))
+    model_load.assert_not_called()
+
+
+def test_openpi_sft_resume_rejects_another_ranks_error_before_model_load(
+    tmp_path, monkeypatch
+):
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+
+    tmp_path = tmp_path / "global_step_1" / "actor"
+    tmp_path.mkdir(parents=True)
+    worker = _make_openpi_checkpoint_worker(monkeypatch)
+    worker.run_training()
+    worker.save_checkpoint(str(tmp_path), step=1)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def gather_errors(output, local_result):
+        assert local_result == (None, (1, 0, 3))
+        output[:] = [
+            local_result,
+            ("FileNotFoundError: missing rank 1 data state", None),
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_errors)
+    model_load = Mock()
+    monkeypatch.setattr(FSDPSftWorker, "load_checkpoint", model_load)
+    with pytest.raises(RuntimeError, match="rank 1: FileNotFoundError"):
+        worker.load_checkpoint(str(tmp_path))
+    model_load.assert_not_called()
+
+
+def test_openpi_sft_checkpoint_rejects_cursor_step_mismatch_before_model_save(
+    tmp_path, monkeypatch
+):
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+
+    worker = _make_openpi_checkpoint_worker(monkeypatch)
+    worker.run_training()
+    model_save = Mock()
+    monkeypatch.setattr(FSDPSftWorker, "save_checkpoint", model_save)
+    with pytest.raises(ValueError, match="cursor and completed training step"):
+        worker.save_checkpoint(str(tmp_path), step=2)
+    model_save.assert_not_called()
+
+
+def test_openpi_sft_resume_rejects_mismatched_rank_positions_before_model_load(
+    tmp_path, monkeypatch
+):
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+
+    tmp_path = tmp_path / "global_step_1" / "actor"
+    tmp_path.mkdir(parents=True)
+    worker = _make_openpi_checkpoint_worker(monkeypatch)
+    worker.run_training()
+    worker.save_checkpoint(str(tmp_path), step=1)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def gather_positions(output, local_result):
+        output[:] = [local_result, (None, (2, 0, 6))]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_positions)
+    model_load = Mock()
+    monkeypatch.setattr(FSDPSftWorker, "load_checkpoint", model_load)
+    with pytest.raises(RuntimeError, match="differ across ranks"):
+        worker.load_checkpoint(str(tmp_path))
+    model_load.assert_not_called()
+
+
+def test_openpi_sft_seeds_initialization_before_parent_init_when_enabled(monkeypatch):
+    from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create({"actor": {"seed": 42, "seed_training_rng": True}})
+    seen = []
+    monkeypatch.setattr(
+        FSDPSftWorker,
+        "init_worker",
+        lambda self: seen.append((torch.rand(4), np.random.rand(4), random.random())),
+    )
+    worker.init_worker()
+    torch.rand(11)
+    np.random.rand(11)
+    random.random()
+    worker.init_worker()
+    assert torch.equal(seen[0][0], seen[1][0])
+    np.testing.assert_array_equal(seen[0][1], seen[1][1])
+    assert seen[0][2] == seen[1][2]
+    worker.cfg.actor.seed_training_rng = False
+    worker.init_worker()
+    assert not torch.equal(seen[1][0], seen[2][0])
+
+
+def test_piper_critical_replay_filters_prefix_and_preserves_epoch_terminals(
+    monkeypatch,
+):
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+    from rlinf.workers.actor import fsdp_rlt_ac_policy_worker as rlt
+
+    monkeypatch.setattr(rlt, "all_reduce_dict", lambda values, **kwargs: values)
+
+    class Learner(rlt.RLTACReplayMixin):
+        pass
+
+    learner = Learner()
+    learner.cfg = OmegaConf.create(
+        {
+            "algorithm": {"replay_buffer": {"critical_phase_only": True}},
+            "env": {"train": {"env_type": "real", "auto_reset": True}},
+        }
+    )
+    learner.replay_buffer = TrajectoryReplayBuffer(seed=123, sample_window_size=4)
+    learner.demo_buffer = None
+    values = torch.arange(4, dtype=torch.float32).reshape(4, 1, 1)
+    flags = torch.tensor([False, True, False, True]).reshape(4, 1, 1)
+    # Two epochs, each with an initial slot followed by two action chunks.
+    dones = torch.tensor([False, False, False, False, False, True]).reshape(6, 1, 1)
+    trajectory = Trajectory(
+        max_episode_length=4,
+        actions=values.clone(),
+        rewards=values.clone(),
+        dones=dones,
+        terminations=dones.clone(),
+        truncations=torch.zeros_like(dones),
+        curr_obs={"z_rl": values.clone()},
+        next_obs={"z_rl": values + 10},
+        forward_inputs={
+            "record_transition": flags,
+            "actor_switch": torch.zeros_like(flags),
+        },
+    )
+    added, completed = learner._ingest_rollout_trajectories([trajectory])
+    assert (added, completed) == (2, 1)
+    assert learner.replay_buffer.total_samples == 2
+    seen = set()
+    for _ in range(10):
+        batch = learner.replay_buffer.sample(2)
+        seen.update(batch["actions"].flatten().tolist())
+        assert batch["forward_inputs"]["record_transition"].all()
+        assert not batch["forward_inputs"]["actor_switch"].any()
+        torch.testing.assert_close(
+            batch["next_obs"]["z_rl"], batch["curr_obs"]["z_rl"] + 10
+        )
+        assert torch.equal(batch["terminations"], batch["actions"] == 3)
+    assert seen == {1.0, 3.0}
+    assert trajectory.actions.shape[0] == 4
+    trajectory.forward_inputs["record_transition"] = torch.zeros_like(flags)
+    assert learner._ingest_rollout_trajectories([trajectory]) == (0, 0)
+    assert learner.replay_buffer.total_samples == 2
+
+
+def test_piper_critical_replay_rejects_missing_phase_labels():
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACReplayMixin
+
+    learner = RLTACReplayMixin()
+    learner.cfg = OmegaConf.create(
+        {
+            "algorithm": {"replay_buffer": {"critical_phase_only": True}},
+            "env": {"train": {"env_type": "real"}},
+        }
+    )
+    learner.replay_buffer = TrajectoryReplayBuffer(sample_window_size=4)
+    learner.demo_buffer = None
+    trajectory = Trajectory(actions=torch.zeros(1, 1, 7), rewards=torch.zeros(1, 1, 1))
+    with pytest.raises(ValueError, match="record_transition"):
+        learner._ingest_rollout_trajectories([trajectory])
+    assert learner.replay_buffer.total_samples == 0
+
+
+def test_piper_warmup_chunks_keep_terminal_rewards_and_do_not_cross_phase():
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+
+    actions = np.arange(140, dtype=np.float32).reshape(20, 7)
+    data = episode_transitions(
+        actions,
+        phases=[{"start": 4, "end": 17}],
+        terminal=17,
+        chunk_length=10,
+        stride=10,
+        success=True,
+        human=np.zeros(20, dtype=bool),
+    )
+    np.testing.assert_array_equal(data["frames"], [4, 14, 17])
+    np.testing.assert_array_equal(data["valid_steps"], [10, 3])
+    np.testing.assert_array_equal(data["terminated"], [False, True])
+    np.testing.assert_array_equal(data["actions"][1, :3], actions[14:17])
+    assert not data["actions"][1, 3:].any()
+    assert data["rewards"].sum() == data["rewards"][1] == 1
+    with pytest.raises(ValueError, match="terminal observation"):
+        episode_transitions(
+            actions,
+            phases=[{"start": 4, "end": 20}],
+            terminal=20,
+            chunk_length=10,
+            stride=10,
+            success=True,
+            human=np.zeros(20, dtype=bool),
+        )
+
+
+def test_piper_warmup_separate_phases_keep_action_windows_and_reference_gaps():
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+
+    actions = np.arange(35 * 7, dtype=np.float32).reshape(35, 7)
+    data = episode_transitions(
+        actions,
+        phases=[{"start": 2, "end": 17}, {"start": 24, "end": 27}],
+        terminal=30,
+        chunk_length=10,
+        stride=10,
+        success=True,
+        human=np.zeros(35, dtype=bool),
+    )
+    for key, expected in {
+        "current": [2, 12, 24],
+        "action_end": [12, 17, 27],
+        "next": [12, 24, 30],
+    }.items():
+        np.testing.assert_array_equal(data["frames"][data[key]], expected)
+    for key, expected in {
+        "valid_steps": [10, 5, 3],
+        "discount_steps": [10, 12, 6],
+        "next_valid_steps": [5, 3, 0],
+        "phase_id": [0, 0, 1],
+        "terminated": [False, False, True],
+        "rewards": [0, 0, 1],
+    }.items():
+        np.testing.assert_array_equal(data[key], expected)
+    for row, (start, end) in enumerate(((2, 12), (12, 17), (24, 27))):
+        np.testing.assert_array_equal(
+            data["actions"][row, : end - start], actions[start:end]
+        )
+        assert not data["actions"][row, end - start :].any()
+
+
+@pytest.mark.parametrize(
+    "phases",
+    [
+        [],
+        [{"start": 1, "end": None}],
+        [{"start": 2, "end": 2}],
+        [{"start": -1, "end": 5}],
+        [{"start": 2, "end": 14}],
+        [{"start": 1, "end": 5}, {"start": 4, "end": 8}],
+        [{"start": True, "end": 5}],
+    ],
+)
+def test_piper_warmup_rejects_incomplete_or_overlapping_phase_labels(
+    piper_warmup_cache,
+    tmp_path,
+    phases,
+):
+    from rlinf.data.datasets.rlt_warmup import load_episode_annotations
+
+    labels = json.loads((piper_warmup_cache / "manifest.json").read_text())[
+        "annotations"
+    ]
+    labels["episodes"][0]["critical_phases"] = phases
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(labels))
+    with pytest.raises(ValueError, match="critical phase|Critical phase"):
+        load_episode_annotations(path)
+
+
+def test_piper_warmup_legacy_annotations_preserve_the_explicit_old_interval(
+    piper_warmup_cache,
+    tmp_path,
+):
+    from rlinf.data.datasets.rlt_warmup import LABEL_FORMAT, load_episode_annotations
+
+    labels = json.loads((piper_warmup_cache / "manifest.json").read_text())[
+        "annotations"
+    ]
+    labels["format"] = "piper-rlt-episodes-v1"
+    for record in labels["episodes"]:
+        record.pop("critical_phases")
+        record["critical_start"] = 1
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(labels))
+    loaded = load_episode_annotations(path)
+    assert loaded["format"] == LABEL_FORMAT
+    for record in loaded["episodes"]:
+        assert record["critical_phases"] == [
+            {"start": 1, "end": record["terminal_frame"]}
+        ]
+
+
+@pytest.mark.parametrize(
+    "column, message",
+    [
+        ("discount_steps", "actual reference-controlled ticks"),
+        ("next_valid_steps", "next action window crosses phase boundaries"),
+    ],
+)
+def test_piper_warmup_rejects_inconsistent_phase_timing_in_cache(
+    piper_warmup_cache,
+    column,
+    message,
+):
+    from rlinf.data.datasets.rlt_warmup import (
+        CachedRLTReplay,
+        file_sha256,
+        json_fingerprint,
+    )
+
+    path = piper_warmup_cache / "manifest.json"
+    manifest = json.loads(path.read_text())
+    entry = manifest["episodes"][0]
+    shard = piper_warmup_cache / entry["file"]
+    with np.load(shard) as original:
+        arrays = {key: original[key].copy() for key in original.files}
+    arrays[column][0] += 1
+    np.savez(shard, **arrays)
+    entry["sha256"] = file_sha256(shard)
+    manifest.pop("content_fingerprint")
+    manifest["content_fingerprint"] = json_fingerprint(manifest)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=message):
+        CachedRLTReplay(piper_warmup_cache)
+
+
+def test_piper_warmup_cache_only_samples_training_and_restores_rng(piper_warmup_cache):
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
+
+    replay = CachedRLTReplay(piper_warmup_cache)
+    state = replay.rng_state()
+    first = replay.sample(4096)
+    # Each episode's feature identity is known; validation identities are 0.2/0.3.
+    identities = first["curr_obs"]["z_rl"][:, 0]
+    assert identities.min() >= 0 and identities.max() < 0.2
+    assert 0.45 < float((identities == 0).float().mean()) < 0.55
+    replay.restore_rng(state)
+    repeated = replay.sample(4096)
+    for key in first["curr_obs"]:
+        torch.testing.assert_close(
+            first["curr_obs"][key], repeated["curr_obs"][key], rtol=0, atol=0
+        )
+    assert (
+        replay.counts("validation")["success"]
+        == replay.counts("validation")["failure"]
+        == 1
+    )
+
+
+def test_piper_warmup_rejects_changed_shards_and_leaking_annotations(
+    piper_warmup_cache, tmp_path
+):
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay, load_episode_annotations
+
+    manifest = json.loads((piper_warmup_cache / "manifest.json").read_text())
+    labels = manifest["annotations"]
+    labels["episodes"][0]["session"] = labels["episodes"][2]["session"] = "same scene"
+    path = tmp_path / "labels.json"
+    path.write_text(json.dumps(labels))
+    with pytest.raises(ValueError, match="crosses train/validation"):
+        load_episode_annotations(path)
+    shard = piper_warmup_cache / manifest["episodes"][0]["file"]
+    with shard.open("ab") as stream:
+        stream.write(b"corruption")
+    with pytest.raises(ValueError, match="shard changed"):
+        CachedRLTReplay(piper_warmup_cache)
+
+
+def test_piper_warmup_collection_split_rejects_missing_labels_and_keeps_sessions(
+    tmp_path,
+):
+    from rlinf.data.datasets.rlt_warmup import (
+        LABEL_FORMAT,
+        load_episode_annotations,
+        split_collection_annotations,
+    )
+
+    labels = {
+        "format": LABEL_FORMAT,
+        "task": "USB",
+        "phase_definition": "approach to insertion",
+        "datasets": {"piper": "dataset"},
+        "episodes": [],
+    }
+    for index in range(20):
+        labels["episodes"].append(
+            {
+                "dataset": "piper",
+                "episode": index,
+                "critical_phases": [{"start": 1, "end": 5}, {"start": 10, "end": 15}],
+                "terminal_frame": 20,
+                "outcome": "success" if index % 2 else "failure",
+                "behavior": "reference",
+                "session": f"scene{index // 2}",
+                "split": None,
+            }
+        )
+    source = tmp_path / "collected.json"
+    source.write_text(json.dumps(labels))
+    output = split_collection_annotations([source], tmp_path / "labels.json")
+    result = load_episode_annotations(output)
+    assert len(result["episodes"]) == 20
+    assert all(len(r["critical_phases"]) == 2 for r in result["episodes"])
+    assert {r["split"] for r in result["episodes"]} == {"train", "validation"}
+    labels["episodes"][0]["critical_phases"][0]["end"] = None
+    source.write_text(json.dumps(labels))
+    with pytest.raises(ValueError, match="Unpaired critical phase"):
+        split_collection_annotations([source], tmp_path / "invalid.json")

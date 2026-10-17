@@ -4427,3 +4427,195 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
     assert selected_seed_0 == selected_seed_0_again
     assert selected_seed_0 != selected_seed_1
+
+
+def test_piper_online_env_exposes_dataset_units_but_replays_normalized_actions(
+    tmp_path,
+):
+    import json
+
+    from rlinf.envs.real.env import RealWorldEnv
+    from rlinf.envs.real.piper.policy import PiperPolicyEnv
+
+    stats = tmp_path / "norm_stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "actions": {
+                        "mean": [0.0] * 7,
+                        "std": [1.0] * 7,
+                        "q01": [-1.0, 0.0, -1.0, -1.0, -1.0, -1.0, 0.0],
+                        "q99": [1.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.07],
+                    }
+                }
+            }
+        )
+    )
+    env = PiperPolicyEnv(
+        {
+            "is_dummy": True,
+            "norm_stats_path": str(stats),
+            "hardware_path": "unused",
+            "task": "insert USB",
+            "max_num_steps": 2,
+            "step_frequency": 1000,
+            "image_width": 9,
+            "image_height": 8,
+        }
+    )
+    obs, info = env.reset()
+    assert info["rlt_switch_flags"] is False
+    env.set_actor_enabled(True)
+    action = np.zeros(7, np.float32)
+    obs, reward, terminated, truncated, info = env.step(action)
+    np.testing.assert_allclose(obs["state"]["joint_gripper"], env.codec.decode(action))
+    np.testing.assert_allclose(env.get_hold_action(), action, atol=1e-5)
+    assert info["rlt_switch_flags"] and not terminated and not truncated
+    # Terminal reporting must not execute the next policy target.
+    env.finish_episode(True)
+    final, reward, terminated, truncated, info = env.step(np.full(7, np.nan))
+    assert reward == 1 and terminated and not truncated
+    np.testing.assert_array_equal(
+        final["state"]["joint_gripper"], obs["state"]["joint_gripper"]
+    )
+    # A fixed-length native chunk may still contain slots after scoring.
+    _, reward, terminated, truncated, info = env.step(action)
+    assert reward == 0 and terminated and not truncated
+    assert not info["action_valid"] and "intervene_action" not in info
+    env.reset()
+    env.step(action)
+    _, _, terminated, truncated, _ = env.step(action)
+    assert truncated and not terminated
+    # Native RealWorldEnv maintains front/front_2/wrist order for the feature model.
+    wrapper = RealWorldEnv.__new__(RealWorldEnv)
+    wrapper.main_image_key = "front"
+    wrapper.task_descriptions = ["insert USB"]
+    batched = {
+        "state": {"joint_gripper": obs["state"]["joint_gripper"][None]},
+        "frames": {name: image[None] for name, image in obs["frames"].items()},
+    }
+    wrapped = wrapper._wrap_obs(batched)
+    assert wrapped["states"].shape == (1, 7)
+    assert wrapped["extra_view_images"].shape == (1, 2, 8, 9, 3)
+    env.close()
+
+
+def test_piper_native_human_overrides_actor_until_fresh_chunk(tmp_path, monkeypatch):
+    import json
+    from collections import deque
+
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.piper import policy as piper_env
+    from rlinf.envs.real.wrappers.episode import keyboard
+    from rlinf.robotics import PiperRobot
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+    from rlinf.robotics.piper_intervention import (
+        PiperIntervention,
+        PiperInterventionConfig,
+    )
+    from rlinf.robotics.piper_runtime import PiperExecutionConfig, PiperSession
+
+    class Camera:
+        is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def disconnect(self):
+            self.is_connected = False
+
+        def read_latest(self, **kwargs):
+            return np.zeros((8, 9, 3), np.uint8)
+
+    class Keyboard:
+        def __init__(self):
+            self.events = deque([[], ["a"]])
+
+        def pop_pressed_keys(self):
+            return self.events.popleft() if self.events else []
+
+        def close(self):
+            pass
+
+    stats = tmp_path / "norm_stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "actions": {
+                        "mean": [0.0] * 7,
+                        "std": [1.0] * 7,
+                        "q01": [-1.0, 0.0, -1.0, -1.0, -1.0, -1.0, 0.0],
+                        "q99": [1.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.07],
+                    }
+                }
+            }
+        )
+    )
+    with mocked_sdks() as sdk:
+        control = PiperIntervention(
+            PiperLeader("can-leader", config=PiperLeaderConfig(startup_sleep_s=0)),
+            PiperInterventionConfig(alignment_duration_s=0.001, toggle_cooldown_s=1e-9),
+        )
+        session = PiperSession(
+            PiperRobot(arm=PiperArm.declare("can-follower", firmware="v189")),
+            {name: Camera() for name in ("front", "front_2", "wrist")},
+            PiperExecutionConfig(fps=1000, check_action_limits=False),
+            control,
+        )
+        monkeypatch.setattr(piper_env, "build_piper_session", lambda path: session)
+        monkeypatch.setattr(keyboard, "KeyboardListener", Keyboard)
+        env = piper_env.PiperPolicyEnv(
+            {
+                "hardware_path": "mock CAN and cameras",
+                "norm_stats_path": str(stats),
+                "task": "insert USB",
+                "step_frequency": 1000.0,
+                "max_num_steps": 100,
+                "image_width": 9,
+                "image_height": 8,
+            }
+        )
+        try:
+            env.reset()
+            env.on_action_chunk_begin()
+            env.listener.events.append(["b", "i"])
+            _, _, _, _, info = env.step(np.zeros(7))
+            assert info["rlt_switch_flags"] and info["action_source"] == "human"
+            device = sdk["piper_sdk"].devices[-1]
+            device.target[:] = [90, 10, -10, 0, 0, 0, 20]
+            _, _, _, _, info = env.step(np.full(7, np.nan))
+            # Invalid unused policy outputs must never supersede human control.
+            np.testing.assert_allclose(
+                info["intervene_action"], env.codec.encode(session.last_command)
+            )
+            assert (
+                info["intervene_action"][0] > 1
+            )  # No quantile clipping of human commands.
+            held = session.last_command.copy()
+            env.listener.events.append(["i", "b"])
+            _, _, _, _, info = env.step(np.full(7, -1.0))
+            assert not info["rlt_switch_flags"] and info["action_source"] == "human"
+            np.testing.assert_allclose(session.last_command, held)
+            _, _, _, _, info = env.step(np.full(7, -1.0))
+            assert (
+                info["action_source"] == "human"
+            )  # Remaining old chunk stays invalid.
+            env.on_action_chunk_begin()
+            _, _, _, _, info = env.step(np.zeros(7))
+            assert info["action_source"] == "policy" and "intervene_action" not in info
+            np.testing.assert_allclose(info["executed_action"], np.zeros(7), atol=1e-5)
+            env.finish_episode(True)
+            _, reward, done, _, info = env.step(np.full(7, np.nan))
+            assert done and reward == 1 and not info["action_valid"]
+            _, reward, done, _, info = env.step(np.full(7, np.nan))
+            assert done and reward == 0 and "intervene_action" not in info
+            assert not control.leader.manual
+        finally:
+            env.close()
+        assert device.closed and all(
+            not c.is_connected for c in session.cameras.values()
+        )

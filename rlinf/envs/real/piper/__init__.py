@@ -20,15 +20,17 @@ from rlinf.envs.real.registry import register_tasks
 from rlinf.robotics.parts.arms.piper import PiperRobotState
 
 from .base import PiperEnv, PiperEnvConfig
+from .policy import PiperPolicyEnv
 from .reach import PiperReachConfig, PiperReachEnv
 
-TASKS = {"PiperReachEnv-v1": PiperReachEnv}
+TASKS = {"PiperReachEnv-v1": PiperReachEnv, "PiperPolicyEnv-v1": PiperPolicyEnv}
 
 _ENTRY_POINTS = register_tasks(__name__, globals(), TASKS)
 
 __all__ = [
     "TASKS",
     "PiperEnv",
+    "PiperPolicyEnv",
     "PiperReachConfig",
     "PiperReachEnv",
     "PiperEnvConfig",

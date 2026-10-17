@@ -148,6 +148,22 @@ class Encoder(nn.Module):
         return x
 
 
+class Float32Conv2d(nn.Conv2d):
+    """Keep the vision stem calculation in FP32 inside its module forward.
+
+    Reading a separately FSDP-wrapped stem's weights from the parent forward
+    bypasses its gradient synchronization hooks. Keep the casts here so the
+    parent can call the module normally without changing checkpoint keys.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self._conv_forward(
+            input.float(),
+            self.weight.float(),
+            None if self.bias is None else self.bias.float(),
+        )
+
+
 class SigLIPViT(nn.Module):
     """SigLIP Vision Transformer for Pi0. Uses So400m/14 by default with pool_type="none".
 
@@ -176,7 +192,7 @@ class SigLIPViT(nn.Module):
             _str_to_dtype(dtype_mm) if isinstance(dtype_mm, str) else dtype_mm
         )
 
-        self.stem = nn.Conv2d(
+        self.stem = Float32Conv2d(
             3,
             self.width,
             kernel_size=self.patch_size,
@@ -250,13 +266,7 @@ class SigLIPViT(nn.Module):
         # --- Stem + pos_embed in float32 (matching JAX) ---
         # image is (B, H, W, C) -> (B, C, H, W)
         x = image.permute(0, 3, 1, 2)
-        x = F.conv2d(
-            x.float(),
-            self.stem.weight.float(),
-            None if self.stem.bias is None else self.stem.bias.float(),
-            stride=self.stem.stride,
-            padding=self.stem.padding,
-        )
+        x = self.stem(x.float())
         B, C, h, w = x.shape
         x = x.reshape(B, C, h * w).permute(0, 2, 1)  # (B, h*w, width)
 

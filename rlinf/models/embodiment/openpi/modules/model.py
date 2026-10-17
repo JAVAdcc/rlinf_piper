@@ -208,11 +208,12 @@ def preprocess_observation(
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
     rng: torch.Generator | None = None,
+    spatial_augmentation: bool = True,
 ) -> Observation:
     """Preprocess observations with optional image augmentations.
 
-    For training, applies random crop, rotate, and color jitter augmentations.
-    Resizes images to the target resolution with padding.
+    Resize with padding. Training applies crop and rotation when
+    ``spatial_augmentation`` is enabled, and color jitter with an explicit RNG.
     """
     if not set(image_keys).issubset(observation.images):
         raise ValueError(
@@ -234,7 +235,9 @@ def preprocess_observation(
         if image.shape[1:3] != image_resolution:
             image = resize_with_pad_torch(image, *image_resolution)
 
-        if train:
+        if train and (spatial_augmentation or rng is not None):
+            import torchvision.transforms.functional as TF
+
             # Convert from [-1, 1] to [0, 1] for augmentations
             image = image / 2.0 + 0.5
             # image is in (B, H, W, C) format
@@ -245,10 +248,8 @@ def preprocess_observation(
                 aug_image = image[i]  # (H, W, C)
                 aug_image = aug_image.permute(2, 0, 1)  # (C, H, W) for torchvision
 
-                if "wrist" not in key:
+                if spatial_augmentation and "wrist" not in key:
                     # Random crop (95% of size) then resize back
-                    import torchvision.transforms.functional as TF
-
                     h, w = aug_image.shape[1], aug_image.shape[2]
                     crop_h, crop_w = int(h * 0.95), int(w * 0.95)
                     top = (

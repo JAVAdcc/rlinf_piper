@@ -91,6 +91,14 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         "action_expert_variant": str(model_cfg.action_expert_variant),
         "dtype": _pi0_dtype_name(target_dtype),
         "pcd": False,
+        "spatial_augmentation": bool(
+            OmegaConf.select(
+                model_cfg,
+                "spatial_augmentation",
+                default=OmegaConf.select(model_cfg, "config_name", default="")
+                not in ("pi05_piper", "pi05_piper_h50_state"),
+            )
+        ),
     }
     discrete_state_input = OmegaConf.select(
         model_cfg, "discrete_state_input", default=None
@@ -242,6 +250,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             "use 'eval', 'sft', 'rl', 'dagger', or 'dsrl'."
         )
 
+    # Establish storage dtypes before copying saved values. Casting afterward
+    # would round FP32 islands through BF16 and irreversibly alter checkpoints.
+    _apply_openpi_param_dtypes(model, target_dtype)
     if full_weights_path is not None:
         load_full_weights(
             model,
@@ -252,9 +263,13 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     elif safetensors_path is not None:
         load_base_safetensors(model, safetensors_path)
 
-    _freeze_after_load(model, task)
-    _apply_openpi_param_dtypes(model, target_dtype)
-
+    _freeze_after_load(
+        model,
+        task,
+        train_expert_only=bool(
+            OmegaConf.select(model_cfg, "train_expert_only", default=False)
+        ),
+    )
     n_params = sum(param.numel() for param in model.parameters())
     source = full_weights_path if full_weights_path is not None else safetensors_path
     logger.info(
@@ -272,8 +287,18 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     return model
 
 
-def _freeze_after_load(model, task: str) -> None:
+def _freeze_after_load(model, task: str, *, train_expert_only: bool = False) -> None:
     """Freeze after weights load so ``requires_grad`` is the post-load truth."""
+    if task == "sft":
+        if train_expert_only:
+            frozen = model.freeze_vlm()
+            logger.info(
+                "openpi[sft]: train_expert_only=True; froze %d parameter "
+                "tensors (SigLIP + gemma expert-0); action expert and "
+                "optional RLT module remain trainable",
+                frozen,
+            )
+        return
     if task == "rl" and getattr(model, "rl_cfg", None) is not None:
         if model.rl_cfg.train_expert_only:
             frozen = model.freeze_vlm()
@@ -293,7 +318,7 @@ def _freeze_after_load(model, task: str) -> None:
 
 
 def _apply_openpi_param_dtypes(model, target_dtype) -> None:
-    """Apply OpenPI's selective mixed precision after checkpoint load.
+    """Establish OpenPI's parameter storage precision before checkpoint load.
 
     YAML ``precision: null`` (OpenPI default) and ``bf16`` both mean: Gemma /
     SigLIP weights in bf16, RMSNorm + vision stem + action/value heads in fp32.

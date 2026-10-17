@@ -1,0 +1,29 @@
+# Run from the repository root: python -m toolkits.piper.warmup cache|train
+stage1: checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor
+annotations: outputs/piper/episodes.json
+cache: outputs/piper/rlt_cache
+output: outputs/piper/rlt_warmup
+hardware: examples/embodiment/config/piper_usb_hardware.yaml
+device: cuda:0
+seed: 1234
+threads: 4
+
+# The frozen Stage 1 metadata supplies the H50 model and normalization contract.
+chunk_length: 10
+stride: 10
+training:
+  bc_steps: 5000
+  critic_steps: 10000
+  joint_steps: 5000
+  actor_every: 4
+  batch_size: 64
+  eval_every: 1000
+  save_every: 1000
+
+# Remaining optimizer and validation defaults are typed in WarmupConfig.
+# Effective values are saved to output/config.json before training.
+validation:
+  consecutive_passes: 3
+  min_train_per_outcome: 20
+  min_validation_per_outcome: 10
+  min_train_transitions: 600

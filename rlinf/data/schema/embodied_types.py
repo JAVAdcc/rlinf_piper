@@ -149,6 +149,8 @@ class EnvTransition:
     intervene_actions: torch.Tensor | None = None
     # Environment-side intervention mask, bool [B, C].
     intervene_flags: torch.Tensor | None = None
+    # Confirmed commands, independently of human ownership, float [B, D].
+    executed_actions: torch.Tensor | None = None
     # RLT route chosen per action, usually bool/int [B, C].
     rlt_switch_flags: torch.Tensor | None = None
     # External reward-model scores aligned with ``rewards``, float [B, C].
@@ -166,6 +168,7 @@ class EnvTransition:
             "truncations",
             "intervene_actions",
             "intervene_flags",
+            "executed_actions",
             "rlt_switch_flags",
             "reward_model_output",
         ):
@@ -199,6 +202,7 @@ class EnvTransition:
                 "rewards",
                 "intervene_actions",
                 "intervene_flags",
+                "executed_actions",
                 "rlt_switch_flags",
             )
         }
@@ -710,6 +714,8 @@ class TrajectoryStep:
                 else None
             ),
         )
+        if env.transition.executed_actions is not None:
+            step.set_executed_actions(env.transition.executed_actions)
         if env.transition.intervene_actions is not None:
             step.apply_interventions(
                 env.transition.intervene_actions,
@@ -724,6 +730,15 @@ class TrajectoryStep:
             enable_rlt=enable_rlt,
         )
         return step
+
+    def set_executed_actions(self, actions: torch.Tensor) -> None:
+        """Use confirmed commands as replay actions without changing BC ownership."""
+        if self.actions is None or actions.shape != self.actions.shape:
+            raise ValueError("Executed actions must match the flattened policy chunk.")
+        self.actions = actions.detach().cpu().contiguous()
+        if "action" in self.forward_inputs:
+            self.forward_inputs["action"] = self.actions
+        self.forward_inputs.pop("model_action", None)
 
     def apply_interventions(
         self,
@@ -746,7 +761,7 @@ class TrajectoryStep:
         flags = intervene_flags.to(torch.bool).reshape(batch_size, chunk_count, 1)
         model_actions = self.actions.reshape(batch_size, chunk_count, -1)
         expert_actions = intervene_actions.reshape(batch_size, chunk_count, -1)
-        actions = expert_actions * flags + model_actions * (~flags)
+        actions = torch.where(flags, expert_actions, model_actions)
         self.actions = actions.reshape(batch_size, -1).cpu().contiguous()
         self.intervene_flags = flags.expand_as(actions).reshape(batch_size, -1)
         if "action" in self.forward_inputs:
@@ -766,7 +781,9 @@ class TrajectoryStep:
         expanded = intervene_flags.reshape(batch_size, chunk_count, 1).expand_as(
             self.actions.reshape(batch_size, chunk_count, -1)
         )
-        self.intervene_flags = expanded.reshape(batch_size, -1).to(torch.bool)
+        flags = expanded.reshape(batch_size, -1).to(torch.bool)
+        # Model-side expert labels cannot erase a physical human intervention.
+        self.intervene_flags = flags | self.intervene_flags.to(flags.device)
 
     def set_transition_observations(
         self,
@@ -779,18 +796,13 @@ class TrajectoryStep:
         """Extract the transition representation required by the algorithm."""
         if enable_rlt:
             from rlinf.algorithms.rlt.transition import (
-                apply_rlt_interventions,
                 extract_rlt_obs_from_forward_inputs,
             )
 
             if env.next_rlt_obs is None:
                 raise ValueError("RLT transitions require next-state features.")
             current_obs = extract_rlt_obs_from_forward_inputs(self.forward_inputs)
-            apply_rlt_interventions(
-                current_obs,
-                env.transition.intervene_actions,
-                env.transition.intervene_flags,
-            )
+            # Human actions belong in actions/BC labels, never in actor inputs.
             next_obs = env.next_rlt_obs
         elif collect_transitions:
             if env.next_obs is None:
@@ -1515,7 +1527,11 @@ class LeRobotFrame:
     def _executed_action(
         action: np.ndarray, info: Any, action_dim: int
     ) -> tuple[np.ndarray, bool]:
-        """Apply an environment-recorded expert action when intervention is active."""
+        """Prefer confirmed commands while keeping intervention ownership separate."""
+        if isinstance(info, dict) and info.get("executed_action") is not None:
+            action = LeRobotChunk._to_numpy(info["executed_action"]).reshape(
+                -1, action_dim
+            )[-1]
         if not isinstance(info, dict) or not {
             "intervene_action",
             "intervene_flag",

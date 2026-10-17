@@ -601,6 +601,10 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         return flow_loss, metrics
 
     def obs_processor(self, env_obs):
+        if self.config.config_name == "pi05_piper":
+            from rlinf.models.embodiment.piper_inference import piper_batch_inputs
+
+            return piper_batch_inputs(env_obs)
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],

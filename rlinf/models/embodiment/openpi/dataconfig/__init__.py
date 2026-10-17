@@ -61,6 +61,7 @@ from rlinf.models.embodiment.openpi.dataconfig.maniskill_rlt_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.piper_dataconfig import PiperDataConfig
 from rlinf.models.embodiment.openpi.dataconfig.polaris_dataconfig import (
     LeRobotPolarisDroidDataConfig,
 )
@@ -75,6 +76,30 @@ from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import 
 )
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_piper",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False
+        ),
+        data=PiperDataConfig(
+            repo_id="piper",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="piper"),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    TrainConfig(
+        name="pi05_piper_h50_state",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, discrete_state_input=True
+        ),
+        data=PiperDataConfig(
+            repo_id="piper",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="piper"),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
     TrainConfig(
         name="pi0_libero",
         model=pi0_config.Pi0Config(),

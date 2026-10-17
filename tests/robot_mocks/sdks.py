@@ -36,13 +36,19 @@ def pinocchio() -> types.ModuleType:
 
     class Model:
         nv = ARM_DOF
+        nq = ARM_DOF
         nframes = 3
 
         def __init__(self):
+            self.inertias = [0.0] * (ARM_DOF + 1)
+            self.gravity = types.SimpleNamespace(linear=np.zeros(3))
             self.frames = [
                 types.SimpleNamespace(name=name)
                 for name in ("universe", "link6", "gripper_center")
             ]
+
+        def createData(self):  # noqa: N802
+            return Data()
 
         def getFrameId(self, name):  # noqa: N802 - the vendor spells it this way
             for index, frame in enumerate(self.frames):
@@ -71,6 +77,9 @@ def pinocchio() -> types.ModuleType:
         LOCAL_WORLD_ALIGNED="LOCAL_WORLD_ALIGNED",
         Model=Model,
         Data=Data,
+        buildModelFromUrdf=lambda _path: Model(),
+        Inertia=lambda mass, _com, _inertia: mass,
+        computeGeneralizedGravity=lambda _model, _data, q: np.sin(q),
         _fake_model=Model,
         _fake_data=Data,
     )

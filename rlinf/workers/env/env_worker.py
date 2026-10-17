@@ -457,10 +457,14 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
+        executed_actions = infos.get("executed_action")
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
         )
         if self.cfg.env.train.auto_reset and chunk_dones.any():
+            executed_actions = infos["final_info"].get(
+                "executed_action", executed_actions
+            )
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
@@ -476,6 +480,7 @@ class EnvWorker(Worker):
                 truncations=chunk_truncations,
                 intervene_actions=intervene_actions,
                 intervene_flags=intervene_flags,
+                executed_actions=executed_actions,
                 rlt_switch_flags=rlt_switch_flags,
             ),
         )

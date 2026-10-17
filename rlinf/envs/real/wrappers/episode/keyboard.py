@@ -15,7 +15,6 @@
 import errno
 import os
 import threading
-import time
 from collections import deque
 from typing import Any
 
@@ -43,6 +42,7 @@ class KeyboardListener:
         self._list_devices = list_devices
 
         self.state_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.latest_data = {"key": None}
         # Queue press edges so short taps are not lost between polls.
         self._press_events: deque[str] = deque()
@@ -152,9 +152,11 @@ class KeyboardListener:
     def _listen_loop(self) -> None:
         # Retain the path so the listener can recover after USB disconnects.
         device_path = self.device.path
-        while True:
+        while not self._stop_event.is_set():
             try:
                 for event in self.device.read_loop():
+                    if self._stop_event.is_set():
+                        return
                     if event.type != self._ecodes.EV_KEY:
                         continue
 
@@ -175,6 +177,8 @@ class KeyboardListener:
                             if self.latest_data["key"] == key:
                                 self.latest_data["key"] = None
             except OSError as exc:
+                if self._stop_event.is_set():
+                    return
                 if exc.errno != errno.ENODEV:
                     _logger.error(
                         "Keyboard device %s read failed (errno=%s): %s",
@@ -195,14 +199,21 @@ class KeyboardListener:
                 except Exception:
                     pass
                 # Keep retrying until the device returns or the process exits.
-                while True:
-                    time.sleep(0.5)
+                while not self._stop_event.wait(0.5):
                     try:
                         self.device = self._input_device_cls(device_path)
                         break
                     except (FileNotFoundError, OSError):
                         continue
                 _logger.info("Keyboard device %s reopened.", device_path)
+
+    def close(self) -> None:
+        """Stop listening and close the input device; safe to call repeatedly."""
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        self.device.close()
+        self.listener.join(timeout=1.0)
 
     def _event_to_key(self, key_code: int) -> str | None:
         key_name = self._ecodes.bytype[self._ecodes.EV_KEY].get(key_code)

@@ -19,12 +19,14 @@ import json
 import os
 import pty
 import termios
+import time
 from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from rlinf.robotics.piper_announcements import PiperAnnouncer
 from rlinf.robotics.piper_evaluation import TerminalKeys, evaluate_piper
 from rlinf.robotics.piper_runtime import PiperSession, rollout_piper
 
@@ -122,6 +124,13 @@ def test_human_controls_during_inference_and_release_discards_old_chunk(tmp_path
         device = sdk["piper_sdk"].devices[-1]
         frames = []
         events = set()
+        resumed = []
+
+        def on_policy_resume():
+            assert "release" in events
+            assert frames[-1]["action_source"] == "reference"
+            np.testing.assert_array_equal(session.last_command, np.ones(7))
+            resumed.append(len(session.targets))
 
         def stop(step):
             if step >= 5 and "take" not in events:
@@ -148,7 +157,9 @@ def test_human_controls_during_inference_and_release_discards_old_chunk(tmp_path
                     record_step=lambda obs, action, **kw: frames.append(
                         dict(kw, action=action.copy())
                     ),
+                    on_policy_resume=on_policy_resume,
                 )
+            assert resumed == [len(session.targets)]
             assert events == {"take", "release"}
             assert control.takeovers == 1 and control.human_steps >= 5
             assert frames[-1]["action_source"] == "reference"
@@ -211,6 +222,7 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
         events = iter([["right"], [], ["b", "i"], [], [], [], ["b"], [], ["s"]])
 
     with mocked_sdks():
+        announcements = []
         session = Follower()
         session.intervention = PiperIntervention(
             PiperLeader("can-hil", config=PiperLeaderConfig(startup_sleep_s=0)),
@@ -229,9 +241,22 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
                 steps=100,
                 keys=Events(),
                 record_dataset=True,
+                announce=lambda event, number: announcements.append(event),
             )
         finally:
             session.intervention.close()
+    assert announcements == [
+        "ready",
+        "aligning",
+        "started",
+        "critical_on",
+        "human",
+        "critical_off",
+        "success",
+        "saving",
+        "saved",
+        "complete",
+    ]
     assert summary["success_rate"] == 1 and summary["autonomous_success_rate"] == 0
     assert summary["intervention_rate"] == 1
     result = summary["episodes"][0]
@@ -256,12 +281,10 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
 @pytest.mark.parametrize("num_episodes", [20, 100])
 def test_trials_score_once_and_keep_one_session(tmp_path, num_episodes):
     session = Session()
-    keys = Keys(
-        [
-            [["s"], ["right"], [], [], ["s" if i % 2 else "f", "right", "s"]]
-            for i in range(num_episodes)
-        ]
-    )
+    keys = Keys([
+        [["s"], ["right"], [], [], ["s" if i % 2 else "f", "right", "s"]]
+        for i in range(num_episodes)
+    ])
     result = evaluate_piper(
         Policy(),
         session,
@@ -303,6 +326,7 @@ def test_label_during_inference_prevents_first_action(tmp_path):
 
 def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
     session = Session()
+    announcements = []
     result = evaluate_piper(
         Policy(),
         session,
@@ -311,9 +335,11 @@ def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
         num_episodes=1,
         steps=1,
         keys=Keys([[["right"], [], [], ["right"], ["f"]]]),
+        announce=lambda event, number: announcements.append(event),
     )
     assert len(session.targets) == 1
     assert result["failures"] == 1
+    assert announcements == ["ready", "started", "waiting_score", "failure", "complete"]
 
 
 @pytest.mark.parametrize(
@@ -322,12 +348,17 @@ def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
 )
 def test_abort_saves_partial_results_and_closes_session(tmp_path, failure, status):
     session = Session()
-    keys = Keys(
-        [
-            [["right"], [], [], ["s"]],
-            [["right"], failure],
-        ]
-    )
+    announcements = []
+
+    def announce(event, number):
+        if event in ("stopped", "fault"):
+            assert session.closes == 1
+        announcements.append(event)
+
+    keys = Keys([
+        [["right"], [], [], ["s"]],
+        [["right"], failure],
+    ])
     with pytest.raises(type(failure)):
         evaluate_piper(
             Policy(),
@@ -337,6 +368,7 @@ def test_abort_saves_partial_results_and_closes_session(tmp_path, failure, statu
             num_episodes=20,
             steps=300,
             keys=keys,
+            announce=announce,
         )
     result = json.loads((tmp_path / "summary.json").read_text())
     assert result["status"] == status
@@ -345,6 +377,7 @@ def test_abort_saves_partial_results_and_closes_session(tmp_path, failure, statu
     assert result["episodes"][1]["outcome"] == status
     assert session.closes == 1
     assert len(session.targets) == 1
+    assert announcements[-1] == ("stopped" if status == "interrupted" else "fault")
 
 
 def test_inference_fault_sends_no_target_and_preserves_error(tmp_path):
@@ -489,9 +522,11 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
     session = Session()
     session.read_state = lambda: np.zeros(7)
     attempts = []
+    announcements = []
 
     def reset(session_arg, target, *, log, timing):
         assert session_arg.opens == 1 and session_arg.closes == 0
+        assert announcements[-1] == "reset_start"
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("temporary controller fault")
@@ -507,11 +542,22 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
         steps=300,
         reset_after_episode="zero",
         keys=Keys([[["right"], [], ["s"]], [["right"], ["s"], ["r"]]]),
+        announce=lambda event, number: announcements.append(event),
     )
     assert summary["successes"] == summary["completed_episodes"] == 1
     assert len(attempts) == 2 and session.opens == session.closes == 1
     assert len(summary["episodes"][0]["reset"]["attempts"]) == 2
     assert (tmp_path / "episode_001/reset_retry_02.jsonl").exists()
+    assert announcements == [
+        "ready",
+        "started",
+        "success",
+        "reset_start",
+        "reset_failed",
+        "reset_start",
+        "reset_done",
+        "complete",
+    ]
 
 
 def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tmp_path):
@@ -543,6 +589,18 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tm
             return np.ones((50, 7), dtype=np.float32)
 
     session = RecordedSession()
+    announcements = []
+
+    def announce(event, number):
+        if event == "saved":
+            labels = json.loads((tmp_path / "annotations.json").read_text())
+            assert len(labels["episodes"]) == number
+            saved = json.loads(
+                (tmp_path / f"episode_{number:03d}/result.json").read_text()
+            )
+            assert saved["recording"]["status"] == "complete"
+        announcements.append((event, number))
+
     summary = evaluate_piper(
         RecordedPolicy(),
         session,
@@ -550,31 +608,49 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tm
         output=tmp_path,
         num_episodes=2,
         steps=100,
-        keys=Keys(
+        keys=Keys([
             [
-                [
-                    ["right"],
-                    [],
-                    [],
-                    ["b"],
-                    [],
-                    [],
-                    [],
-                    ["b"],
-                    [],
-                    [],
-                    [],
-                    ["b"],
-                    [],
-                    ["b"],
-                    [],
-                    ["s"],
-                ],
-                [["right"], ["b"], [], ["f"]],
-            ]
-        ),
+                ["right"],
+                [],
+                [],
+                ["b"],
+                [],
+                [],
+                [],
+                ["b"],
+                [],
+                [],
+                [],
+                ["b"],
+                [],
+                ["b"],
+                [],
+                ["s"],
+            ],
+            [["right"], ["b"], [], ["f"]],
+        ]),
         record_dataset=True,
+        announce=announce,
     )
+    assert announcements == [
+        ("ready", 1),
+        ("started", 1),
+        ("critical_on", 1),
+        ("critical_off", 1),
+        ("critical_on", 2),
+        ("critical_off", 2),
+        ("success", 1),
+        ("saving", 1),
+        ("saved", 1),
+        ("ready", 2),
+        ("started", 2),
+        ("critical_on", 1),
+        ("critical_closed", 0),
+        ("failure", 2),
+        ("saving", 2),
+        ("saved", 2),
+        ("complete", 0),
+    ]
     assert summary["successes"] == summary["failures"] == 1
     assert summary["recorded_episodes"] == summary["phase_labeled_episodes"] == 2
     labels = json.loads((tmp_path / "annotations.json").read_text())
@@ -631,20 +707,18 @@ def test_scoring_extends_only_the_unpaired_final_phase_to_terminal(
         output=tmp_path,
         num_episodes=1,
         steps=steps,
-        keys=Keys(
+        keys=Keys([
             [
-                [
-                    ["right"],
-                    ["b"],
-                    [],
-                    ["b"] if has_prior_pair else [],
-                    [],
-                    ["b"] if has_prior_pair else [],
-                    [],
-                    [score],
-                ]
+                ["right"],
+                ["b"],
+                [],
+                ["b"] if has_prior_pair else [],
+                [],
+                ["b"] if has_prior_pair else [],
+                [],
+                [score],
             ]
-        ),
+        ]),
     )
     saved = json.loads((tmp_path / "episode_001/result.json").read_text())
     assert saved["critical_phases"] == (
@@ -746,6 +820,7 @@ def test_recording_failure_preserves_operator_score_and_excludes_invalid_data(
         raise OSError("video write failed")
 
     monkeypatch.setattr(PiperEpisodeRecorder, "finish", fail_encoding)
+    announcements = []
     with pytest.raises(OSError, match="video write failed"):
         evaluate_piper(
             RecordedPolicy(),
@@ -756,8 +831,192 @@ def test_recording_failure_preserves_operator_score_and_excludes_invalid_data(
             steps=100,
             keys=Keys([[["right"], ["b"], [], ["s"]]]),
             record_dataset=True,
+            announce=lambda event, number: announcements.append(event),
         )
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["status"] == "error" and summary["successes"] == 1
     assert summary["recorded_episodes"] == 0
     assert not json.loads((tmp_path / "annotations.json").read_text())["episodes"]
+    assert announcements[-3:] == ["success", "saving", "fault"]
+    assert "saved" not in announcements
+
+
+@pytest.mark.parametrize(
+    "language, voice, expected",
+    [
+        (
+            "en",
+            "en-US",
+            [
+                "Ready for episode 1. Press right.",
+                "Policy control resumed.",
+                "Critical phase 2 off.",
+            ],
+        ),
+        (
+            "zh",
+            "cmn",
+            [
+                "准备采集第1回合，按右方向键开始。",
+                "模型控制已恢复。",
+                "退出第2段关键阶段。",
+            ],
+        ),
+    ],
+)
+def test_speech_runs_in_background_and_replaces_stale_control_prompts(
+    tmp_path, monkeypatch, language, voice, expected
+):
+    from robot_mocks.audio import SpeechDispatcher
+
+    backend = SpeechDispatcher(tmp_path, blocked=True)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with PiperAnnouncer(language=language) as announce:
+        announce("ready", 1)
+        backend.wait_for_calls(1)
+        started = time.monotonic()
+        for _ in range(30):
+            announce("human")
+            announce("policy_wait")
+        announce("policy_resumed")
+        announce("critical_on", 2)
+        announce("critical_off", 2)
+        announce("critical_off", 2)  # An unchanged state is not repeated.
+        assert time.monotonic() - started < 0.5
+        assert len(backend.calls) == 1  # Playback still blocked; enqueue never waited.
+        backend.release()
+        calls = backend.wait_for_calls(3)
+    assert [call["args"][-1] for call in calls] == expected
+    assert all(call["args"][:3] == ["--wait", "--language", voice] for call in calls)
+    for call in calls:
+        with pytest.raises(ChildProcessError):
+            os.waitpid(call["pid"], os.WNOHANG)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_speech_disabled_or_unavailable_does_not_break_collection(
+    tmp_path, monkeypatch, caplog, enabled
+):
+    monkeypatch.setenv("PATH", str(tmp_path))  # No speech executable installed.
+    session = Session()
+    with PiperAnnouncer(enabled=enabled) as announce:
+        result = evaluate_piper(
+            Policy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=10,
+            keys=Keys([[["right"], [], [], ["s"]]]),
+            announce=announce,
+        )
+    assert result["successes"] == 1 and len(session.targets) == 1
+    assert session.closes == 1
+    assert caplog.text.count("Piper speech disabled") == int(enabled)
+
+
+@pytest.mark.parametrize("hung", [False, True])
+def test_speech_failure_or_timeout_disables_backend_and_reaps_child(
+    tmp_path, monkeypatch, caplog, hung
+):
+    from robot_mocks.audio import SpeechDispatcher
+
+    backend = SpeechDispatcher(tmp_path, blocked=hung, exit_code=7)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with PiperAnnouncer() as announce:
+        announce("ready", 1)
+        calls = backend.wait_for_calls(1)
+        deadline = time.monotonic() + 10
+        while (
+            "Piper speech disabled" not in caplog.text and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert caplog.text.count("Piper speech disabled") == 1
+        assert ("exceeded eight seconds" if hung else "status 7") in caplog.text
+        announce("human")
+        announce("complete")
+    assert len(backend.calls) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(calls[0]["pid"], os.WNOHANG)
+
+
+@pytest.mark.parametrize("terminal", [None, "fault"])
+def test_speech_close_cancels_pending_work_and_reaps_a_stalled_process(
+    tmp_path, monkeypatch, terminal
+):
+    from robot_mocks.audio import SpeechDispatcher
+
+    backend = SpeechDispatcher(tmp_path, blocked=True)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with PiperAnnouncer() as announce:
+        announce("ready", 1)
+        calls = backend.wait_for_calls(1)
+        announce("human")
+        if terminal:
+            announce(terminal)
+        started = time.monotonic()
+    assert time.monotonic() - started < (4.5 if terminal else 1.5)
+    announce.close()  # Idempotent, with no late subprocess or speech.
+    announce("success", 1)
+    assert len(backend.calls) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(calls[0]["pid"], os.WNOHANG)
+
+
+def test_terminal_speech_is_delivered_after_hardware_closes(tmp_path, monkeypatch):
+    from robot_mocks.audio import SpeechDispatcher
+
+    backend = SpeechDispatcher(tmp_path / "speech", blocked=True)
+    monkeypatch.setenv("PATH", str(backend.root))
+    session = Session()
+    (tmp_path / "collection").mkdir()
+    with PiperAnnouncer() as speaker:
+
+        def announce(event, number):
+            if event == "complete":
+                assert session.closes == 1
+            speaker(event, number)
+            if event == "ready":
+                backend.wait_for_calls(1)
+            if event == "complete":
+                backend.release()
+
+        evaluate_piper(
+            Policy(),
+            session,
+            "USB",
+            output=tmp_path / "collection",
+            num_episodes=1,
+            steps=10,
+            keys=Keys([[["right"], ["b"], [], ["s"]]]),
+            announce=announce,
+        )
+    assert [call["args"][-1] for call in backend.calls] == [
+        "Ready for episode 1. Press right.",
+        "Last critical phase closed at episode end.",
+        "Episode 1 marked successful.",
+        "Collection complete.",
+    ]
+
+
+def test_failed_announcement_callback_preserves_scoring_and_cleanup(tmp_path, caplog):
+    calls = []
+
+    def announce(event, number):
+        calls.append(event)
+        raise OSError("audio service unavailable")
+
+    session = Session()
+    summary = evaluate_piper(
+        Policy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=10,
+        keys=Keys([[["right"], [], [], ["s"]]]),
+        announce=announce,
+    )
+    assert summary["successes"] == 1 and len(session.targets) == 1
+    assert session.closes == 1 and calls == ["ready"]
+    assert caplog.text.count("Piper announcement delivery failed") == 1

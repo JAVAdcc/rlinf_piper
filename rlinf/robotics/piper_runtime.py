@@ -378,6 +378,7 @@ def rollout_piper(
     record_step: Callable[..., None] | None = None,
     manage_session: bool = True,
     policy_source: str = "reference",
+    on_policy_resume: Callable[[], None] | None = None,
 ) -> int:
     """Execute bounded chunks, with concurrent inference when HIL is enabled.
 
@@ -388,6 +389,7 @@ def rollout_piper(
     The JSONL output is a diagnostic trace, not an online RL replay dataset.
     HIL keeps processing input and human commands while inference runs, holds
     between predictions, and invalidates queued predictions on ownership changes.
+    on_policy_resume runs after the first fresh policy command following release.
     """
     if replan_steps is None:
         replan_steps = policy.action_horizon
@@ -418,6 +420,7 @@ def rollout_piper(
                 stop_requested=stop_requested,
                 record_step=record_step,
                 policy_source=policy_source,
+                on_policy_resume=on_policy_resume,
             )
         while completed < steps:
             if stop_requested is not None and stop_requested(completed):
@@ -463,19 +466,17 @@ def rollout_piper(
             target = actions[chunk_index]
             measured = session.execute(target)
             log.write(
-                json.dumps(
-                    {
-                        "event": "action",
-                        "step": completed,
-                        "state": measured.tolist(),
-                        "target": target.tolist(),
-                        "command": session.last_command.tolist()
-                        if record_step is not None
-                        else None,
-                        "time": time.time(),
-                        "prediction_age_s": time.monotonic() - observed_at,
-                    }
-                )
+                json.dumps({
+                    "event": "action",
+                    "step": completed,
+                    "state": measured.tolist(),
+                    "target": target.tolist(),
+                    "command": session.last_command.tolist()
+                    if record_step is not None
+                    else None,
+                    "time": time.time(),
+                    "prediction_age_s": time.monotonic() - observed_at,
+                })
                 + "\n"
             )
             log.flush()
@@ -505,6 +506,7 @@ def _rollout_with_intervention(
     stop_requested: Callable[[int], bool] | None,
     record_step: Callable[..., None] | None,
     policy_source: str,
+    on_policy_resume: Callable[[], None] | None,
 ) -> int:
     """Keep control and recording responsive while one inference job runs."""
     control = session.intervention
@@ -516,6 +518,7 @@ def _rollout_with_intervention(
     index = completed = 0
     generation = control.generation
     prediction_time = 0.0
+    resume_generation = None
     period = 1 / session.config.fps
     try:
         while completed < steps:
@@ -534,20 +537,21 @@ def _rollout_with_intervention(
                     or not np.isfinite(prediction).all()
                 ):
                     raise ValueError("Policy returned an invalid action chunk.")
+                releasing = control.mode == "release_pending"
                 accepted = control.accept_prediction(request_generation)
+                if accepted and releasing:
+                    resume_generation = control.generation
                 log.write(
-                    json.dumps(
-                        {
-                            "event": "prediction",
-                            "step": request_step,
-                            "accepted_at_step": completed if accepted else None,
-                            "generation": request_generation,
-                            "discarded": not accepted,
-                            "inference_s": time.monotonic() - requested_at,
-                            "actions": prediction.tolist(),
-                            "replan_steps": replan_steps,
-                        }
-                    )
+                    json.dumps({
+                        "event": "prediction",
+                        "step": request_step,
+                        "accepted_at_step": completed if accepted else None,
+                        "generation": request_generation,
+                        "discarded": not accepted,
+                        "inference_s": time.monotonic() - requested_at,
+                        "actions": prediction.tolist(),
+                        "replan_steps": replan_steps,
+                    })
                     + "\n"
                 )
                 log.flush()
@@ -585,22 +589,20 @@ def _rollout_with_intervention(
             )
             measured = session.execute(target)
             log.write(
-                json.dumps(
-                    {
-                        "event": "action",
-                        "step": completed,
-                        "state": measured.tolist(),
-                        "target": target.tolist(),
-                        "command": session.last_command.tolist(),
-                        "time": time.time(),
-                        "action_source": source,
-                        "is_intervention": source == "human",
-                        "control_generation": control.generation,
-                        "prediction_age_s": time.monotonic() - prediction_time
-                        if source in ("reference", "actor")
-                        else None,
-                    }
-                )
+                json.dumps({
+                    "event": "action",
+                    "step": completed,
+                    "state": measured.tolist(),
+                    "target": target.tolist(),
+                    "command": session.last_command.tolist(),
+                    "time": time.time(),
+                    "action_source": source,
+                    "is_intervention": source == "human",
+                    "control_generation": control.generation,
+                    "prediction_age_s": time.monotonic() - prediction_time
+                    if source in ("reference", "actor")
+                    else None,
+                })
                 + "\n"
             )
             log.flush()
@@ -620,6 +622,10 @@ def _rollout_with_intervention(
             completed += 1
             control.executed(session.last_command, source)
             if source in ("reference", "actor"):
+                if resume_generation == control.generation:
+                    resume_generation = None
+                    if on_policy_resume is not None:
+                        on_policy_resume()
                 index += 1
             time.sleep(max(0, period - (time.monotonic() - started)))
     finally:

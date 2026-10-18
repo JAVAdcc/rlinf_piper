@@ -15,12 +15,14 @@
 """Operator-scored Piper episodes with terminal keys and durable results."""
 
 import json
+import logging
 import os
 import select
 import sys
 import termios
 import time
 import tty
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
@@ -115,6 +117,7 @@ def evaluate_piper(
     reset_after_episode: str = "none",
     reset_timing: PiperResetTiming = PiperResetTiming(),
     policy_source: str = "reference",
+    announce: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
 
@@ -122,6 +125,7 @@ def evaluate_piper(
     At the step limit, wait for a label without sending further actions. Errors
     abort the whole run. Unscored trials are excluded from the success rate.
     Scoring closes an active final phase at the terminal observation frame.
+    Optional announcement delivery is best-effort and cannot abort collection.
     """
     if num_episodes <= 0 or steps <= 0:
         raise ValueError("Episode count and step limit must be positive.")
@@ -134,6 +138,18 @@ def evaluate_piper(
     if policy_source not in ("reference", "actor"):
         raise ValueError("Policy source must be reference or actor.")
     episodes = []
+
+    def notify(event: str, number: int = 0) -> None:
+        nonlocal announce
+        if announce is not None:
+            try:
+                announce(event, number)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Piper announcement delivery failed; continuing without speech.",
+                    exc_info=True,
+                )
+                announce = None
 
     def summarize(status: str) -> dict[str, Any]:
         scored = [x for x in episodes if x["outcome"] in ("success", "failure")]
@@ -206,6 +222,7 @@ def evaluate_piper(
                     f"Reset after scoring: {reset_after_episode}.",
                     flush=True,
                 )
+                notify("ready", number)
                 while True:
                     pressed = keys.poll()
                     if "q" in pressed:
@@ -235,6 +252,7 @@ def evaluate_piper(
                     )
                 # Any s/f or additional Right in the start batch is stale.
                 if control is not None:
+                    notify("aligning")
                     print(
                         "Aligning the leader to the follower before the trial.",
                         flush=True,
@@ -262,6 +280,7 @@ def evaluate_piper(
                     f"[{number}/{num_episodes}] Running: b = enter/exit critical phase, s = success, f = failure; q exits.",
                     flush=True,
                 )
+                notify("started", number)
 
                 def critical_active() -> bool:
                     phases = result["critical_phases"]
@@ -279,6 +298,11 @@ def evaluate_piper(
                         ):
                             if control.toggle(session.read_state()):
                                 result["takeovers"] = control.takeovers
+                                notify(
+                                    "human"
+                                    if control.mode == "human"
+                                    else "policy_wait"
+                                )
                                 print(
                                     f"Control: {control.mode}; critical phase is unchanged.",
                                     flush=True,
@@ -287,6 +311,7 @@ def evaluate_piper(
                             phases = result["critical_phases"]
                             if critical_active():
                                 if completed == phases[-1]["start"]:
+                                    notify("critical_empty")
                                     print(
                                         "No action since phase start; ignoring an empty end marker.",
                                         flush=True,
@@ -298,12 +323,17 @@ def evaluate_piper(
                                 phases.append({"start": completed, "end": None})
                                 event = "started"
                             else:
+                                notify("phase_limit")
                                 print(
                                     "Step limit reached; cannot start another phase.",
                                     flush=True,
                                 )
                                 continue
                             _write_json(episode_dir / "result.json", result)
+                            notify(
+                                "critical_on" if critical_active() else "critical_off",
+                                len(phases),
+                            )
                             print(
                                 f"Critical phase {len(phases)} {event} at frame {completed}; "
                                 f"critical={'ON' if critical_active() else 'OFF'}.",
@@ -311,21 +341,27 @@ def evaluate_piper(
                             )
                         if key in ("s", "f"):
                             result["outcome"] = "success" if key == "s" else "failure"
+                            phase_event = None
                             if critical_active():
                                 phases = result["critical_phases"]
                                 if phases[-1]["start"] < completed:
                                     phases[-1]["end"] = completed
+                                    phase_event = "critical_closed"
                                     print(
                                         f"Critical phase {len(phases)} automatically ended at terminal frame {completed}.",
                                         flush=True,
                                     )
                                 else:
                                     phases.pop()
+                                    phase_event = "critical_empty"
                                     print(
                                         "No action after the last b marker; discarding the empty phase.",
                                         flush=True,
                                     )
                             _write_json(episode_dir / "result.json", result)
+                            if phase_event is not None:
+                                notify(phase_event)
+                            notify(result["outcome"], number)
                             return True
                     return False
 
@@ -369,6 +405,7 @@ def evaluate_piper(
                             record_step=record_step if recorder is not None else None,
                             manage_session=False,
                             policy_source=policy_source,
+                            on_policy_resume=lambda: notify("policy_resumed"),
                         )
                     result["action_duration_s"] = time.monotonic() - started
                     # Capture before scoring waits or reset can change the scene.
@@ -377,6 +414,7 @@ def evaluate_piper(
                     )
                     if result["outcome"] == "unscored":
                         summarize("waiting_for_score")
+                        notify("waiting_score")
                         print(
                             "Step limit reached; holding. Press s or f to score.",
                             flush=True,
@@ -384,6 +422,7 @@ def evaluate_piper(
                         while not stop(result["completed_steps"]):
                             time.sleep(0.02)
                     if recorder is not None:
+                        notify("saving", number)
                         print(
                             "Trial stopped; saving its dataset and encoding videos.",
                             flush=True,
@@ -394,6 +433,7 @@ def evaluate_piper(
                             outcome=result["outcome"],
                         )
                         if not result["critical_phases"]:
+                            notify("no_critical")
                             print(
                                 "No critical actions marked: full recording saved; annotate a critical interval before warmup.",
                                 flush=True,
@@ -423,6 +463,8 @@ def evaluate_piper(
                         _write_json(episode_dir / "result.json", result)
                         episodes.append(result)
                         summary = summarize("running")
+                if recorder is not None:
+                    notify("saved", number)
                 print(
                     f"[{number}/{num_episodes}] {result['outcome']}; "
                     f"success rate {summary['successes']}/{summary['completed_episodes']} "
@@ -444,6 +486,7 @@ def evaluate_piper(
                             else f"reset_retry_{attempt:02d}.jsonl"
                         )
                         try:
+                            notify("reset_start")
                             with (episode_dir / log_name).open("x") as reset_log:
                                 completed_reset = reset_piper(
                                     session,
@@ -452,9 +495,11 @@ def evaluate_piper(
                                     timing=reset_timing,
                                 )
                             result["reset"].update(completed_reset, status="complete")
-                            result["reset"]["attempts"].append(
-                                {"log": log_name, "status": "complete"}
-                            )
+                            result["reset"]["attempts"].append({
+                                "log": log_name,
+                                "status": "complete",
+                            })
+                            notify("reset_done")
                             print(
                                 "Reset trajectory complete. Check the pose, restore the scene, then press Right.",
                                 flush=True,
@@ -466,11 +511,14 @@ def evaluate_piper(
                         except Exception as exc:
                             error = f"{type(exc).__name__}: {exc}"
                             result["reset"].update(status="error", error=error)
-                            result["reset"]["attempts"].append(
-                                {"log": log_name, "status": "error", "error": error}
-                            )
+                            result["reset"]["attempts"].append({
+                                "log": log_name,
+                                "status": "error",
+                                "error": error,
+                            })
                             _write_json(episode_dir / "result.json", result)
                             summarize("reset_failed")
+                            notify("reset_failed")
                             print(
                                 f"Reset stopped: {error}\nScore saved; connection remains open. "
                                 "After resolving the fault, press r to retry reset, or q / Ctrl-C to exit. "
@@ -494,8 +542,12 @@ def evaluate_piper(
                             )
     except KeyboardInterrupt:
         summarize("interrupted")
+        notify("stopped")
         raise
     except Exception:
         summarize("error")
+        notify("fault")
         raise
-    return summarize("complete")
+    summary = summarize("complete")
+    notify("complete")
+    return summary

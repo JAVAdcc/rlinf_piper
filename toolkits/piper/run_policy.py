@@ -103,6 +103,18 @@ def main() -> None:
         help="Save each prediction's RGB/state/task as an NPZ for offline diagnosis",
     )
     parser.add_argument(
+        "--play-sounds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Speak interactive collection events through local Speech Dispatcher",
+    )
+    parser.add_argument(
+        "--speech-language",
+        choices=("en", "zh"),
+        default="en",
+        help="Language of interactive voice prompts (default: en, as in Evo-RL)",
+    )
+    parser.add_argument(
         "--no-action-limits",
         action="store_true",
         help="Disable extra rollout action bounds/step checks; driver travel limits remain",
@@ -248,6 +260,7 @@ def main() -> None:
         from rlinf.robotics.piper_runtime import rollout_piper
 
         if args.interactive:
+            from rlinf.robotics.piper_announcements import PiperAnnouncer
             from rlinf.robotics.piper_evaluation import TerminalKeys, evaluate_piper
 
             if session.intervention is not None:
@@ -264,7 +277,12 @@ def main() -> None:
                 flush=True,
             )
             try:
-                with TerminalKeys() as keys:
+                with (
+                    PiperAnnouncer(
+                        enabled=args.play_sounds, language=args.speech_language
+                    ) as announcements,
+                    TerminalKeys() as keys,
+                ):
                     evaluate_piper(
                         policy,
                         session,
@@ -283,6 +301,7 @@ def main() -> None:
                         policy_source="actor"
                         if args.actor is not None
                         else "reference",
+                        announce=announcements,
                     )
             except KeyboardInterrupt:
                 print(

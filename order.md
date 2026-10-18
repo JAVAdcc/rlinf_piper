@@ -22,6 +22,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
   --replan-steps 50 \
   --record-dataset \
   --save-observations \
+  --play-sounds \
   --no-action-limits \
   --reset-after-episode initial \
   --output-dir "$piper_run_dir"
@@ -152,6 +153,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
   --num-episodes 2 \
   --steps 7200 --replan-steps 50 \
   --record-dataset \
+  --play-sounds \
   --no-action-limits \
   --reset-after-episode initial \
   --output-dir "$piper_run_dir"
@@ -177,3 +179,31 @@ bash toolkits/piper/eval_stage1.sh rollout \
 HIL 采集前不需要 latent cache，后续继续用 `warmup init -> cache -> train`。当前 critical-only warmup 只取标注区间，区间外的人工动作保留在原始数据中；混合回合不要整条改成 `behavior=human`。
 
 原生在线 `PiperPolicyEnv` 已接入接管动作和标签回传，交还到新 chunk 才生效；它在分布式推理等待期间仍不能像本地入口一样连续响应接管。在线有效长度、跨阶段折扣和数据池恢复仍需后续接通，不能直接把 HIL 采集通过视为在线探索就绪。实现细节见 `/home/descfly/code/rlinf_piper/docs/piper_human_intervention_design.rst`。本次开发使用 CPU 和 mock 验证，尚未启动真机验收。
+
+**6. 采集语音播报**
+
+第 1、5 节的本地交互采集入口均已接入语音，默认开启英文播报，与 Evo-RL 使用同一个本地 Speech Dispatcher 后端。原有命令不加参数也会播报；上面的 `--play-sounds` 显式开启。需要中文时增加 `--speech-language zh`，关闭时把 `--play-sounds` 换成 `--no-play-sounds`。这些参数不影响数据、标注或动作来源，也不启动额外的模型服务。
+
+| 操作 / 状态 | 播报内容与时机 |
+| --- | --- |
+| 等待 `→`、开始回合 | 提示回合编号和开始键；HIL 另提示正在对齐主臂。 |
+| `b` 进入 / 退出 | 提示关键阶段编号；标签写入成功后播报。 |
+| 奇数次 `b` 后评分 | 提示最后一段自动延长到回合结束；空段被忽略时另有提示。 |
+| `i` 接管 | 接管成功后提示“人工接管”。 |
+| 再按 `i` 交还 | 先提示“等待模型的新预测”；新的 policy 动作实际下发后才提示“模型控制已恢复”。 |
+| 到达步数上限 | 提示等待 `s/f` 评分；此时再开新的 critical phase 会提示无效。 |
+| `s/f` | 评分写入成功后提示该回合标记成功 / 失败。 |
+| 保存数据 | 提示正在保存；数据、结果和标注清单写入成功后提示保存完成。漏标 critical phase 会单独提示。 |
+| 自动复位 / `r` 重试 | 提示开始复位、轨迹执行完成或复位失败及重试键；“轨迹执行完成”仍需现场确认姿态。 |
+| 完成、`q` / Ctrl-C、故障 | 分别提示采集完成、采集停止或故障停止。 |
+
+播报在后台串行播放，不在控制循环中等待音频。快速连续操作时，尚未播放的同类状态提示会合并为最新状态，过期提示会丢弃，终端日志保留完整事件。正常结束会保留最后的评分、保存和复位结果；退出或故障则优先播报停止。程序先清理相机和机械臂，再有限等待收尾播报：正常结束最多 8 秒，停止 / 故障最多 3 秒，随后回收语音进程。已经交给系统播放的短句可能继续读完。
+
+本机已有 `spd-say`。以下命令只测试扬声器，不连接机械臂：
+
+```bash
+spd-say --wait --language en-US 'Piper collection voice test.'
+spd-say --wait --language cmn '采集语音播报测试。'
+```
+
+听不到声音时，先检查桌面的音量和输出设备是否选中了实际使用的扬声器 / 耳机。其他机器需要安装系统包 `speech-dispatcher`；若找不到命令、播放失败或单句超过 8 秒，程序只警告一次并关闭本次语音，采集、评分和保存继续运行。语音目前接在本地交互入口，原生分布式在线环境和离线 warmup 不播报。

@@ -20,6 +20,14 @@ case "$piper_mode" in
       "$@"
     ;;
   rollout)
+    # Resume reads the saved launch; wrapper defaults must not replace it.
+    for piper_arg in "$@"; do
+      case "$piper_arg" in
+        --resume|--resume=*)
+          exec "$piper_python" -m toolkits.piper.run_policy rollout "$@"
+          ;;
+      esac
+    done
     exec "$piper_python" -m toolkits.piper.run_policy rollout \
       --checkpoint "$piper_checkpoint" \
       --hardware "$piper_repo/examples/embodiment/config/piper_usb_hardware.yaml" \

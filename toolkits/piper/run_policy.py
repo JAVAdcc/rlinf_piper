@@ -16,6 +16,7 @@
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -24,18 +25,18 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.models.embodiment.piper_inference import PiperCFGPolicy, PiperRLTPolicy
+from rlinf.robotics.piper_collection import collection_lock, read_collection_json
 
 
-def main() -> None:
-    """Load a downloaded checkpoint before opening any robot or camera."""
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse a new run or restore collection settings with explicit overrides."""
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("command", choices=("infer", "rollout"))
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        required=True,
-        help="Stage 1 actor directory, or CFG actor directory",
+        help="Stage 1 actor directory, or CFG actor directory; restored by --resume",
     )
     parser.add_argument("--backend", choices=("rlt", "cfg"), default="rlt")
     parser.add_argument(
@@ -80,7 +81,7 @@ def main() -> None:
         "--num-episodes",
         type=int,
         default=1,
-        help="Number of scored episodes to retain; discarded attempts do not count",
+        help="Total scored episodes to retain, including previous collection when resuming",
     )
     parser.add_argument(
         "--record-dataset",
@@ -130,21 +131,78 @@ def main() -> None:
         action="store_true",
         help="Disable extra rollout action bounds/step checks; driver travel limits remain",
     )
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
         "--output-dir",
         type=Path,
         help="New directory; defaults to a unique outputs/piper run",
     )
+    destination.add_argument(
+        "--resume",
+        type=Path,
+        help="Continue an existing interactive run, restoring its settings and reset pose",
+    )
     parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.resume is not None:
+        allowed = {
+            "--resume",
+            "--num-episodes",
+            "--device",
+            "--play-sounds",
+            "--no-play-sounds",
+            "--speech-language",
+            "--streaming-video",
+            "--no-streaming-video",
+        }
+        supplied = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
+        if supplied - allowed:
+            parser.error(
+                "--resume restores collection settings; permitted overrides: "
+                + ", ".join(sorted(allowed - {"--resume"}))
+            )
+        try:
+            output = args.resume.expanduser().resolve()
+            saved = read_collection_json(output / "run.json")
+            if (
+                args.command != "rollout"
+                or saved.get("command") != "rollout"
+                or saved.get("interactive") is not True
+            ):
+                raise ValueError("--resume requires an existing interactive rollout.")
+            if not (output / "hardware.yaml").is_file():
+                raise ValueError(
+                    f"Missing hardware snapshot: {output / 'hardware.yaml'}"
+                )
+            defaults = {
+                key: value
+                for key, value in saved.items()
+                if key in vars(args) and key not in ("command", "resume", "output_dir")
+            }
+            # Historical wrapper runs used the repository as their working directory.
+            for key in ("checkpoint", "actor", "hardware", "dataset"):
+                if defaults.get(key) is not None:
+                    path = Path(defaults[key]).expanduser()
+                    if not path.is_absolute():
+                        path = Path(__file__).resolve().parents[2] / path
+                    defaults[key] = path
+            if (output / "summary.json").exists():
+                defaults["num_episodes"] = read_collection_json(
+                    output / "summary.json"
+                )["requested_episodes"]
+            parser.set_defaults(**defaults)
+            args = parser.parse_args(argv)
+            args.resume = output
+        except (ValueError, KeyError, TypeError) as exc:
+            parser.error(str(exc))
     from rlinf.robotics.piper_reset import PiperResetTiming
 
     try:
-        reset_timing = PiperResetTiming(
-            args.reset_duration_s, args.reset_gripper_duration_s
-        )
+        PiperResetTiming(args.reset_duration_s, args.reset_gripper_duration_s)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required for a new run.")
     if args.reset_after_episode != "none" and not args.interactive:
         parser.error("--reset-after-episode requires --interactive.")
     if args.num_episodes <= 0:
@@ -183,14 +241,51 @@ def main() -> None:
         or args.frame < 0
     ):
         parser.error("Use positive steps/replan-steps and a nonnegative frame.")
-    output = args.output_dir or Path("outputs/piper") / (
-        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "_" + uuid.uuid4().hex[:8]
+    return args
+
+
+def main() -> None:
+    """Own the output directory before loading a model or connecting hardware."""
+    args = parse_args()
+    output = (
+        args.resume
+        or args.output_dir
+        or Path("outputs/piper")
+        / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "_" + uuid.uuid4().hex[:8])
     )
-    output.mkdir(parents=True, exist_ok=False)
-    (output / "run.json").write_text(
+    output = output.expanduser().resolve()
+    if args.resume is None:
+        output.mkdir(parents=True, exist_ok=False)
+    with collection_lock(output):
+        _run(args, output)
+
+
+def _run(args: argparse.Namespace, output: Path) -> None:
+    """Execute under the run lock, keeping original launch snapshots immutable."""
+    from rlinf.models.embodiment.piper_inference import PiperCFGPolicy, PiperRLTPolicy
+    from rlinf.robotics.piper_reset import PiperResetTiming
+
+    reset_timing = PiperResetTiming(
+        args.reset_duration_s, args.reset_gripper_duration_s
+    )
+    metadata_output = output
+    if args.resume is not None:
+        metadata_output = (
+            output
+            / "resumes"
+            / (
+                time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                + "_"
+                + uuid.uuid4().hex[:8]
+            )
+        )
+        metadata_output.mkdir(parents=True, exist_ok=False)
+    (metadata_output / "run.json").write_text(
         json.dumps(
             {
-                key: str(value) if isinstance(value, Path) else value
+                key: str(value.expanduser().resolve())
+                if isinstance(value, Path)
+                else value
                 for key, value in vars(args).items()
             },
             indent=2,
@@ -201,7 +296,9 @@ def main() -> None:
     if args.command == "rollout":
         from rlinf.robotics.piper_runtime import build_piper_session
 
-        hardware = OmegaConf.load(args.hardware)
+        hardware = OmegaConf.load(
+            output / "hardware.yaml" if args.resume is not None else args.hardware
+        )
         if args.teleop is not None:
             if "teleop" not in hardware:
                 hardware.teleop = {}
@@ -210,7 +307,9 @@ def main() -> None:
             hardware.teleop.usb_serial = args.leader_usb_serial
         if args.intervention_key is not None:
             if hardware.get("teleop", {}).get("type") != "piper_leader":
-                parser.error("--intervention-key requires a configured Piper leader.")
+                raise ValueError(
+                    "--intervention-key requires a configured Piper leader."
+                )
             if "intervention" not in hardware.teleop:
                 hardware.teleop.intervention = {}
             hardware.teleop.intervention.key = args.intervention_key
@@ -218,17 +317,17 @@ def main() -> None:
             hardware.get("teleop", {}).get("type", "none") != "none"
             and not args.interactive
         ):
-            parser.error("Configured teleop requires --interactive.")
+            raise ValueError("Configured teleop requires --interactive.")
         if args.no_action_limits:
             hardware.execution.check_action_limits = False
-        OmegaConf.save(hardware, output / "hardware.yaml")
-        session = build_piper_session(output / "hardware.yaml")
+        OmegaConf.save(hardware, metadata_output / "hardware.yaml")
+        session = build_piper_session(metadata_output / "hardware.yaml")
         if session.intervention is not None:
             import importlib.util
 
             for module in ("piper_sdk", "pinocchio"):
                 if importlib.util.find_spec(module) is None:
-                    parser.error(
+                    raise ValueError(
                         f"Missing {module}; install requirements/embodied/piper-hil.txt."
                     )
     torch.manual_seed(args.seed)
@@ -237,7 +336,14 @@ def main() -> None:
         if args.backend == "rlt"
         else PiperCFGPolicy(args.checkpoint, device=args.device)
     )
-    (output / "policy.json").write_text(json.dumps(policy.manifest, indent=2) + "\n")
+    if args.resume is not None and (output / "policy.json").exists():
+        if policy.manifest != read_collection_json(output / "policy.json"):
+            raise ValueError(
+                "Policy manifest changed; collect this policy in a new directory."
+            )
+    (metadata_output / "policy.json").write_text(
+        json.dumps(policy.manifest, indent=2) + "\n"
+    )
     if args.command == "infer":
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -314,16 +420,19 @@ def main() -> None:
                         if args.actor is not None
                         else "reference",
                         announce=announcements,
+                        resume=args.resume is not None,
                     )
             except KeyboardInterrupt:
                 print(
-                    "Interrupted; partial results saved. Arm holds its last target.",
+                    "Interrupted; partial results saved. Arm holds its last target. "
+                    "Use --resume with this results directory to continue collection.",
                     flush=True,
                 )
             except Exception:
                 print(
                     f"Evaluation stopped after a fault; keys are no longer active. "
-                    f"Saved results: {output.resolve()}. Restart the command after resolving the fault.",
+                    f"Saved results: {output.resolve()}. After resolving the fault, "
+                    "use --resume with this directory to continue collection.",
                     flush=True,
                 )
                 raise

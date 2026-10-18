@@ -30,6 +30,16 @@ _LOG = logging.getLogger(__name__)
 # Use the same local Speech Dispatcher backend as Evo-RL's log_say.
 # Each topic retains only its latest pending state; results remain independent.
 _MESSAGES = {
+    "resumed": (
+        "resume",
+        "Collection resumed with {number} saved episodes.",
+        "继续采集，已保留{number}条数据。",
+    ),
+    "resume_reset": (
+        "reset",
+        "Previous reset unfinished. Check the workspace, then press R to reset.",
+        "上次复位未完成，确认工作区后按 R 复位。",
+    ),
     "ready": (
         "episode",
         "Ready for episode {number}. Press right.",

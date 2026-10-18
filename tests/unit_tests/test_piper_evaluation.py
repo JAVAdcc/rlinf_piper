@@ -18,9 +18,11 @@ import io
 import json
 import os
 import pty
+import subprocess
 import termios
 import time
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -1073,6 +1075,418 @@ class VideoSession(Session):
 
 class VideoPolicy(Policy):
     fps = 30
+
+
+@pytest.mark.parametrize("streaming_video", [False, True])
+def test_resume_keeps_recordings_labels_and_skips_discarded_or_unfinished_attempts(
+    tmp_path, streaming_video
+):
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_piper(
+            VideoPolicy(),
+            VideoSession(),
+            "USB",
+            output=tmp_path,
+            num_episodes=3,
+            steps=100,
+            record_dataset=True,
+            streaming_video=streaming_video,
+            keys=Keys([
+                [["right"], ["b"], [], ["s"]],
+                [["right"], ["b"], [], ["f"]],
+                [["left"], ["q"]],
+            ]),
+        )
+    labels_before = json.loads((tmp_path / "annotations.json").read_text())
+    # Older collections did not store a separate attempt field.
+    result_path = tmp_path / "episode_001/result.json"
+    old = json.loads(result_path.read_text())
+    old.pop("attempt")
+    result_path.write_text(json.dumps(old))
+    preserved = {
+        p: p.read_bytes()
+        for root in (tmp_path / "episode_001", tmp_path / "discarded")
+        for p in root.rglob("*")
+        if p.is_file()
+    }
+    orphan = tmp_path / "episode_007"
+    orphan.mkdir()
+    (orphan / "trace.jsonl").write_text('{"incomplete": true}\n')
+    events = []
+    session = VideoSession()
+    summary = evaluate_piper(
+        VideoPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=2,
+        steps=100,
+        record_dataset=True,
+        resume=True,
+        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+        announce=lambda event, number: events.append((event, number)),
+    )
+    assert summary["completed_episodes"] == summary["recorded_episodes"] == 2
+    assert summary["success_rate"] == 0.5 and summary["discarded_episodes"] == 1
+    assert [x["attempt"] for x in summary["episodes"]] == [1, 2, 7, 8]
+    assert [x["outcome"] for x in summary["episodes"]] == [
+        "success",
+        "discarded",
+        "interrupted",
+        "failure",
+    ]
+    assert summary["episodes"][-1]["episode"] == 2
+    assert len(session.targets) == 1 and session.opens == session.closes == 1
+    assert events[0] == ("resumed", 1)
+    assert all(p.read_bytes() == contents for p, contents in preserved.items())
+    labels = json.loads((tmp_path / "annotations.json").read_text())
+    assert labels["episodes"][0] == labels_before["episodes"][0]
+    assert list(labels["datasets"]) == ["episode_001", "episode_008"]
+
+
+@pytest.mark.parametrize("lost_commit", [False, True])
+def test_resume_uses_results_when_summary_lags_and_excludes_uncommitted_video(
+    tmp_path, lost_commit
+):
+    evaluate_piper(
+        VideoPolicy(),
+        VideoSession(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        record_dataset=True,
+        keys=Keys([[["right"], ["b"], [], ["s"]]]),
+    )
+    if lost_commit:
+        path = tmp_path / "episode_001/result.json"
+        trial = json.loads(path.read_text())
+        trial.pop("recording")
+        trial.pop("ended_at")
+        path.write_text(json.dumps(trial))
+    else:
+        (tmp_path / "summary.json").write_text(
+            json.dumps({"episodes": [], "requested_episodes": 2})
+        )
+    summary = evaluate_piper(
+        VideoPolicy(),
+        VideoSession(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1 if lost_commit else 2,
+        steps=100,
+        record_dataset=True,
+        resume=True,
+        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+    )
+    assert summary["completed_episodes"] == (1 if lost_commit else 2)
+    assert summary["successes"] == (0 if lost_commit else 1)
+    assert summary["episodes"][0]["outcome"] == (
+        "interrupted" if lost_commit else "success"
+    )
+    labels = json.loads((tmp_path / "annotations.json").read_text())
+    assert list(labels["datasets"]) == (
+        ["episode_002"] if lost_commit else ["episode_001", "episode_002"]
+    )
+
+
+def test_resume_allows_discarding_last_saved_episode_before_another_start(tmp_path):
+    evaluate_piper(
+        Policy(),
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys([[["right"], [], ["s"]]]),
+    )
+    summary = evaluate_piper(
+        Policy(),
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        resume=True,
+        keys=Keys([[["left"], ["left"], ["right"], [], ["f"]]]),
+    )
+    assert summary["completed_episodes"] == summary["discarded_episodes"] == 1
+    assert summary["failures"] == 1 and summary["successes"] == 0
+    assert [x["directory"] for x in summary["episodes"]] == [
+        "discarded/episode_001",
+        "episode_002",
+    ]
+
+
+@pytest.mark.parametrize("interrupted_reset", [False, True])
+def test_resume_restores_first_reset_pose_and_gates_unfinished_reset(
+    tmp_path, interrupted_reset
+):
+    from rlinf.robotics.piper_reset import PiperResetTiming
+
+    class ResetSession(Session):
+        config = SimpleNamespace(
+            fps=1000, max_prediction_age_s=2, gripper_max_width_m=0.07
+        )
+
+        def __init__(self, state, fail=False):
+            super().__init__()
+            self.state = state.copy()
+            self.fail = fail
+            self.reset_targets = []
+
+        def read_state(self):
+            return self.state.copy()
+
+        def prepare_for_reset(self):
+            pass
+
+        def execute_reset(self, target):
+            if self.fail:
+                raise KeyboardInterrupt
+            self.reset_targets.append(target.copy())
+            self.state = target.copy()
+            return {"state": self.state}
+
+    initial = np.array([1, 2, -3, 4, 5, 6, 7.0])
+    timing = PiperResetTiming(0.001, 0.001)
+    first = ResetSession(initial, fail=interrupted_reset)
+    try:
+        evaluate_piper(
+            Policy(),
+            first,
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=100,
+            reset_after_episode="initial",
+            reset_timing=timing,
+            keys=Keys([[["right"], [], ["s"]]]),
+        )
+    except KeyboardInterrupt:
+        assert interrupted_reset
+    pose_bytes = (tmp_path / "reset_pose.json").read_bytes()
+    reset_bytes = (tmp_path / "episode_001/reset.jsonl").read_bytes()
+    second = ResetSession(np.array([10, 20, -30, 40, 50, 60, 70.0]))
+    events = []
+
+    def announce(event, number):
+        if event == "started" and interrupted_reset:
+            # Right in the reset gate could not start the next policy episode.
+            np.testing.assert_array_equal(second.state, initial)
+            assert len(second.reset_targets) == 3
+        events.append(event)
+
+    key_batches = [[["right"], ["r"]]] if interrupted_reset else []
+    key_batches.append([["right"], [], ["f"]])
+    summary = evaluate_piper(
+        Policy(),
+        second,
+        "USB",
+        output=tmp_path,
+        num_episodes=2,
+        steps=100,
+        resume=True,
+        reset_after_episode="initial",
+        reset_timing=timing,
+        keys=Keys(key_batches),
+        announce=announce,
+    )
+    assert summary["completed_episodes"] == 2
+    assert all(x["reset"]["status"] == "complete" for x in summary["episodes"])
+    assert ("resume_reset" in events) == interrupted_reset
+    assert (tmp_path / "reset_pose.json").read_bytes() == pose_bytes
+    assert (tmp_path / "episode_001/reset.jsonl").read_bytes() == reset_bytes
+    assert (tmp_path / "episode_001/reset_retry_02.jsonl").exists() == interrupted_reset
+    np.testing.assert_array_equal(second.reset_targets[-1], initial)
+
+
+@pytest.mark.parametrize(
+    "damage", ["video", "result", "missing_result", "directory", "target"]
+)
+def test_resume_refuses_damaged_history_before_connecting_or_rewriting(
+    tmp_path, damage
+):
+    evaluate_piper(
+        VideoPolicy(),
+        VideoSession(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        record_dataset=True,
+        keys=Keys([[["right"], ["b"], [], ["s"]]]),
+    )
+    if damage == "video":
+        next((tmp_path / "episode_001/dataset/videos").rglob("*.mp4")).unlink()
+    elif damage == "result":
+        (tmp_path / "episode_001/result.json").write_text("{broken")
+    elif damage == "missing_result":
+        (tmp_path / "episode_001/result.json").unlink()
+    elif damage == "directory":
+        (tmp_path / "episode_001").rename(tmp_path / "missing")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    session = VideoSession()
+    with pytest.raises(ValueError):
+        evaluate_piper(
+            VideoPolicy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=1 if damage == "target" else 2,
+            steps=100,
+            resume=True,
+            record_dataset=True,
+            reset_after_episode="initial" if damage == "target" else "none",
+            keys=Keys([]),
+        )
+    assert session.opens == session.closes == 0
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
+def test_resume_target_cannot_shrink_history_and_existing_run_requires_resume(tmp_path):
+    evaluate_piper(
+        Policy(),
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=2,
+        steps=100,
+        keys=Keys([[["right"], [], ["s"]], [["right"], [], ["f"]]]),
+    )
+    saved = (tmp_path / "summary.json").read_bytes()
+    for resume in (True, False):
+        session = Session()
+        with pytest.raises(ValueError, match="below|already exists"):
+            evaluate_piper(
+                Policy(),
+                session,
+                "USB",
+                output=tmp_path,
+                num_episodes=1,
+                steps=100,
+                resume=resume,
+                keys=Keys([]),
+            )
+        assert session.opens == 0
+        assert (tmp_path / "summary.json").read_bytes() == saved
+
+
+def test_resume_cli_restores_settings_and_wrapper_preserves_overrides(tmp_path):
+    from toolkits.piper.run_policy import parse_args
+
+    original = parse_args([
+        "rollout",
+        "--checkpoint",
+        str(tmp_path / "checkpoint"),
+        "--hardware",
+        str(tmp_path / "old_hardware.yaml"),
+        "--task",
+        "USB",
+        "--interactive",
+        "--teleop",
+        "piper_leader",
+        "--record-dataset",
+        "--reset-after-episode",
+        "initial",
+        "--steps",
+        "7200",
+        "--no-action-limits",
+        "--num-episodes",
+        "2",
+    ])
+    values = {
+        k: str(v) if isinstance(v, Path) else v for k, v in vars(original).items()
+    }
+    values.pop("streaming_video")  # Runs collected before streaming support.
+    run_path = tmp_path / "run.json"
+    run_path.write_text(json.dumps(values))
+    original_bytes = run_path.read_bytes()
+    (tmp_path / "hardware.yaml").write_text("{}\n")
+    (tmp_path / "summary.json").write_text(json.dumps({"requested_episodes": 80}))
+    resumed = parse_args(["rollout", "--resume", str(tmp_path)])
+    assert resumed.num_episodes == 80 and resumed.record_dataset and resumed.interactive
+    assert resumed.teleop == "piper_leader" and resumed.steps == 7200
+    assert resumed.streaming_video and resumed.no_action_limits
+    assert (
+        resumed.checkpoint == original.checkpoint
+        and resumed.reset_after_episode == "initial"
+    )
+    assert resumed.output_dir is None and resumed.resume == tmp_path
+    overrides = [
+        "--num-episodes",
+        "100",
+        "--device",
+        "cpu",
+        "--no-play-sounds",
+        "--speech-language",
+        "zh",
+        "--no-streaming-video",
+    ]
+    resumed = parse_args(["rollout", "--resume", str(tmp_path), *overrides])
+    assert resumed.num_episodes == 100 and resumed.device == "cpu"
+    assert not resumed.play_sounds and not resumed.streaming_video
+    assert resumed.speech_language == "zh"
+    assert run_path.read_bytes() == original_bytes
+    repo = Path(__file__).resolve().parents[2]
+    for resume_option in (["--resume", str(tmp_path)], [f"--resume={tmp_path}"]):
+        completed = subprocess.run(
+            [
+                "bash",
+                str(repo / "toolkits/piper/eval_stage1.sh"),
+                "rollout",
+                *resume_option,
+                *overrides,
+            ],
+            env={**os.environ, "PIPER_PYTHON": "/bin/echo"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert (
+            "--checkpoint" not in completed.stdout
+            and "--num-episodes 20" not in completed.stdout
+        )
+        assert "--num-episodes 100" in completed.stdout
+    for forbidden in (
+        ["--task", "other task"],
+        ["--output-dir", str(tmp_path)],
+        ["--teleop", "none"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            parse_args(["rollout", "--resume", str(tmp_path), *forbidden])
+        assert exc.value.code == 2
+
+
+def test_collection_lock_blocks_second_writer_and_releases_on_error(
+    tmp_path, monkeypatch
+):
+    from rlinf.robotics.piper_collection import collection_lock
+    from toolkits.piper.run_policy import main
+
+    (tmp_path / "run.json").write_text(
+        json.dumps({
+            "command": "rollout",
+            "interactive": True,
+            "checkpoint": "/unused",
+            "hardware": "/unused",
+            "task": "USB",
+        })
+    )
+    (tmp_path / "hardware.yaml").write_text("{}\n")
+    monkeypatch.setattr(
+        "sys.argv", ["run_policy", "rollout", "--resume", str(tmp_path)]
+    )
+    with (
+        collection_lock(tmp_path),
+        pytest.raises(RuntimeError, match="already running"),
+    ):
+        main()  # Must fail before attempting to load the nonexistent checkpoint.
+    with pytest.raises(KeyboardInterrupt), collection_lock(tmp_path):
+        raise KeyboardInterrupt
+    with collection_lock(tmp_path):
+        pass  # A stale lock file alone does not prevent resuming.
+    assert not (tmp_path / "resumes").exists()
 
 
 @pytest.mark.parametrize("streaming_video", [True, False])

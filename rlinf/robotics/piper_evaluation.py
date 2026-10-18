@@ -129,6 +129,7 @@ def evaluate_piper(
     reset_timing: PiperResetTiming = PiperResetTiming(),
     policy_source: str = "reference",
     announce: Callable[[str, int], None] | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
 
@@ -139,6 +140,8 @@ def evaluate_piper(
     Left discards the latest stopped trial until Right starts another trial.
     After the requested retained count, Right confirms completion; Left retries.
     Optional announcement delivery is best-effort and cannot abort collection.
+    Resume restores attempts and the reset target from this exclusively owned
+    output directory. ``num_episodes`` remains the total retained target.
     """
     if num_episodes <= 0 or steps <= 0:
         raise ValueError("Episode count and step limit must be positive.")
@@ -151,6 +154,23 @@ def evaluate_piper(
     if policy_source not in ("reference", "actor"):
         raise ValueError("Policy source must be reference or actor.")
     episodes = []
+    if resume:
+        from rlinf.robotics.piper_collection import load_collection
+
+        episodes, reset_pose = load_collection(
+            output,
+            record_dataset=record_dataset,
+            reset_after_episode=reset_after_episode,
+        )
+    elif (output / "summary.json").exists() or any(output.glob("episode_*")):
+        raise ValueError(
+            "Collection already exists; use resume to preserve its history."
+        )
+    retained = sum(x["outcome"] in ("success", "failure") for x in episodes)
+    if num_episodes < retained:
+        raise ValueError(
+            f"Episode target {num_episodes} is below the {retained} retained episodes."
+        )
 
     def notify(event: str, number: int = 0) -> None:
         nonlocal announce
@@ -256,11 +276,137 @@ def evaluate_piper(
         _write_json(destination / "result.json", trial)
         summarize("running")
 
+    def reset_trial(trial: dict, on_tick: Callable[[], None]) -> None:
+        episode_dir = output / trial["directory"]
+        trial.setdefault("reset", {"status": "pending", "attempts": []})
+        trial["reset"].setdefault("attempts", [])
+        # A crash may leave a log before the attempt was appended to result.json.
+        attempt = 0
+        while True:
+            attempt += 1
+            log_name = (
+                "reset.jsonl" if attempt == 1 else f"reset_retry_{attempt:02d}.jsonl"
+            )
+            if (episode_dir / log_name).exists():
+                continue
+            trial["reset"].pop("error", None)
+            trial["reset"]["status"] = "running"
+            _write_json(episode_dir / "result.json", trial)
+            summarize("resetting")
+            try:
+                notify("reset_start")
+                with (episode_dir / log_name).open("x") as reset_log:
+                    completed_reset = reset_piper(
+                        session,
+                        reset_pose,
+                        log=reset_log,
+                        timing=reset_timing,
+                        on_tick=on_tick,
+                    )
+                trial["reset"].update(completed_reset, status="complete")
+                trial["reset"]["attempts"].append({
+                    "log": log_name,
+                    "status": "complete",
+                })
+                notify("reset_done")
+                print(
+                    "Reset trajectory complete. Check the pose, restore the scene, then press Right.",
+                    flush=True,
+                )
+                return
+            except KeyboardInterrupt:
+                trial["reset"]["status"] = "interrupted"
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                trial["reset"].update(status="error", error=error)
+                trial["reset"]["attempts"].append({
+                    "log": log_name,
+                    "status": "error",
+                    "error": error,
+                })
+                _write_json(episode_dir / "result.json", trial)
+                summarize("reset_failed")
+                notify("reset_failed")
+                print(
+                    f"Reset stopped: {error}\nScore saved; connection remains open. "
+                    "After resolving the fault, press r to retry reset, or q / Ctrl-C to exit. "
+                    "Right will not start another trial until reset finishes.",
+                    flush=True,
+                )
+                keys.clear()
+                while True:
+                    pressed = keys.poll()
+                    if "left" in pressed:
+                        discard_trial(trial)
+                    if "q" in pressed:
+                        raise
+                    if "r" in pressed:
+                        break
+                    time.sleep(0.02)
+            finally:
+                _write_json(episode_dir / "result.json", trial)
+                summarize(
+                    "reset_failed" if trial["reset"]["status"] == "error" else "running"
+                )
+
+    attempt_number = max((x["attempt"] for x in episodes), default=0)
+    undoable = (
+        episodes[-1]
+        if episodes and episodes[-1]["outcome"] in ("success", "failure")
+        else None
+    )
+    if resume:
+        print(
+            f"Resuming {output}: {retained}/{num_episodes} retained; "
+            f"next attempt directory is episode_{attempt_number + 1:03d}.",
+            flush=True,
+        )
+        notify("resumed", retained)
+    for trial in episodes:
+        if trial["outcome"] == "discarded":
+            archive_discarded(trial)
     summarize("running")
     try:
         with session:
-            attempt_number = 0
-            undoable = None
+            if (
+                resume
+                and reset_pose is not None
+                and episodes
+                and episodes[-1].get("reset", {}).get("status") != "complete"
+            ):
+                last_trial = episodes[-1]
+                summarize("waiting_for_reset")
+                notify("resume_reset")
+                print(
+                    "The last attempt did not finish reset. Check the workspace, "
+                    "then press r to return to the saved reset pose, or q to exit. "
+                    "Right cannot start an episode until reset finishes.",
+                    flush=True,
+                )
+
+                def poll_resumed_reset() -> list[str]:
+                    pressed = keys.poll()
+                    if "left" in pressed:
+                        if undoable is not None:
+                            discard_trial(last_trial)
+                        else:
+                            notify("nothing_to_discard")
+                    if "q" in pressed:
+                        raise KeyboardInterrupt
+                    return pressed
+
+                keys.clear()
+                while "r" not in poll_resumed_reset():
+                    time.sleep(0.02)
+
+                def resumed_reset_tick() -> None:
+                    poll_resumed_reset()
+
+                reset_trial(last_trial, resumed_reset_tick)
+                if last_trial["outcome"] == "discarded":
+                    archive_discarded(last_trial)
+                    undoable = None
             while True:
                 number = (
                     sum(x["outcome"] in ("success", "failure") for x in episodes) + 1
@@ -349,6 +495,7 @@ def evaluate_piper(
                     "takeovers": 0,
                     "human_steps": 0,
                 }
+                _write_json(episode_dir / "result.json", result)
                 summarize("running_episode")
                 started = time.monotonic()
                 print(
@@ -597,77 +744,7 @@ def evaluate_piper(
                         archive_discarded(result)
                     raise KeyboardInterrupt
                 if reset_pose is not None:
-                    result["reset"] = {"status": "pending", "attempts": []}
-                    attempt = 0
-                    while True:
-                        attempt += 1
-                        result["reset"].pop("error", None)
-                        result["reset"]["status"] = "running"
-                        _write_json(episode_dir / "result.json", result)
-                        summarize("resetting")
-                        log_name = (
-                            "reset.jsonl"
-                            if attempt == 1
-                            else f"reset_retry_{attempt:02d}.jsonl"
-                        )
-                        try:
-                            notify("reset_start")
-                            with (episode_dir / log_name).open("x") as reset_log:
-                                completed_reset = reset_piper(
-                                    session,
-                                    reset_pose,
-                                    log=reset_log,
-                                    timing=reset_timing,
-                                    on_tick=poll_reset,
-                                )
-                            result["reset"].update(completed_reset, status="complete")
-                            result["reset"]["attempts"].append({
-                                "log": log_name,
-                                "status": "complete",
-                            })
-                            notify("reset_done")
-                            print(
-                                "Reset trajectory complete. Check the pose, restore the scene, then press Right.",
-                                flush=True,
-                            )
-                            break
-                        except KeyboardInterrupt:
-                            result["reset"]["status"] = "interrupted"
-                            raise
-                        except Exception as exc:
-                            error = f"{type(exc).__name__}: {exc}"
-                            result["reset"].update(status="error", error=error)
-                            result["reset"]["attempts"].append({
-                                "log": log_name,
-                                "status": "error",
-                                "error": error,
-                            })
-                            _write_json(episode_dir / "result.json", result)
-                            summarize("reset_failed")
-                            notify("reset_failed")
-                            print(
-                                f"Reset stopped: {error}\nScore saved; connection remains open. "
-                                "After resolving the fault, press r to retry reset, or q / Ctrl-C to exit. "
-                                "Right will not start another trial until reset finishes.",
-                                flush=True,
-                            )
-                            keys.clear()
-                            while True:
-                                pressed = keys.poll()
-                                if "left" in pressed:
-                                    discard_trial(result)
-                                if "q" in pressed:
-                                    raise
-                                if "r" in pressed:
-                                    break
-                                time.sleep(0.02)
-                        finally:
-                            _write_json(episode_dir / "result.json", result)
-                            summarize(
-                                "reset_failed"
-                                if result["reset"]["status"] == "error"
-                                else "running"
-                            )
+                    reset_trial(result, poll_reset)
                 if result["outcome"] == "discarded":
                     archive_discarded(result)
                 else:

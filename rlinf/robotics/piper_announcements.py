@@ -29,107 +29,36 @@ _LOG = logging.getLogger(__name__)
 
 # Use the same local Speech Dispatcher backend as Evo-RL's log_say.
 # Each topic retains only its latest pending state; results remain independent.
+# Speak the operation; keep counts and instructions in the terminal.
 _MESSAGES = {
-    "resumed": (
-        "resume",
-        "Collection resumed with {number} saved episodes.",
-        "继续采集，已保留{number}条数据。",
-    ),
-    "resume_reset": (
-        "reset",
-        "Previous reset unfinished. Check the workspace, then press R to reset.",
-        "上次复位未完成，确认工作区后按 R 复位。",
-    ),
-    "ready": (
-        "episode",
-        "Ready for episode {number}. Press right.",
-        "准备采集第{number}回合，按右方向键开始。",
-    ),
-    "aligning": ("episode", "Aligning the leader arm.", "正在对齐主臂。"),
-    "started": ("episode", "Starting episode {number}.", "开始第{number}回合。"),
-    "review": (
-        "episode",
-        "Collection target reached. Right to finish. Left to discard the last episode.",
-        "已采够回合数，右键结束，左键丢弃重采。",
-    ),
-    "discarded": (
-        "discard",
-        "Episode {number} discarded.",
-        "第{number}回合已丢弃。",
-    ),
-    "nothing_to_discard": (
-        "discard",
-        "No episode available to discard.",
-        "当前没有可以丢弃的回合。",
-    ),
-    "critical_on": (
-        "phase",
-        "Critical phase {number} on.",
-        "进入第{number}段关键阶段。",
-    ),
-    "critical_off": (
-        "phase",
-        "Critical phase {number} off.",
-        "退出第{number}段关键阶段。",
-    ),
-    "critical_closed": (
-        "phase_result",
-        "Last critical phase closed at episode end.",
-        "最后一段关键阶段已自动延长到回合结束。",
-    ),
-    "critical_empty": (
-        "phase",
-        "Empty critical phase ignored.",
-        "忽略空的关键阶段标记。",
-    ),
-    "phase_limit": (
-        "phase",
-        "Step limit. Cannot start a critical phase.",
-        "已到步数上限，不能开始新的关键阶段。",
-    ),
+    "resumed": ("resume", "Resuming.", "续采。"),
+    "resume_reset": ("reset", "Reset pending.", "待复位。"),
+    "ready": ("episode", "Ready.", "就绪。"),
+    "aligning": ("episode", "Aligning.", "对齐。"),
+    "started": ("episode", "Start.", "开始。"),
+    "review": ("episode", "Confirm finish.", "确认结束。"),
+    "discarded": ("discard", "Discarded.", "已丢弃。"),
+    "nothing_to_discard": ("discard", "Nothing to discard.", "无可丢弃。"),
+    "critical_on": ("phase", "Critical on.", "关键段开始。"),
+    "critical_off": ("phase", "Critical off.", "关键段结束。"),
+    "critical_closed": ("phase_result", "Phase closed.", "终点补齐。"),
+    "critical_empty": ("phase", "Empty phase.", "空段。"),
+    "phase_limit": ("phase", "Step limit.", "步数上限。"),
     "human": ("control", "Human control.", "人工接管。"),
-    "policy_wait": ("control", "Waiting for a new prediction.", "等待模型的新预测。"),
-    "policy_resumed": ("control", "Policy control resumed.", "模型控制已恢复。"),
-    "waiting_score": (
-        "episode",
-        "Step limit. Press S or F to score.",
-        "已到步数上限，请按 S 或 F 评分。",
-    ),
-    "success": (
-        "outcome",
-        "Episode {number} marked successful.",
-        "第{number}回合已标记成功。",
-    ),
-    "failure": (
-        "outcome",
-        "Episode {number} marked failed.",
-        "第{number}回合已标记失败。",
-    ),
-    "saving": ("recording", "Saving episode {number}.", "正在保存第{number}回合。"),
-    "saved": ("recording", "Episode {number} saved.", "第{number}回合数据已保存。"),
-    "no_critical": (
-        "annotation",
-        "No critical phase marked.",
-        "本回合没有关键阶段标注。",
-    ),
-    "reset_start": ("reset", "Resetting the arm.", "开始复位。"),
-    "reset_done": (
-        "reset_result",
-        "Reset trajectory finished. Check the pose.",
-        "复位轨迹已执行，请检查姿态。",
-    ),
-    "reset_failed": (
-        "reset",
-        "Reset failed. Press R to retry, or Q to exit.",
-        "复位失败，按 R 重试，或按 Q 退出。",
-    ),
-    "stopped": ("terminal", "Collection stopped.", "采集已停止。"),
-    "complete": ("terminal", "Collection complete.", "采集完成。"),
-    "fault": (
-        "terminal",
-        "Collection stopped after an error.",
-        "发生故障，采集已停止。",
-    ),
+    "policy_wait": ("control", "Predicting.", "等待预测。"),
+    "policy_resumed": ("control", "Policy control.", "模型接管。"),
+    "waiting_score": ("episode", "Score now.", "请评分。"),
+    "success": ("outcome", "Success.", "成功。"),
+    "failure": ("outcome", "Failure.", "失败。"),
+    "saving": ("recording", "Saving.", "保存中。"),
+    "saved": ("recording", "Saved.", "已保存。"),
+    "no_critical": ("annotation", "Unmarked phase.", "未标关键段。"),
+    "reset_start": ("reset", "Resetting.", "复位中。"),
+    "reset_done": ("reset_result", "Reset finished.", "复位结束。"),
+    "reset_failed": ("reset", "Reset failed.", "复位失败。"),
+    "stopped": ("terminal", "Stopped.", "已停止。"),
+    "complete": ("terminal", "Complete.", "采集完成。"),
+    "fault": ("terminal", "Error.", "故障。"),
 }
 _TRANSIENT = {"episode", "phase", "control", "reset"}
 

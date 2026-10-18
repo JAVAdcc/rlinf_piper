@@ -880,18 +880,18 @@ def test_recording_failure_preserves_operator_score_and_excludes_invalid_data(
             "en",
             "en-US",
             [
-                "Ready for episode 1. Press right.",
-                "Policy control resumed.",
-                "Critical phase 2 off.",
+                "Ready.",
+                "Policy control.",
+                "Critical off.",
             ],
         ),
         (
             "zh",
             "cmn",
             [
-                "准备采集第1回合，按右方向键开始。",
-                "模型控制已恢复。",
-                "退出第2段关键阶段。",
+                "就绪。",
+                "模型接管。",
+                "关键段结束。",
             ],
         ),
     ],
@@ -1024,10 +1024,10 @@ def test_terminal_speech_is_delivered_after_hardware_closes(tmp_path, monkeypatc
             announce=announce,
         )
     assert [call["args"][-1] for call in backend.calls] == [
-        "Ready for episode 1. Press right.",
-        "Last critical phase closed at episode end.",
-        "Episode 1 marked successful.",
-        "Collection complete.",
+        "Ready.",
+        "Phase closed.",
+        "Success.",
+        "Complete.",
     ]
 
 

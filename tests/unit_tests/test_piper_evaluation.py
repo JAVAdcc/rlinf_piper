@@ -1490,6 +1490,244 @@ def test_collection_lock_blocks_second_writer_and_releases_on_error(
 
 
 @pytest.mark.parametrize("streaming_video", [True, False])
+def test_left_stops_active_trial_without_scoring_or_saving_and_preserves_previous(
+    tmp_path, streaming_video
+):
+    import threading
+
+    class Follower(VideoSession):
+        discarded = False
+
+        def observe(self):
+            assert not self.discarded, "Discard must not capture another terminal view"
+            return super().observe()
+
+        def execute(self, target):
+            assert not self.discarded, "Discard must stop further episode actions"
+            return super().execute(target)
+
+    session = Follower()
+    attempt = 0
+    events = []
+
+    def announce(event, number):
+        nonlocal attempt
+        if event == "started":
+            attempt += 1
+            session.discarded = False
+        if event == "discarded":
+            session.discarded = True
+        events.append((attempt, event))
+
+    summary = evaluate_piper(
+        VideoPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=2,
+        steps=100,
+        record_dataset=True,
+        streaming_video=streaming_video,
+        announce=announce,
+        keys=Keys([
+            [["right"], ["b"], [], ["s"]],
+            [["right"], ["b"], [], ["s", "left", "f", "right", "i"]],
+            [["left"], ["right"], ["b"], [], ["f"]],
+        ]),
+    )
+    assert summary["completed_episodes"] == summary["recorded_episodes"] == 2
+    assert summary["discarded_episodes"] == 1 and summary["success_rate"] == 0.5
+    assert len(session.targets) == 3 and session.opens == session.closes == 1
+    discarded = summary["episodes"][1]
+    assert (
+        discarded["outcome"] == "discarded"
+        and discarded["original_outcome"] == "unscored"
+    )
+    assert discarded["completed_steps"] == 1
+    assert discarded["recording"]["status"] == "discarded"
+    aborted_events = [event for index, event in events if index == 2]
+    assert aborted_events.count("discarded") == 1
+    assert not {"success", "failure", "saving", "saved", "waiting_score"}.intersection(
+        aborted_events
+    )
+    root = tmp_path / "discarded/episode_002/dataset"
+    assert not (root / "meta/episodes.jsonl").exists()
+    assert not list(root.rglob("*.mp4"))
+    assert not list(tmp_path.rglob("streaming-video-*"))
+    assert not any(t.name == "piper-video" for t in threading.enumerate())
+    labels = json.loads((tmp_path / "annotations.json").read_text())
+    assert list(labels["datasets"]) == ["episode_001", "episode_003"]
+    assert all(
+        x["critical_phases"] == [{"start": 0, "end": 1}] for x in labels["episodes"]
+    )
+
+
+@pytest.mark.parametrize("before_inference", [True, False])
+def test_left_before_first_action_needs_no_score_or_recorder(
+    tmp_path, before_inference
+):
+    class CountedPolicy(Policy):
+        calls = 0
+
+        def infer(self, obs, task):
+            self.calls += 1
+            return super().infer(obs, task)
+
+    first_keys = (
+        [["right"], ["left"]] if before_inference else [["right"], [], ["left"]]
+    )
+    policy, session = CountedPolicy(), Session()
+    summary = evaluate_piper(
+        policy,
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys([first_keys, [["right"], [], ["f"]]]),
+    )
+    assert policy.calls == (1 if before_inference else 2)
+    assert not session.targets
+    assert summary["completed_episodes"] == summary["failures"] == 1
+    assert summary["discarded_episodes"] == 1
+    assert summary["episodes"][0]["completed_steps"] == 0
+    assert summary["episodes"][0]["original_outcome"] == "unscored"
+    assert (tmp_path / "discarded/episode_001/result.json").exists()
+
+
+def test_left_at_step_limit_discards_without_success_or_failure(tmp_path):
+    summary = evaluate_piper(
+        VideoPolicy(),
+        VideoSession(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=1,
+        record_dataset=True,
+        keys=Keys([
+            [["right"], ["b"], [], ["left"]],
+            [["right"], ["b"], [], ["s"]],
+        ]),
+    )
+    assert summary["completed_episodes"] == summary["successes"] == 1
+    assert summary["discarded_episodes"] == 1
+    assert summary["episodes"][0]["outcome"] == "discarded"
+    assert summary["episodes"][0]["original_outcome"] == "unscored"
+    assert summary["episodes"][0]["recording"]["status"] == "discarded"
+    labels = json.loads((tmp_path / "annotations.json").read_text())
+    assert list(labels["datasets"]) == ["episode_002"]
+
+
+def test_left_during_human_control_discards_pending_prediction_before_next_trial(
+    tmp_path,
+):
+    from threading import Event
+
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+    from rlinf.robotics.piper_intervention import (
+        PiperIntervention,
+        PiperInterventionConfig,
+    )
+
+    predicting, release = Event(), Event()
+
+    class SlowPolicy(VideoPolicy):
+        calls = 0
+
+        def infer(self, obs, task):
+            self.calls += 1
+            if self.calls == 1:
+                predicting.set()
+                assert release.wait(5)
+                return np.full((50, 7), 77.0)
+            return np.ones((50, 7))
+
+    class Follower(VideoSession):
+        discarded = False
+
+        def read_state(self):
+            return np.zeros(7)
+
+        def observe(self):
+            observation = super().observe()
+            observation["observation.state"] = self.read_state()
+            return observation
+
+        def execute(self, target):
+            assert not self.discarded
+            return super().execute(target)
+
+    session = Follower()
+
+    class HumanKeys(Keys):
+        batch = 0
+
+        def clear(self):
+            self.batch += 1
+            super().clear()
+
+        def poll(self):
+            event = super().poll()
+            if (
+                self.batch == 2
+                and not event
+                and any(np.all(x == 1) for x in session.targets)
+            ):
+                return ["s"]
+            return event
+
+    with mocked_sdks():
+        control = PiperIntervention(
+            PiperLeader("can-hil", config=PiperLeaderConfig(startup_sleep_s=0)),
+            PiperInterventionConfig(alignment_duration_s=0.001),
+        )
+        session.intervention = control
+        control.connect()
+
+        def announce(event, number):
+            if event == "started":
+                session.discarded = False
+            if event == "discarded":
+                assert control.mode == "human" and predicting.wait(2)
+                assert not release.is_set()
+                session.discarded = True
+                release.set()
+
+        try:
+            summary = evaluate_piper(
+                SlowPolicy(),
+                session,
+                "USB",
+                output=tmp_path,
+                num_episodes=1,
+                steps=100,
+                record_dataset=True,
+                announce=announce,
+                keys=HumanKeys([
+                    [["right"], [], [], ["b", "i"], ["left"]],
+                    [["right"], [], ["b"]],
+                ]),
+            )
+        finally:
+            release.set()
+            control.close()
+    assert (
+        summary["completed_episodes"] == 1 and summary["autonomous_success_rate"] == 1
+    )
+    assert summary["discarded_episodes"] == 1
+    assert (
+        summary["episodes"][0]["takeovers"]
+        == summary["episodes"][0]["human_steps"]
+        == 1
+    )
+    assert summary["episodes"][1]["takeovers"] == 0
+    assert not any(np.any(x == 77) for x in session.targets)
+    assert any(np.all(x == 1) for x in session.targets)
+
+
+@pytest.mark.parametrize("streaming_video", [True, False])
 def test_left_during_encoding_cancels_before_publication_and_replaces_trial(
     tmp_path, streaming_video
 ):
@@ -1580,7 +1818,12 @@ def test_left_at_final_review_discards_only_last_trial_and_keeps_target_count(
         assert summary["phase_labeled_episodes"] == summary["recorded_episodes"] == 2
 
 
-def test_left_in_score_batch_and_quit_never_publishes_discarded_recording(tmp_path):
+@pytest.mark.parametrize(
+    "stop_keys", [["s", "left", "q"], ["left", "q"], ["q", "left"]]
+)
+def test_left_and_quit_never_publish_discarded_recording_and_allow_resume(
+    tmp_path, stop_keys
+):
     with pytest.raises(KeyboardInterrupt):
         evaluate_piper(
             VideoPolicy(),
@@ -1589,7 +1832,7 @@ def test_left_in_score_batch_and_quit_never_publishes_discarded_recording(tmp_pa
             output=tmp_path,
             num_episodes=1,
             steps=100,
-            keys=Keys([[["right"], ["b"], [], ["s", "left", "q"]]]),
+            keys=Keys([[["right"], ["b"], [], stop_keys]]),
             record_dataset=True,
         )
     summary = json.loads((tmp_path / "summary.json").read_text())
@@ -1597,18 +1840,35 @@ def test_left_in_score_batch_and_quit_never_publishes_discarded_recording(tmp_pa
     assert summary["discarded_episodes"] == 1
     assert not json.loads((tmp_path / "annotations.json").read_text())["episodes"]
     assert (tmp_path / "discarded/episode_001/result.json").exists()
+    summary = evaluate_piper(
+        VideoPolicy(),
+        VideoSession(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        record_dataset=True,
+        resume=True,
+        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+    )
+    assert summary["completed_episodes"] == summary["recorded_episodes"] == 1
+    assert summary["episodes"][-1]["directory"] == "episode_002"
 
 
-def test_left_during_reset_keeps_reset_and_excludes_trial(tmp_path, monkeypatch):
+@pytest.mark.parametrize("discard_when", ["active", "reset"])
+def test_left_keeps_reset_and_excludes_trial(tmp_path, monkeypatch, discard_when):
     from rlinf.robotics import piper_evaluation
 
     session = VideoSession()
     session.read_state = lambda: np.zeros(7)
-    keys = Keys([[["right"], ["b"], [], ["s"]], [["right"], ["b"], [], ["f"]]])
+    keys = Keys([
+        [["right"], ["b"], [], ["left" if discard_when == "active" else "s"]],
+        [["right"], ["b"], [], ["f"]],
+    ])
     resets = []
 
     def reset(session_arg, target, *, log, timing, on_tick):
-        if not resets:
+        if not resets and discard_when == "reset":
             keys.events.append(["left"])
         on_tick()
         resets.append(target.copy())

@@ -137,7 +137,8 @@ def evaluate_piper(
     At the step limit, wait for a label without sending further actions. Errors
     abort the whole run. Unscored trials are excluded from the success rate.
     Scoring closes an active final phase at the terminal observation frame.
-    Left discards the latest stopped trial until Right starts another trial.
+    Left stops and discards the active trial, including while waiting for a score.
+    After stopping, Left can discard that trial until Right starts another one.
     After the requested retained count, Right confirms completion; Left retries.
     Optional announcement delivery is best-effort and cannot abort collection.
     Resume restores attempts and the reset target from this exclusively owned
@@ -421,7 +422,7 @@ def evaluate_piper(
                     if final_review
                     else (
                         f"[{number}/{num_episodes}] Restore the scene; press Right to start. "
-                        f"Left discards the last episode. Reset after scoring: {reset_after_episode}."
+                        f"Left discards the last episode. Reset after trial: {reset_after_episode}."
                     ),
                     flush=True,
                 )
@@ -499,7 +500,7 @@ def evaluate_piper(
                 summarize("running_episode")
                 started = time.monotonic()
                 print(
-                    f"[{number}/{num_episodes}] Running: b = enter/exit critical phase, s = success, f = failure; q exits.",
+                    f"[{number}/{num_episodes}] Running: b = enter/exit critical phase, s = success, f = failure; Left discards this trial; q exits.",
                     flush=True,
                 )
                 notify("started", number)
@@ -512,6 +513,13 @@ def evaluate_piper(
                 def stop(completed: int) -> bool:
                     result["completed_steps"] = completed
                     pressed = keys.poll()
+                    if "left" in pressed:
+                        # Discard wins over labels/takeover in the same input batch.
+                        if recorder is not None:
+                            recorder.request_discard()
+                        discard_trial(result)
+                        post_episode_keys.extend(key for key in pressed if key == "q")
+                        return True
                     for key_index, key in enumerate(pressed):
                         if key == "q":
                             raise KeyboardInterrupt
@@ -657,18 +665,22 @@ def evaluate_piper(
                     result["action_duration_s"] = time.monotonic() - started
                     # Capture before scoring waits or reset can change the scene.
                     terminal_observation = (
-                        session.observe() if recorder is not None else None
+                        session.observe()
+                        if recorder is not None and result["outcome"] != "discarded"
+                        else None
                     )
                     if result["outcome"] == "unscored":
                         summarize("waiting_for_score")
                         notify("waiting_score")
                         print(
-                            "Step limit reached; holding. Press s or f to score.",
+                            "Step limit reached; holding. Press s/f to score, or Left to discard.",
                             flush=True,
                         )
                         while not stop(result["completed_steps"]):
                             time.sleep(0.02)
-                    if recorder is not None:
+                    if recorder is not None and result["outcome"] == "discarded":
+                        result["recording"] = {"status": "discarded"}
+                    elif recorder is not None:
                         notify("saving", number)
                         print(
                             "Trial stopped; finishing videos and saving data. Left discards this trial; q exits after saving.",

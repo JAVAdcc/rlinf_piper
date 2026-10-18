@@ -69,13 +69,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Right starts/confirms completion; s/f scores; Left discards the last stopped episode",
+        help="Right starts/confirms completion; s/f scores; Left stops and discards the current episode",
     )
     parser.add_argument(
         "--reset-after-episode",
         choices=("none", "initial", "zero"),
         default="none",
-        help="After s/f: open gripper, return to the first start pose or zero, restore gripper",
+        help="After scoring or discarding: open gripper, return to the first start pose or zero, restore gripper",
     )
     parser.add_argument(
         "--num-episodes",
@@ -389,8 +389,8 @@ def _run(args: argparse.Namespace, output: Path) -> None:
 
             print(
                 "Interactive evaluation enables the follower after cameras connect, "
-                f"then waits for Right. Reset after scoring: {args.reset_after_episode}. "
-                "Keep this terminal focused; b alternates critical phase start/end; s/f stops and scores a trial.",
+                f"then waits for Right. Reset after trial: {args.reset_after_episode}. "
+                "Keep this terminal focused; b alternates critical phase start/end; s/f stops and scores a trial; Left stops and discards it.",
                 flush=True,
             )
             try:

@@ -36,7 +36,7 @@ class EvaluationKeys(Protocol):
     """Keyboard event boundary for an operator-scored trial."""
 
     def clear(self) -> None:
-        """Discard pending events."""
+        """Discard stale start/score input at a stopped episode boundary."""
         ...
 
     def poll(self) -> list[str]:
@@ -63,9 +63,17 @@ class TerminalKeys:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.original)
 
     def clear(self) -> None:
-        """Discard keys from the previous episode or model startup."""
-        self.pending = b""
-        termios.tcflush(self.fd, termios.TCIFLUSH)
+        """Discard stale start/score keys, retaining late discard/quit requests."""
+        pressed = self.poll()
+        fragment = self.pending
+        self.pending = (
+            b"".join(
+                b"\x1b[D" if key == "left" else b"q"
+                for key in pressed
+                if key in ("left", "q")
+            )
+            + fragment
+        )
 
     def poll(self) -> list[str]:
         """Return ordered key events, retaining incomplete arrow sequences."""
@@ -81,6 +89,8 @@ class TerminalKeys:
                     break
                 if self.pending[:3] in (b"\x1b[C", b"\x1bOC"):
                     keys.append("right")
+                elif self.pending[:3] in (b"\x1b[D", b"\x1bOD"):
+                    keys.append("left")
                 self.pending = self.pending[3:]
             else:
                 char = chr(self.pending[0]).lower()
@@ -112,6 +122,7 @@ def evaluate_piper(
     replan_steps: int | None = None,
     save_observations: bool = False,
     record_dataset: bool = False,
+    streaming_video: bool = True,
     phase_definition: str = "Each pair of b presses marks a critical interval; s/f ends the task.",
     session_id: str | None = None,
     reset_after_episode: str = "none",
@@ -125,6 +136,8 @@ def evaluate_piper(
     At the step limit, wait for a label without sending further actions. Errors
     abort the whole run. Unscored trials are excluded from the success rate.
     Scoring closes an active final phase at the terminal observation frame.
+    Left discards the latest stopped trial until Right starts another trial.
+    After the requested retained count, Right confirms completion; Left retries.
     Optional announcement delivery is best-effort and cannot abort collection.
     """
     if num_episodes <= 0 or steps <= 0:
@@ -171,6 +184,7 @@ def evaluate_piper(
             if scored
             else None,
             "episodes": episodes,
+            "discarded_episodes": sum(x["outcome"] == "discarded" for x in episodes),
         }
         if record_dataset:
             collected = [
@@ -211,25 +225,85 @@ def evaluate_piper(
         _write_json(output / "summary.json", summary)
         return summary
 
+    def discard_trial(trial: dict) -> None:
+        if trial["outcome"] == "discarded":
+            return
+        trial["original_outcome"] = trial["outcome"]
+        trial["outcome"] = "discarded"
+        trial["discarded_at"] = time.time()
+        _write_json(output / trial["directory"] / "result.json", trial)
+        summarize("discarding")
+        notify("discarded", trial["episode"])
+        print(
+            f"Episode {trial['episode']} discarded; excluded from scores and training. Press Right to collect a replacement after reset.",
+            flush=True,
+        )
+
+    def archive_discarded(trial: dict) -> None:
+        # Call only after the recorder and reset have released their files.
+        if trial.get("recording_cleanup_error"):
+            return
+        source = output / trial["directory"]
+        if source.parent == output / "discarded":
+            return
+        destination = output / "discarded" / source.name
+        destination.parent.mkdir(exist_ok=True)
+        source.rename(destination)
+        trial["directory"] = str(destination.relative_to(output))
+        if "recording" in trial:
+            trial["recording"]["status"] = "discarded"
+            trial["recording"]["dataset"] = str((destination / "dataset").resolve())
+        _write_json(destination / "result.json", trial)
+        summarize("running")
+
     summarize("running")
     try:
         with session:
-            for number in range(1, num_episodes + 1):
-                summarize("waiting_for_start")
+            attempt_number = 0
+            undoable = None
+            while True:
+                number = (
+                    sum(x["outcome"] in ("success", "failure") for x in episodes) + 1
+                )
+                final_review = number > num_episodes
+                summarize(
+                    "waiting_for_confirmation" if final_review else "waiting_for_start"
+                )
                 keys.clear()
                 print(
-                    f"[{number}/{num_episodes}] Restore the scene; press Right to start. "
-                    f"Reset after scoring: {reset_after_episode}.",
+                    "Requested episodes collected. Right confirms completion; Left discards the last episode; q exits keeping it."
+                    if final_review
+                    else (
+                        f"[{number}/{num_episodes}] Restore the scene; press Right to start. "
+                        f"Left discards the last episode. Reset after scoring: {reset_after_episode}."
+                    ),
                     flush=True,
                 )
-                notify("ready", number)
+                notify("review" if final_review else "ready", min(number, num_episodes))
                 while True:
                     pressed = keys.poll()
+                    if "left" in pressed:
+                        if undoable is not None:
+                            discard_trial(undoable)
+                            archive_discarded(undoable)
+                            undoable = None
+                            number -= 1
+                            final_review = False
+                            summarize("waiting_for_start")
+                            notify("ready", number)
+                        else:
+                            notify("nothing_to_discard")
                     if "q" in pressed:
                         raise KeyboardInterrupt
+                    if "left" in pressed:
+                        continue  # A same-batch Right cannot start after discarding.
                     if "right" in pressed:
                         break
                     time.sleep(0.02)
+                if final_review:
+                    break
+                undoable = None
+                attempt_number += 1
                 if reset_pose is None and reset_after_episode != "none":
                     reset_metadata = {"mode": reset_after_episode}
                     if reset_after_episode == "initial":
@@ -262,10 +336,11 @@ def evaluate_piper(
                         session.config.fps,
                         abort=lambda: "q" in keys.poll(),
                     )
-                episode_dir = output / f"episode_{number:03d}"
+                episode_dir = output / f"episode_{attempt_number:03d}"
                 episode_dir.mkdir(exist_ok=False)
                 result = {
                     "episode": number,
+                    "attempt": attempt_number,
                     "outcome": "unscored",
                     "completed_steps": 0,
                     "started_at": time.time(),
@@ -281,6 +356,7 @@ def evaluate_piper(
                     flush=True,
                 )
                 notify("started", number)
+                post_episode_keys = []
 
                 def critical_active() -> bool:
                     phases = result["critical_phases"]
@@ -288,7 +364,8 @@ def evaluate_piper(
 
                 def stop(completed: int) -> bool:
                     result["completed_steps"] = completed
-                    for key in keys.poll():
+                    pressed = keys.poll()
+                    for key_index, key in enumerate(pressed):
                         if key == "q":
                             raise KeyboardInterrupt
                         if (
@@ -362,10 +439,32 @@ def evaluate_piper(
                             if phase_event is not None:
                                 notify(phase_event)
                             notify(result["outcome"], number)
+                            post_episode_keys.extend(
+                                key
+                                for key in pressed[key_index + 1 :]
+                                if key in ("left", "q")
+                            )
                             return True
                     return False
 
                 recorder = None
+                quit_requested = False
+
+                def poll_after_episode() -> None:
+                    nonlocal quit_requested
+                    pressed = post_episode_keys + keys.poll()
+                    post_episode_keys.clear()
+                    if "left" in pressed:
+                        discard_trial(result)
+                        if recorder is not None:
+                            recorder.request_discard()
+                    quit_requested |= "q" in pressed
+
+                def poll_reset() -> None:
+                    poll_after_episode()
+                    if quit_requested:
+                        raise KeyboardInterrupt
+
                 try:
                     if record_dataset:
                         from rlinf.data.storage.lerobot.piper import (
@@ -376,6 +475,7 @@ def evaluate_piper(
                             episode_dir / "dataset",
                             fps=session.config.fps,
                             task=task,
+                            streaming_video=streaming_video,
                         )
                         recorder.prepare(session.observe())
 
@@ -424,15 +524,21 @@ def evaluate_piper(
                     if recorder is not None:
                         notify("saving", number)
                         print(
-                            "Trial stopped; saving its dataset and encoding videos.",
+                            "Trial stopped; finishing videos and saving data. Left discards this trial; q exits after saving.",
                             flush=True,
                         )
+                        save_started = time.monotonic()
                         result["recording"] = recorder.finish(
                             terminal_observation,
                             critical=critical_active(),
                             outcome=result["outcome"],
+                            poll=poll_after_episode,
                         )
-                        if not result["critical_phases"]:
+                        result["save_duration_s"] = time.monotonic() - save_started
+                        if (
+                            result["outcome"] != "discarded"
+                            and not result["critical_phases"]
+                        ):
                             notify("no_critical")
                             print(
                                 "No critical actions marked: full recording saved; annotate a critical interval before warmup.",
@@ -442,7 +548,7 @@ def evaluate_piper(
                     if result["outcome"] == "unscored":
                         result["outcome"] = "interrupted"
                     if recorder is not None:
-                        result["recording"] = {"status": "interrupted"}
+                        result.setdefault("recording", {"status": "interrupted"})
                     raise
                 except Exception as exc:
                     if result["outcome"] == "unscored":
@@ -457,20 +563,39 @@ def evaluate_piper(
                             result["takeovers"] = control.takeovers
                             result["human_steps"] = control.human_steps
                         if recorder is not None:
-                            recorder.close()
+                            try:
+                                recorder.close()
+                            except Exception as exc:
+                                result["recording_cleanup_error"] = (
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                                raise
                     finally:
+                        if result["outcome"] == "discarded" and "recording" in result:
+                            result["recording"]["status"] = "discarded"
                         result["ended_at"] = time.time()
                         _write_json(episode_dir / "result.json", result)
                         episodes.append(result)
                         summary = summarize("running")
-                if recorder is not None:
+                poll_after_episode()
+                summary = summarize("running")
+                if recorder is not None and result["outcome"] != "discarded":
                     notify("saved", number)
+                rate = (
+                    f"{summary['success_rate']:.1%}"
+                    if summary["success_rate"] is not None
+                    else "n/a"
+                )
                 print(
                     f"[{number}/{num_episodes}] {result['outcome']}; "
                     f"success rate {summary['successes']}/{summary['completed_episodes']} "
-                    f"= {summary['success_rate']:.1%}",
+                    f"= {rate}",
                     flush=True,
                 )
+                if quit_requested:
+                    if result["outcome"] == "discarded":
+                        archive_discarded(result)
+                    raise KeyboardInterrupt
                 if reset_pose is not None:
                     result["reset"] = {"status": "pending", "attempts": []}
                     attempt = 0
@@ -493,6 +618,7 @@ def evaluate_piper(
                                     reset_pose,
                                     log=reset_log,
                                     timing=reset_timing,
+                                    on_tick=poll_reset,
                                 )
                             result["reset"].update(completed_reset, status="complete")
                             result["reset"]["attempts"].append({
@@ -528,6 +654,8 @@ def evaluate_piper(
                             keys.clear()
                             while True:
                                 pressed = keys.poll()
+                                if "left" in pressed:
+                                    discard_trial(result)
                                 if "q" in pressed:
                                     raise
                                 if "r" in pressed:
@@ -540,11 +668,21 @@ def evaluate_piper(
                                 if result["reset"]["status"] == "error"
                                 else "running"
                             )
+                if result["outcome"] == "discarded":
+                    archive_discarded(result)
+                else:
+                    undoable = result
     except KeyboardInterrupt:
+        for trial in episodes:
+            if trial["outcome"] == "discarded":
+                archive_discarded(trial)
         summarize("interrupted")
         notify("stopped")
         raise
     except Exception:
+        for trial in episodes:
+            if trial["outcome"] == "discarded":
+                archive_discarded(trial)
         summarize("error")
         notify("fault")
         raise

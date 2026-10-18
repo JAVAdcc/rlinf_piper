@@ -75,10 +75,10 @@ class Keys:
         self.events = deque()
 
     def clear(self):
-        self.events = deque(next(self.episodes))
+        self.events = deque(next(self.episodes, [["right"]]))
 
     def poll(self):
-        event = self.events.popleft()
+        event = self.events.popleft() if self.events else []
         if isinstance(event, BaseException):
             raise event
         return event
@@ -212,8 +212,12 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
             return super().execute(target)
 
     class Events:
+        clears = 0
+
         def clear(self):
-            pass
+            self.clears += 1
+            if self.clears > 1:
+                self.events = iter([["right"]])
 
         def poll(self):
             # Right starts, one alignment poll, then b and i together before tick 0.
@@ -255,6 +259,7 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
         "success",
         "saving",
         "saved",
+        "review",
         "complete",
     ]
     assert summary["success_rate"] == 1 and summary["autonomous_success_rate"] == 0
@@ -339,7 +344,14 @@ def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
     )
     assert len(session.targets) == 1
     assert result["failures"] == 1
-    assert announcements == ["ready", "started", "waiting_score", "failure", "complete"]
+    assert announcements == [
+        "ready",
+        "started",
+        "waiting_score",
+        "failure",
+        "review",
+        "complete",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -422,6 +434,15 @@ def test_terminal_reads_fragmented_arrows_and_restores_settings():
                 os.write(master, b"s\x1b[C")
                 keys.clear()
                 assert keys.poll() == []
+                os.write(master, b"\x1b[")
+                assert keys.poll() == []
+                os.write(master, b"D\x1bODs\x1b[C")
+                keys.clear()
+                assert keys.poll() == ["left", "left"]
+                os.write(master, b"\x1b[")
+                keys.clear()
+                os.write(master, b"D")
+                assert keys.poll() == ["left"]
             assert termios.tcgetattr(slave) == original
     finally:
         os.close(master)
@@ -452,7 +473,7 @@ def test_score_is_saved_before_reset_and_reset_reuses_connection(
     session.read_state = lambda: initial.copy()
     resets = []
 
-    def reset(session_arg, target, *, log, timing):
+    def reset(session_arg, target, *, log, timing, on_tick=None):
         assert session_arg is session and session.opens == 1 and session.closes == 0
         summary = json.loads((tmp_path / "summary.json").read_text())
         assert summary["completed_episodes"] >= 1
@@ -524,7 +545,7 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
     attempts = []
     announcements = []
 
-    def reset(session_arg, target, *, log, timing):
+    def reset(session_arg, target, *, log, timing, on_tick=None):
         assert session_arg.opens == 1 and session_arg.closes == 0
         assert announcements[-1] == "reset_start"
         attempts.append(1)
@@ -556,11 +577,15 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
         "reset_failed",
         "reset_start",
         "reset_done",
+        "review",
         "complete",
     ]
 
 
-def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tmp_path):
+@pytest.mark.parametrize("streaming_video", [True, False])
+def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
+    tmp_path, streaming_video
+):
     lerobot = pytest.importorskip("lerobot.datasets.lerobot_dataset")
     from rlinf.data.storage.lerobot.metadata import load_episode_outcomes
 
@@ -630,6 +655,7 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tm
             [["right"], ["b"], [], ["f"]],
         ]),
         record_dataset=True,
+        streaming_video=streaming_video,
         announce=announce,
     )
     assert announcements == [
@@ -649,10 +675,14 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(tm
         ("failure", 2),
         ("saving", 2),
         ("saved", 2),
+        ("review", 2),
         ("complete", 0),
     ]
     assert summary["successes"] == summary["failures"] == 1
     assert summary["recorded_episodes"] == summary["phase_labeled_episodes"] == 2
+    assert summary["episodes"][0]["recording"]["video_encoding"] == (
+        "streaming" if streaming_video else "png"
+    )
     labels = json.loads((tmp_path / "annotations.json").read_text())
     assert labels["format"] == "piper-rlt-episodes-v2"
     assert labels["episodes"][0]["critical_phases"] == [
@@ -1020,3 +1050,251 @@ def test_failed_announcement_callback_preserves_scoring_and_cleanup(tmp_path, ca
     assert summary["successes"] == 1 and len(session.targets) == 1
     assert session.closes == 1 and calls == ["ready"]
     assert caplog.text.count("Piper announcement delivery failed") == 1
+
+
+class VideoSession(Session):
+    config = SimpleNamespace(fps=30, max_prediction_age_s=3, gripper_max_width_m=0.07)
+
+    def observe(self):
+        return {
+            "observation.state": np.full(7, len(self.targets), dtype=np.float32),
+            **{
+                f"observation.images.{key}": np.full(
+                    (32, 48, 3), len(self.targets), dtype=np.uint8
+                )
+                for key in ("front", "front_2", "wrist")
+            },
+        }
+
+    def execute(self, target):
+        self.last_command = target.copy()
+        return super().execute(target)
+
+
+class VideoPolicy(Policy):
+    fps = 30
+
+
+@pytest.mark.parametrize("streaming_video", [True, False])
+def test_left_during_encoding_cancels_before_publication_and_replaces_trial(
+    tmp_path, streaming_video
+):
+    from robot_mocks.video import video_output
+
+    session = VideoSession()
+    events = []
+    with video_output() as (entered, release):
+
+        def announce(event, number):
+            if event == "discarded":
+                assert entered.wait(2)
+                assert not release.is_set()
+                assert (tmp_path / "episode_001").is_dir()
+                assert not (tmp_path / "discarded/episode_001").exists()
+                assert (
+                    json.loads((tmp_path / "annotations.json").read_text())["episodes"]
+                    == []
+                )
+                release.set()
+            events.append(event)
+
+        summary = evaluate_piper(
+            VideoPolicy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=100,
+            keys=Keys([
+                [["right"], ["b"], [], ["s"], ["left"]],
+                [["right"], ["b"], [], ["f"]],
+            ]),
+            record_dataset=True,
+            streaming_video=streaming_video,
+            announce=announce,
+        )
+    assert summary["completed_episodes"] == summary["recorded_episodes"] == 1
+    assert summary["successes"] == 0 and summary["failures"] == 1
+    assert summary["discarded_episodes"] == 1 and len(session.targets) == 2
+    assert session.opens == session.closes == 1
+    assert events.count("discarded") == events.count("saved") == 1
+    discarded = json.loads((tmp_path / "discarded/episode_001/result.json").read_text())
+    assert (
+        discarded["outcome"] == "discarded"
+        and discarded["original_outcome"] == "success"
+    )
+    assert discarded["recording"]["status"] == "discarded"
+    assert not (tmp_path / "episode_001").exists()
+    labels = json.loads((tmp_path / "annotations.json").read_text())
+    assert list(labels["datasets"]) == ["episode_002"]
+    assert labels["episodes"][0]["critical_phases"] == [{"start": 0, "end": 1}]
+
+
+@pytest.mark.parametrize("record_dataset", [False, True])
+def test_left_at_final_review_discards_only_last_trial_and_keeps_target_count(
+    tmp_path, record_dataset
+):
+    session = VideoSession()
+    summary = evaluate_piper(
+        VideoPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=2,
+        steps=100,
+        keys=Keys([
+            [["right"], ["b"], [], ["s"]],
+            [["right"], ["b"], [], ["s"]],
+            [["left", "right"], ["left"], ["right"], ["b"], [], ["f"]],
+        ]),
+        record_dataset=record_dataset,
+    )
+    assert summary["completed_episodes"] == 2 and summary["discarded_episodes"] == 1
+    assert summary["success_rate"] == summary["autonomous_success_rate"] == 0.5
+    assert [episode["outcome"] for episode in summary["episodes"]] == [
+        "success",
+        "discarded",
+        "failure",
+    ]
+    assert [episode["episode"] for episode in summary["episodes"]] == [1, 2, 2]
+    assert (tmp_path / "episode_001/result.json").exists()
+    assert (tmp_path / "discarded/episode_002/result.json").exists()
+    assert (tmp_path / "episode_003/result.json").exists()
+    if record_dataset:
+        labels = json.loads((tmp_path / "annotations.json").read_text())
+        assert list(labels["datasets"]) == ["episode_001", "episode_003"]
+        assert summary["phase_labeled_episodes"] == summary["recorded_episodes"] == 2
+
+
+def test_left_in_score_batch_and_quit_never_publishes_discarded_recording(tmp_path):
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_piper(
+            VideoPolicy(),
+            VideoSession(),
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=100,
+            keys=Keys([[["right"], ["b"], [], ["s", "left", "q"]]]),
+            record_dataset=True,
+        )
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["completed_episodes"] == summary["recorded_episodes"] == 0
+    assert summary["discarded_episodes"] == 1
+    assert not json.loads((tmp_path / "annotations.json").read_text())["episodes"]
+    assert (tmp_path / "discarded/episode_001/result.json").exists()
+
+
+def test_left_during_reset_keeps_reset_and_excludes_trial(tmp_path, monkeypatch):
+    from rlinf.robotics import piper_evaluation
+
+    session = VideoSession()
+    session.read_state = lambda: np.zeros(7)
+    keys = Keys([[["right"], ["b"], [], ["s"]], [["right"], ["b"], [], ["f"]]])
+    resets = []
+
+    def reset(session_arg, target, *, log, timing, on_tick):
+        if not resets:
+            keys.events.append(["left"])
+        on_tick()
+        resets.append(target.copy())
+        return {"completion": "trajectory_sent"}
+
+    monkeypatch.setattr(piper_evaluation, "reset_piper", reset)
+    summary = evaluate_piper(
+        VideoPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=keys,
+        record_dataset=True,
+        reset_after_episode="initial",
+    )
+    assert len(resets) == 2 and summary["completed_episodes"] == 1
+    assert summary["episodes"][0]["reset"]["status"] == "complete"
+    assert (tmp_path / "discarded/episode_001/reset.jsonl").exists()
+    assert summary["episodes"][0]["outcome"] == "discarded"
+    assert summary["failures"] == 1
+
+
+@pytest.mark.parametrize("steps", [0, 45])
+def test_streaming_video_copies_frames_and_preserves_timestamps_without_pngs(
+    tmp_path, steps
+):
+    import av
+
+    from rlinf.data.storage.lerobot.piper import PiperEpisodeRecorder
+
+    observation = VideoSession().observe()
+    recorder = PiperEpisodeRecorder(tmp_path / "dataset", fps=30, task="USB")
+    try:
+        recorder.prepare(observation)
+        for index in range(steps):
+            for key, image in observation.items():
+                if key.startswith("observation.images."):
+                    image.fill(index)
+            recorder.add_step(
+                observation,
+                np.ones(7),
+                requested=np.ones(7),
+                measured=np.zeros(7),
+                critical=index >= 20,
+                wall_time=float(index),
+            )
+        assert not list(tmp_path.rglob("*.png"))
+        for key, image in observation.items():
+            if key.startswith("observation.images."):
+                image.fill(steps)
+        result = recorder.finish(observation, critical=False, outcome="success")
+    finally:
+        recorder.close()
+    assert result["frames"] == steps + 1 and result["video_encoding"] == "streaming"
+    videos = list(tmp_path.rglob("*.mp4"))
+    assert len(videos) == 3
+    for path in videos:
+        with av.open(str(path)) as video:
+            frames = list(video.decode(video=0))
+            assert len(frames) == steps + 1
+            for index, frame in enumerate(frames):
+                assert float(frame.pts * frame.time_base) == pytest.approx(index / 30)
+                assert float(frame.to_ndarray(format="rgb24").mean()) == pytest.approx(
+                    index, abs=2
+                )
+    assert not list(tmp_path.rglob("streaming-video-*"))
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_video_backpressure_or_writer_failure_cannot_silently_drop_frames(
+    tmp_path, fail
+):
+    import threading
+
+    from robot_mocks.video import video_output
+
+    from rlinf.data.storage.lerobot.piper import PiperEpisodeRecorder
+
+    observation = VideoSession().observe()
+    recorder = PiperEpisodeRecorder(tmp_path / "dataset", fps=30, task="USB")
+    with video_output(fail=fail) as (_, release):
+        if fail:
+            release.set()
+        try:
+            recorder.prepare(observation)
+            with pytest.raises(RuntimeError if fail else TimeoutError):
+                for _ in range(100):
+                    recorder.add_step(
+                        observation,
+                        np.zeros(7),
+                        requested=np.zeros(7),
+                        measured=np.zeros(7),
+                        critical=True,
+                        wall_time=0,
+                    )
+        finally:
+            release.set()
+            recorder.close()
+    assert not (tmp_path / "dataset/meta/episodes.jsonl").exists()
+    assert not list(tmp_path.rglob("streaming-video-*"))
+    assert not any(thread.name == "piper-video" for thread in threading.enumerate())

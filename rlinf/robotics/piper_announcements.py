@@ -37,6 +37,21 @@ _MESSAGES = {
     ),
     "aligning": ("episode", "Aligning the leader arm.", "正在对齐主臂。"),
     "started": ("episode", "Starting episode {number}.", "开始第{number}回合。"),
+    "review": (
+        "episode",
+        "Collection target reached. Right to finish. Left to discard the last episode.",
+        "已采够回合数，右键结束，左键丢弃重采。",
+    ),
+    "discarded": (
+        "discard",
+        "Episode {number} discarded.",
+        "第{number}回合已丢弃。",
+    ),
+    "nothing_to_discard": (
+        "discard",
+        "No episode available to discard.",
+        "当前没有可以丢弃的回合。",
+    ),
     "critical_on": (
         "phase",
         "Critical phase {number} on.",
@@ -202,6 +217,13 @@ class PiperAnnouncer:
                 if self._terminal:
                     return
                 discard = {topic}
+                if event == "discarded":
+                    discard |= {
+                        "outcome",
+                        "recording",
+                        "annotation",
+                        "phase_result",
+                    } | _TRANSIENT
                 if event in (
                     "ready",
                     "success",

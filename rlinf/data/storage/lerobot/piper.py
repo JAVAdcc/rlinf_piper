@@ -14,13 +14,18 @@
 
 """Record one Piper trial as an independently readable LeRobot dataset."""
 
+import inspect
 import json
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 from rlinf.data.storage.lerobot.compat import add_frame_to_dataset
+from rlinf.data.storage.lerobot.video import PiperVideoEncoder, RecordingDiscarded
 from rlinf.models.embodiment.openpi.policies.piper_policy import PiperInputs
 from rlinf.robotics.piper_intervention import ACTION_SOURCES
 
@@ -30,11 +35,13 @@ class PiperEpisodeRecorder:
 
     Each action row contains the observation before the command. The final
     row is a measured terminal observation with ``action_valid=False``; its
-    placeholder action must never become a training target. PNG capture does
-    not drop frames; video encoding runs after execution has stopped.
+    placeholder action must never become a training target. Video frames are
+    encoded during collection, with exact frame delivery and bounded queues.
     """
 
-    def __init__(self, root: Path, *, fps: float, task: str):
+    def __init__(
+        self, root: Path, *, fps: float, task: str, streaming_video: bool = True
+    ) -> None:
         if fps <= 0 or not float(fps).is_integer() or not task.strip():
             raise ValueError("Recording requires integer FPS and a task.")
         if root.exists():
@@ -44,6 +51,8 @@ class PiperEpisodeRecorder:
         self.steps = 0
         self.human_steps = 0
         self.closed = False
+        self.streaming_video = streaming_video
+        self.cancelled = threading.Event()
 
     def _create(self, observation: dict) -> None:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -105,6 +114,16 @@ class PiperEpisodeRecorder:
                     "shape": tuple(value.shape),
                     "names": ["height", "width", "channels"],
                 }
+        options = {}
+        if self.streaming_video:
+            if (
+                "streaming_encoding"
+                not in inspect.signature(LeRobotDataset.create).parameters
+            ):
+                raise RuntimeError(
+                    "This LeRobot release lacks streaming encoding; update LeRobot or use --no-streaming-video."
+                )
+            options["streaming_encoding"] = True
         self.dataset = LeRobotDataset.create(
             repo_id="piper/rollout",
             root=self.root,
@@ -112,9 +131,16 @@ class PiperEpisodeRecorder:
             fps=self.fps,
             features=features,
             vcodec="h264",
-            image_writer_threads=6,
+            image_writer_threads=0 if self.streaming_video else 6,
             image_writer_processes=0,
+            **options,
         )
+        if self.streaming_video:
+            # LeRobot owns publication and metadata. Replace its dormant encoder
+            # because the upstream queue drops frames when it cannot keep up.
+            self.dataset._streaming_encoder = PiperVideoEncoder(
+                self.fps, self.cancelled
+            )
 
     def prepare(self, observation: dict) -> None:
         """Open writers before the first policy action or prediction timer."""
@@ -148,34 +174,30 @@ class PiperEpisodeRecorder:
             policy_action = requested
         policy_valid = valid and policy_action is not None
         frame["observation.state"] = frame["observation.state"].astype(np.float32)
-        frame.update(
-            {
-                "action": np.asarray(action, dtype=np.float32),
-                "task": self.task,
-                "complementary_info.requested_action": np.asarray(
-                    requested, dtype=np.float32
-                ),
-                "complementary_info.command_state": np.asarray(
-                    measured, dtype=np.float32
-                ),
-                "complementary_info.action_valid": np.array([valid], dtype=bool),
-                "complementary_info.critical_phase": np.array([critical], dtype=bool),
-                "complementary_info.is_intervention": np.array(
-                    [is_intervention], dtype=bool
-                ),
-                "complementary_info.action_source": np.array(
-                    [ACTION_SOURCES[source]], dtype=np.int64
-                ),
-                "complementary_info.policy_action": np.asarray(
-                    policy_action if policy_valid else np.zeros(7),
-                    dtype=np.float32,
-                ),
-                "complementary_info.policy_action_valid": np.array(
-                    [policy_valid], dtype=bool
-                ),
-                "complementary_info.wall_time": np.array([wall_time], dtype=np.float64),
-            }
-        )
+        frame.update({
+            "action": np.asarray(action, dtype=np.float32),
+            "task": self.task,
+            "complementary_info.requested_action": np.asarray(
+                requested, dtype=np.float32
+            ),
+            "complementary_info.command_state": np.asarray(measured, dtype=np.float32),
+            "complementary_info.action_valid": np.array([valid], dtype=bool),
+            "complementary_info.critical_phase": np.array([critical], dtype=bool),
+            "complementary_info.is_intervention": np.array(
+                [is_intervention], dtype=bool
+            ),
+            "complementary_info.action_source": np.array(
+                [ACTION_SOURCES[source]], dtype=np.int64
+            ),
+            "complementary_info.policy_action": np.asarray(
+                policy_action if policy_valid else np.zeros(7),
+                dtype=np.float32,
+            ),
+            "complementary_info.policy_action_valid": np.array(
+                [policy_valid], dtype=bool
+            ),
+            "complementary_info.wall_time": np.array([wall_time], dtype=np.float64),
+        })
         add_frame_to_dataset(self.dataset, frame)
 
     def add_step(
@@ -207,9 +229,42 @@ class PiperEpisodeRecorder:
         self.steps += 1
         self.human_steps += int(is_intervention)
 
-    def finish(self, observation: dict, *, critical: bool, outcome: str) -> dict:
+    def request_discard(self) -> None:
+        """Request cancellation without mutating the dataset from the input thread."""
+        self.cancelled.set()
+
+    def finish(
+        self,
+        observation: dict,
+        *,
+        critical: bool,
+        outcome: str,
+        poll: Callable[[], None] | None = None,
+    ) -> dict:
+        """Finish on a worker while the caller optionally services terminal input."""
+        if poll is None:
+            return self._finish(observation, critical=critical, outcome=outcome)
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="piper-save"
+        ) as worker:
+            future = worker.submit(
+                self._finish, observation, critical=critical, outcome=outcome
+            )
+            try:
+                while not future.done():
+                    poll()
+                    time.sleep(0.02)
+                poll()  # A final Left still applies when saving completed quickly.
+                return future.result()
+            except BaseException:
+                self.request_discard()
+                raise
+
+    def _finish(self, observation: dict, *, critical: bool, outcome: str) -> dict:
         """Append the terminal observation and publish a readable dataset."""
         try:
+            if self.cancelled.is_set():
+                raise RecordingDiscarded
             state = np.asarray(observation["observation.state"], dtype=np.float32)
             self._append(
                 observation,
@@ -223,6 +278,8 @@ class PiperEpisodeRecorder:
             )
             self.dataset.save_episode(parallel_encoding=False)
             self.dataset.finalize()
+            if self.cancelled.is_set():
+                raise RecordingDiscarded
             (self.root / "meta/piper_control.json").write_text(
                 json.dumps(
                     {"action_sources": ACTION_SOURCES, "human_steps": self.human_steps},
@@ -233,13 +290,11 @@ class PiperEpisodeRecorder:
             # Preserve explicit outcomes for the existing LeRobot metadata reader.
             with (self.root / "meta/episodes.jsonl").open("x") as stream:
                 stream.write(
-                    json.dumps(
-                        {
-                            "episode_index": 0,
-                            "length": self.steps + 1,
-                            "episode_success": outcome == "success",
-                        }
-                    )
+                    json.dumps({
+                        "episode_index": 0,
+                        "length": self.steps + 1,
+                        "episode_success": outcome == "success",
+                    })
                     + "\n"
                 )
             return {
@@ -248,7 +303,10 @@ class PiperEpisodeRecorder:
                 "terminal_frame": self.steps,
                 "dataset": str(self.root.resolve()),
                 "human_steps": self.human_steps,
+                "video_encoding": "streaming" if self.streaming_video else "png",
             }
+        except RecordingDiscarded:
+            return {"status": "discarded"}
         finally:
             self.close()
 
@@ -256,9 +314,9 @@ class PiperEpisodeRecorder:
         """Release image writers; incomplete datasets remain outside annotations."""
         if self.closed:
             return
-        self.closed = True
         if self.dataset is not None:
             try:
                 self.dataset.stop_image_writer()
             finally:
                 self.dataset.finalize()
+        self.closed = True

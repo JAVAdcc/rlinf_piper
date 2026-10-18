@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Right starts; s/f scores each episode",
+        help="Right starts/confirms completion; s/f scores; Left discards the last stopped episode",
     )
     parser.add_argument(
         "--reset-after-episode",
@@ -76,11 +76,22 @@ def main() -> None:
         default="none",
         help="After s/f: open gripper, return to the first start pose or zero, restore gripper",
     )
-    parser.add_argument("--num-episodes", type=int, default=1)
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=1,
+        help="Number of scored episodes to retain; discarded attempts do not count",
+    )
     parser.add_argument(
         "--record-dataset",
         action="store_true",
         help="Record every RGB/state/command plus terminal observation; b alternates critical phase start/end",
+    )
+    parser.add_argument(
+        "--streaming-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encode RGB during collection; --no-streaming-video uses post-episode PNG encoding",
     )
     parser.add_argument(
         "--phase-definition",
@@ -294,6 +305,7 @@ def main() -> None:
                         replan_steps=args.replan_steps,
                         save_observations=args.save_observations,
                         record_dataset=args.record_dataset,
+                        streaming_video=args.streaming_video,
                         phase_definition=args.phase_definition,
                         session_id=args.session_id,
                         reset_after_episode=args.reset_after_episode,

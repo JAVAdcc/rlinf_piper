@@ -21,6 +21,7 @@ means the trajectory was sent; measured final error is reported separately.
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TextIO
 
@@ -48,6 +49,7 @@ def reset_piper(
     *,
     log: TextIO,
     timing: PiperResetTiming = PiperResetTiming(),
+    on_tick: Callable[[], None] | None = None,
 ) -> dict:
     """Send a timed three-stage reset over the current connection.
 
@@ -55,6 +57,7 @@ def reset_piper(
     travel is not rejected. The session clips every sent target to legal
     travel and checks feedback freshness and controller status on every tick.
     No policy step-delta or arbitrary arrival threshold gates the trajectory.
+    on_tick services optional operator input before each reset command.
     """
     target = np.asarray(target, dtype=float)
     if target.shape != (7,) or not np.isfinite(target).all():
@@ -81,16 +84,14 @@ def reset_piper(
     period = 1 / fps
     started = time.monotonic()
     log.write(
-        json.dumps(
-            {
-                "event": "reset_start",
-                "strategy": "evo_timed_v1",
-                "state": start.tolist(),
-                "target": target.tolist(),
-                "joint_duration_s": timing.joint_duration_s,
-                "gripper_duration_s": timing.gripper_duration_s,
-            }
-        )
+        json.dumps({
+            "event": "reset_start",
+            "strategy": "evo_timed_v1",
+            "state": start.tolist(),
+            "target": target.tolist(),
+            "joint_duration_s": timing.joint_duration_s,
+            "gripper_duration_s": timing.gripper_duration_s,
+        })
         + "\n"
     )
     log.flush()
@@ -106,19 +107,19 @@ def reset_piper(
         )
         for step in range(1, count + 1):
             tick = time.monotonic()
+            if on_tick is not None:
+                on_tick()
             command = origin + (destination - origin) * (step / count)
             receipt = session.execute_reset(command)
             log.write(
-                json.dumps(
-                    {
-                        "event": "reset_action",
-                        "phase": phase,
-                        "step": step,
-                        "steps": count,
-                        "time": time.time(),
-                        **{key: value.tolist() for key, value in receipt.items()},
-                    }
-                )
+                json.dumps({
+                    "event": "reset_action",
+                    "phase": phase,
+                    "step": step,
+                    "steps": count,
+                    "time": time.time(),
+                    **{key: value.tolist() for key, value in receipt.items()},
+                })
                 + "\n"
             )
             log.flush()

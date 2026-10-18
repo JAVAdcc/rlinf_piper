@@ -21,6 +21,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
   --steps 3600 \
   --replan-steps 50 \
   --record-dataset \
+  --streaming-video \
   --save-observations \
   --play-sounds \
   --no-action-limits \
@@ -43,11 +44,12 @@ bash toolkits/piper/eval_stage1.sh rollout \
 | `→` | 恢复场景后开始当前回合。 |
 | `b` | 第一次进入 critical phase，第二次退出；第三、四次标记下一段，可以继续添加。 |
 | `s` / `f` | 停止下发动作，分别记为成功 / 失败并保存。 |
+| `←` | 在评分后的保存、复位或等待阶段，丢弃刚结束的回合；恢复场景后按 `→` 重采。 |
 | `q` / `Ctrl-C` | 退出；此前完成的回合保留，当前未评分回合不进入训练标注清单。 |
 
 如果结束时 `b` 为奇数次，按 `s/f` 会自动将最后一段延长到终止帧，前面已配对的段保持原边界。完全没按 `b` 的回合仍保存录像和评分，但需要补标才能用于 warmup。刚按 `b` 就评分、尚未执行动作的空段会被忽略。
 
-全回合由 SFT 模型执行，`b` 只改变标签。达到步数上限后程序停止下发动作并等待 `s/f`。评分后会编码视频；等待保存和复位完成，再恢复场景并按 `→`。
+全回合由 SFT 模型执行，`b` 只改变标签。达到步数上限后程序停止下发动作并等待 `s/f`。视频默认随采集流式编码，评分后只需收尾并保存元数据；等待保存和复位完成，再恢复场景并按 `→`。采够指定条数后，最后一条仍可按 `←` 撤销，按 `→` 确认结束。
 
 **3. 采集后检查数据**
 
@@ -65,7 +67,7 @@ labels = json.loads((root / "annotations.json").read_text())
 print("保存目录：", root)
 for key in ("status", "completed_episodes", "successes", "failures", "success_rate",
             "autonomous_success_rate", "intervention_rate",
-            "recorded_episodes", "phase_labeled_episodes"):
+            "recorded_episodes", "phase_labeled_episodes", "discarded_episodes"):
     print(f"{key}: {summary.get(key)}")
 for episode in labels["episodes"]:
     print(episode["dataset"], episode["outcome"],
@@ -82,6 +84,7 @@ PY
 - 每条回合的 `result.json`、`trace.jsonl`：回合结果与执行记录；`observations/` 为每次推理时的快照，完整逐帧数据在 `dataset/`。
 - `policy.json`、`hardware.yaml`、`run.json`：本次权重元数据、硬件配置和启动参数。
 - `reset_pose.json`：整次采集固定使用的复位目标；各回合的 `reset.jsonl` 记录实际复位过程。复位出错时先查看 `result.json` 的 `reset.error`，程序保持连接并等待 `r` 重试或 `q` 退出。
+- `discarded/`：左键撤销的采集尝试，保留原始评分和撤销时间供检查；这些目录不进入 `annotations.json`，也不计入成功率。
 
 `start` 包含该帧动作，`end` 不包含；最后一段自动延长时，`end` 等于 `terminal_frame`。终止帧只有观测，`action_valid=False`，不会作为训练动作。
 
@@ -153,6 +156,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
   --num-episodes 2 \
   --steps 7200 --replan-steps 50 \
   --record-dataset \
+  --streaming-video \
   --play-sounds \
   --no-action-limits \
   --reset-after-episode initial \
@@ -168,6 +172,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
 | 再按 `i` | 交还：两臂先保持最后的人工目标，等当前观测的新预测返回；接管前剩余动作作废。 |
 | `b` | 独立进入 / 退出 critical phase；接管本身不自动更改 critical 标签。 |
 | `s/f` | 停止、评分、保存，再复位；复位时主臂跟随，复位帧不录入训练数据。 |
+| `←` | 保存中、复位中或下一条开始前撤销刚结束的回合，随后按 `→` 重采。 |
 | `q` / `Ctrl-C` | 退出，已完成回合保留。 |
 
 若习惯 Evo-RL 的 `o` 键，可加 `--intervention-key o`。交还后的等待保持仍记为人工段；普通推理等待记为 `hold`。采集线程在推理期间继续响应按键，但实际周期还受相机、CAN 和写盘影响，30 Hz 是名义配置。
@@ -195,6 +200,7 @@ HIL 采集前不需要 latent cache，后续继续用 `warmup init -> cache -> t
 | `s/f` | 评分写入成功后提示该回合标记成功 / 失败。 |
 | 保存数据 | 提示正在保存；数据、结果和标注清单写入成功后提示保存完成。漏标 critical phase 会单独提示。 |
 | 自动复位 / `r` 重试 | 提示开始复位、轨迹执行完成或复位失败及重试键；“轨迹执行完成”仍需现场确认姿态。 |
+| `←` / 最后一条确认 | 提示该回合已丢弃、可以重采，或提示右键结束 / 左键撤销。 |
 | 完成、`q` / Ctrl-C、故障 | 分别提示采集完成、采集停止或故障停止。 |
 
 播报在后台串行播放，不在控制循环中等待音频。快速连续操作时，尚未播放的同类状态提示会合并为最新状态，过期提示会丢弃，终端日志保留完整事件。正常结束会保留最后的评分、保存和复位结果；退出或故障则优先播报停止。程序先清理相机和机械臂，再有限等待收尾播报：正常结束最多 8 秒，停止 / 故障最多 3 秒，随后回收语音进程。已经交给系统播放的短句可能继续读完。
@@ -207,3 +213,15 @@ spd-say --wait --language cmn '采集语音播报测试。'
 ```
 
 听不到声音时，先检查桌面的音量和输出设备是否选中了实际使用的扬声器 / 耳机。其他机器需要安装系统包 `speech-dispatcher`；若找不到命令、播放失败或单句超过 8 秒，程序只警告一次并关闭本次语音，采集、评分和保存继续运行。语音目前接在本地交互入口，原生分布式在线环境和离线 warmup 不播报。
+
+**7. 流式视频与左键撤销**
+
+原命令默认启用流式视频，上面已显式写入 `--streaming-video`。三路 RGB 在采集时分别由后台线程直接编码成 H.264，省去逐帧 PNG 的写盘和回读；评分后仍需要写入终止观测、排空短队列和保存 LeRobot 元数据。视频与动作保持逐帧对应，包含最后的无动作终止帧。每条 `result.json` 的 `save_duration_s` 记录评分后的实际保存耗时，`recording.video_encoding` 标记使用 `streaming` 还是 `png`。若要对照旧流程，把参数换成 `--no-streaming-video`。
+
+按 `s/f` 后即可按 `←`，即使仍在视频收尾、保存元数据或自动复位。程序会立即把该回合标为丢弃，保存线程释放文件后将整个采集尝试移到 `discarded/episode_XXX/`。已经完成保存、正在等待下一条的回合也可以撤销；评分、成功率、自主成功率、接管比例和训练标注清单同步排除它。撤销会播报，复位仍按原配置完成。
+
+撤销后恢复场景，再按一次 `→` 重采；不会自动启动动作。`--num-episodes` 表示要保留的已评分回合数，撤销的回合不占名额。目录编号按实际尝试递增，例如撤销 `episode_002` 后，新数据写入 `episode_003`，终端仍显示正在补采第 2 条。连续按左键只撤销最近这一条，不会继续删除更早的有效数据；正在执行新回合时左键不撤销上一条。
+
+最后一条保存并复位后，程序等待确认：`→` 完成采集并退出，`←` 丢弃最后一条并等待重采，`q` 退出并保留未撤销的数据。保存和复位中按下的右键不会提前触发下一条，需要等待就绪后重新按。
+
+每路编码队列最多 32 帧，CPU 编码使用 `veryfast`、每路 2 个编码线程。队列持续拥堵超过 1 秒或编码失败会停止本次采集并报告错误，避免丢帧后污染动作与 critical 标签的对应关系。当前环境支持所需的 LeRobot 流式接口；旧版环境若提示缺少该接口，可升级 LeRobot，或用 `--no-streaming-video` 继续原采集方式。训练数据继续从结束采集后的 `annotations.json` 导入。

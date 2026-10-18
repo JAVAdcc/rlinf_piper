@@ -1,4 +1,4 @@
-**RLinf critical phase 数据采集与检查（2026-10-17）**
+**RLinf critical phase 数据采集与离线 warmup（2026-10-18）**
 
 沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、按 `s/f` 评分，数据用于离线 actor-critic warmup。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。
 
@@ -84,19 +84,55 @@ PY
 
 `start` 包含该帧动作，`end` 不包含；最后一段自动延长时，`end` 等于 `terminal_frame`。终止帧只有观测，`action_valid=False`，不会作为训练动作。
 
-**4. 数据确认后生成 warmup 标注清单**
+**4. 数据确认后运行离线 warmup**
 
-这一步固定训练/验证划分，不启动训练或机械臂。需要有足够的独立回合用于划分；正式训练同时保留成功和失败。完全漏标的回合默认报错：补标后再执行，或明确加 `--skip-unlabeled` 排除这些回合。已有输出文件不会被覆盖。
+先用 `init` 固定训练/验证划分，这一步不启动训练或机械臂。需要有足够的独立回合用于划分；正式训练同时保留成功和失败。完全漏标的回合默认报错：补标后再执行，或明确加 `--skip-unlabeled` 排除这些回合。已有输出文件不会被覆盖。
+
+在完成采集的同一终端执行以下命令，复用 `piper_run_dir` 和 `PIPER_STAGE1_PATH`。如果换了终端，先将这两个变量设为实际采集目录和对应的 Stage 1 权重。下面的路径数组供后续步骤共用，缓存和训练输出都保存在本次采集目录下。
 
 ```bash
 cd /home/descfly/code/rlinf_piper
 
+piper_warmup_args=(
+  "stage1=$PIPER_STAGE1_PATH"
+  "annotations=$piper_run_dir/episodes.json"
+  "cache=$piper_run_dir/rlt_cache"
+  "output=$piper_run_dir/rlt_warmup"
+)
+
 USE_TF=0 JAX_PLATFORMS=cpu .venv-piper/bin/python -m toolkits.piper.warmup init \
   --collection "$piper_run_dir/annotations.json" \
-  "annotations=$piper_run_dir/episodes.json"
+  "${piper_warmup_args[@]}"
 ```
 
-后续缓存和训练入口都是 `python -m toolkits.piper.warmup`，需将 `annotations` 指向这里生成的 `episodes.json`。仅测试本次采集不需要提前计算 latent cache。
+合并多次采集时，给 `init` 重复传入 `--collection /实际采集目录/annotations.json`。同一回合的所有 critical 区间会进入同一个 split，训练和验证不会混用同一回合。
+
+然后计算一次冻结 Stage 1 的 latent/reference 缓存，再启动小型 RLT actor-critic 训练。这两步使用 GPU，不连接机械臂；采集和 SFT 验收本身不需要提前计算 latent cache。
+
+```bash
+USE_TF=0 JAX_PLATFORMS=cpu .venv-piper/bin/python -m toolkits.piper.warmup cache \
+  "${piper_warmup_args[@]}"
+
+USE_TF=0 JAX_PLATFORMS=cpu .venv-piper/bin/python -m toolkits.piper.warmup train \
+  "${piper_warmup_args[@]}"
+```
+
+默认配置在 `examples/offline_rl/config/piper_rlt_warmup.yaml`：5,000 步 actor BC、10,000 步 critic、5,000 步联合更新，batch size 为 64，联合阶段每 4 步更新一次 actor。训练只读缓存，按 episode 等概率、再按 chunk 等概率采样；验证池独立。正式数据门槛包括训练集成功/失败各至少 20 条、验证集各至少 10 条，以及至少 600 条训练 transition。
+
+缓存中断后重新执行相同的 `cache` 命令即可校验并继续。更换权重、标注或抽帧配置时使用新的缓存目录。训练中断后保留同一组路径和配置，使用下面的恢复命令；若只想先跑到第 1,000 步，首次训练时在 `train` 后加 `--until-step 1000`。
+
+```bash
+USE_TF=0 JAX_PLATFORMS=cpu .venv-piper/bin/python -m toolkits.piper.warmup train --resume \
+  "${piper_warmup_args[@]}"
+```
+
+训练后查看验证报告：
+
+```bash
+python3 -m json.tool "$piper_run_dir/rlt_warmup/readiness.json"
+```
+
+`metrics.jsonl` 记录训练和验证指标，`latest.json` 指向恢复 checkpoint，`actor/` 保存导出的 Stage 2 actor。固定预算结束且最后 3 次定期验证全部通过，才会得到 `ready_for_deterministic_eval=true`。当前 `ready_for_online_exploration` 始终为 `false`，离线 warmup 完成后仍需确定性真机验收和后续 online 接入。详细设计见 `docs/piper_offline_warmup.rst`。
 
 **5. 启用主臂 human intervention**
 
@@ -114,12 +150,14 @@ export PIPER_STAGE1_PATH="/home/descfly/code/rlinf_piper/checkpoints/piper_stage
 bash toolkits/piper/eval_stage1.sh rollout \
   --teleop piper_leader \
   --num-episodes 2 \
-  --steps 3600 --replan-steps 50 \
-  --record-dataset --save-observations \
+  --steps 7200 --replan-steps 50 \
+  --record-dataset \
   --no-action-limits \
   --reset-after-episode initial \
   --output-dir "$piper_run_dir"
 ```
+
+这条命令每回合最多执行 7,200 个控制 step，按名义 30 Hz 约为 4 分钟，实际时长还受取帧、推理和写盘影响；它不是训练步数。`--record-dataset` 已保存完整的逐帧训练数据和视频。需要额外保存每次推理的 RGB/state/task 快照用于排查时，再加 `--save-observations`。
 
 | 操作 | 行为 |
 | --- | --- |
@@ -139,11 +177,3 @@ bash toolkits/piper/eval_stage1.sh rollout \
 HIL 采集前不需要 latent cache，后续继续用 `warmup init -> cache -> train`。当前 critical-only warmup 只取标注区间，区间外的人工动作保留在原始数据中；混合回合不要整条改成 `behavior=human`。
 
 原生在线 `PiperPolicyEnv` 已接入接管动作和标签回传，交还到新 chunk 才生效；它在分布式推理等待期间仍不能像本地入口一样连续响应接管。在线有效长度、跨阶段折扣和数据池恢复仍需后续接通，不能直接把 HIL 采集通过视为在线探索就绪。实现细节见 `/home/descfly/code/rlinf_piper/docs/piper_human_intervention_design.rst`。本次开发使用 CPU 和 mock 验证，尚未启动真机验收。
-
-**6. 启动失败后的重试**
-
-2026-10-17 的主臂 `can_auto_init=False / __arm_can is None` 报错来自连接初始化遗漏，已补上 `CreateCanBus()`，随后才调用 `ConnectPort()`。本机真实 SDK 配合虚拟 CAN 已验证连接、接管、交还和断开；机械臂的实际运行效果仍需通过第 5 节验收。
-
-修复后重新执行第 5 节整段命令，包括生成带新时间戳的 `piper_run_dir`，避免复用上次的输出目录。不需要更换 checkpoint 或重新安装依赖。`20261017_182727` 和 `20261017_182825` 两次运行都在回合开始前失败，完成回合数为 0，没有生成训练轨迹。
-
-此前的 `/dev/video16` 取帧超时是另一个问题。修复期间按相同配置单独连接三路相机，5 秒内每路读到 150 个新帧，未复现超时；测试后已释放相机。若再次出现，应保留完整报错和运行目录以继续定位。相机按 USB 序列号选择，不要将当前的 `/dev/video16` 编号写死到配置里。

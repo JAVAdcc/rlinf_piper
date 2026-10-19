@@ -148,13 +148,13 @@ HIL 已接入同一个采集入口；在原命令上增加 `--teleop piper_leade
 ```bash
 cd /home/descfly/code/rlinf_piper
 
-piper_run_dir="/media/descfly/新加卷/value/data_inference/rlinf_sft50k_hil_$(date +%Y%m%d_%H%M%S)"
+piper_run_dir="/home/descfly/code/rlinf_piper/data/rlinf_sft50k_hil_$(date +%Y%m%d_%H%M%S)"
 export PIPER_PYTHON="/home/descfly/code/rlinf_piper/.venv-piper/bin/python"
 export PIPER_STAGE1_PATH="/home/descfly/code/rlinf_piper/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
 
 bash toolkits/piper/eval_stage1.sh rollout \
   --teleop piper_leader \
-  --num-episodes 2 \
+  --num-episodes 50 \
   --steps 7200 --replan-steps 50 \
   --record-dataset \
   --streaming-video \
@@ -243,11 +243,11 @@ spd-say --wait --language cmn '采集语音播报测试。'
 ```bash
 cd /home/descfly/code/rlinf_piper
 export PIPER_PYTHON="/home/descfly/code/rlinf_piper/.venv-piper/bin/python"
-piper_run_dir="/media/descfly/新加卷/value/data_inference/rlinf_sft50k_hil_20261018_122807"
+piper_run_dir="/home/descfly/code/rlinf_piper/data/rlinf_sft50k_hil_20261018_143541"
 
 bash toolkits/piper/eval_stage1.sh rollout \
   --resume "$piper_run_dir" \
-  --num-episodes 100
+  --num-episodes 50
 ```
 
 `--num-episodes 100` 表示累计保留 100 条，包含原目录中已有的完整回合；已有 60 条时再采 40 条。省略此参数则沿用上次的目标条数。已经达到目标时进入最后一条确认界面，可按 `→` 结束或 `←` 撤销重采；要继续增加数据就把目标调大。

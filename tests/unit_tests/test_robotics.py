@@ -6427,9 +6427,17 @@ def test_piper_policy_rejects_invalid_or_large_targets(bad_target):
         )
 
 
-def test_piper_camera_resolution_distinguishes_rgb_from_depth_and_metadata(tmp_path):
+def test_piper_camera_resolution_distinguishes_rgb_from_depth_and_metadata(
+    tmp_path, monkeypatch
+):
     from rlinf.robotics.piper_camera import resolve_piper_camera
 
+    def unexpected_reset(*args, **kwargs):
+        pytest.fail("Existing or ambiguous capture nodes must not trigger USB reset.")
+
+    monkeypatch.setattr(
+        "rlinf.robotics.piper_camera.reset_piper_camera", unexpected_reset
+    )
     usb = tmp_path / "usb"
     usb.mkdir()
     (usb / "idVendor").write_text("2bc5")
@@ -6449,12 +6457,82 @@ def test_piper_camera_resolution_distinguishes_rgb_from_depth_and_metadata(tmp_p
     node("video0", "00", 0)
     node("video6", "04", 0)
     node("video7", "04", 1)
-    assert resolve_piper_camera("camera-serial", "04", sysfs=sysfs) == "/dev/video6"
+    assert (
+        resolve_piper_camera("camera-serial", "04", sysfs=sysfs, reset_if_missing=True)
+        == "/dev/video6"
+    )
     with pytest.raises(ValueError, match="Expected one"):
         resolve_piper_camera("other-camera", "04", sysfs=sysfs)
     node("video8", "04", 0)
     with pytest.raises(ValueError, match="Expected one"):
-        resolve_piper_camera("camera-serial", "04", sysfs=sysfs)
+        resolve_piper_camera("camera-serial", "04", sysfs=sysfs, reset_if_missing=True)
+
+
+@pytest.mark.parametrize("recovery", ["disabled", "restored", "still_missing", "busy"])
+def test_piper_camera_builder_recovers_missing_rgb_before_connect(
+    tmp_path, monkeypatch, recovery
+):
+    from rlinf.robotics import piper_camera
+
+    usb, sysfs, devices = (tmp_path / name for name in ("usb", "video4linux", "dev"))
+    for path in (usb, sysfs, devices):
+        path.mkdir()
+    (usb / "idVendor").write_text("2bc5")
+    (usb / "serial").write_text("selected")
+
+    def node(name, interface, index):
+        parent = usb / interface
+        parent.mkdir(exist_ok=True)
+        (parent / "bInterfaceNumber").write_text(interface)
+        entry = sysfs / name
+        entry.mkdir()
+        (entry / "index").write_text(str(index))
+        (entry / "device").symlink_to(parent, target_is_directory=True)
+        (devices / name).touch()
+
+    node("video0", "00", 0)
+    resets = []
+
+    def reset(serial, **kwargs):
+        resets.append(serial)
+        if recovery == "busy":
+            raise RuntimeError("Camera selected is in use")
+        if recovery == "restored":
+            node("video20", "04", 0)
+            node("video21", "04", 1)
+
+    original_resolve = piper_camera.resolve_piper_camera
+
+    def resolve(serial, interface, **kwargs):
+        return original_resolve(
+            serial, interface, **{**kwargs, "sysfs": sysfs, "device_root": devices}
+        )
+
+    monkeypatch.setattr(piper_camera, "reset_piper_camera", reset)
+    monkeypatch.setattr(piper_camera, "resolve_piper_camera", resolve)
+    spec = {
+        "front": {
+            "usb_serial": "selected",
+            "usb_interface": "04",
+            "reset_on_connect": recovery != "disabled",
+            "width": 640,
+            "height": 480,
+            "fps": 30,
+            "fourcc": "MJPG",
+        }
+    }
+    if recovery == "restored":
+        camera = piper_camera.build_piper_cameras(spec)["front"]
+        assert str(camera.index_or_path) == str(devices / "video20")
+        assert not camera.is_connected
+        assert camera.usb_serial == "selected"
+    elif recovery == "busy":
+        with pytest.raises(RuntimeError, match="in use"):
+            piper_camera.build_piper_cameras(spec)
+    else:
+        with pytest.raises(ValueError, match="Expected one"):
+            piper_camera.build_piper_cameras(spec)
+    assert resets == ([] if recovery == "disabled" else ["selected"])
 
 
 @pytest.mark.parametrize("busy", [False, True])

@@ -81,8 +81,14 @@ def resolve_piper_camera(
     *,
     sysfs: Path = Path("/sys/class/video4linux"),
     device_root: Path = Path("/dev"),
+    reset_if_missing: bool = False,
 ) -> str:
-    """Select one capture node by USB serial, interface, and capture index zero."""
+    """Select a capture node by USB identity, optionally recovering it once.
+
+    An SDK can leave USB present without its RGB V4L2 node. Recovery resets
+    only the selected idle camera, then repeats the exact identity lookup.
+    Ambiguous nodes and empty identities never trigger recovery.
+    """
     if not usb_serial or not usb_interface:
         raise ValueError("Camera selection requires a USB serial and interface.")
     matches = []
@@ -110,6 +116,16 @@ def resolve_piper_camera(
             and serial.read_text().strip() == usb_serial
         ):
             matches.append(str(device_root / entry.name))
+    if not matches and reset_if_missing:
+        get_logger().warning(
+            "Camera %s interface %s has no capture node; recovering its idle USB device.",
+            usb_serial,
+            usb_interface,
+        )
+        reset_piper_camera(usb_serial, video_sysfs=sysfs, device_root=device_root)
+        return resolve_piper_camera(
+            usb_serial, usb_interface, sysfs=sysfs, device_root=device_root
+        )
     if len(matches) != 1:
         raise ValueError(
             f"Expected one capture node for camera {usb_serial}, interface {usb_interface}; found {matches}."
@@ -118,7 +134,7 @@ def resolve_piper_camera(
 
 
 def build_piper_cameras(specifications: dict) -> dict[str, "PiperOpenCVCamera"]:
-    """Construct disconnected RGB cameras using stable USB identities or paths."""
+    """Construct RGB cameras, recovering missing nodes when reset is configured."""
     cameras = {}
     paths = set()
     for name, values in specifications.items():
@@ -133,7 +149,9 @@ def build_piper_cameras(specifications: dict) -> dict[str, "PiperOpenCVCamera"]:
         if serial is not None or interface is not None:
             if "index_or_path" in spec:
                 raise ValueError("Specify either camera USB identity or index_or_path.")
-            spec["index_or_path"] = resolve_piper_camera(serial, interface)
+            spec["index_or_path"] = resolve_piper_camera(
+                serial, interface, reset_if_missing=reset
+            )
         path = Path(spec["index_or_path"]).resolve(strict=True)
         if path in paths:
             raise ValueError("Each camera must identify a different physical device.")

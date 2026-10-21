@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Explicit, paired critical-phase boundaries within a recorded episode."""
+"""Critical action intervals and independently scored segment outcomes."""
+
+SEGMENT_LABEL_FORMAT = "piper-rlt-episodes-v3"
+SEGMENT_SCORING_PROTOCOL = "critical-segment-v1"
+SEGMENT_PHASE_DEFINITION = (
+    "b starts a critical segment; s/f ends and scores that segment. "
+    "Right stops the episode; a separate s/f scores the whole episode."
+)
 
 
 def critical_phase_intervals(
@@ -42,4 +49,21 @@ def critical_phase_intervals(
             )
         intervals.append((start, end))
         previous_end = end
+    return intervals
+
+
+def scored_critical_phase_intervals(
+    phases: object, terminal_frame: int
+) -> list[tuple[int, int]]:
+    """Validate nonempty segments with their own explicit success/failure labels.
+
+    Segment results do not imply an episode result, or vice versa. The end
+    observation may also be the start observation of a later segment.
+    """
+    intervals = critical_phase_intervals(phases, terminal_frame)
+    for phase in phases:
+        if phase.get("outcome") not in ("success", "failure"):
+            raise ValueError(
+                "Each critical segment needs its own success/failure outcome."
+            )
     return intervals

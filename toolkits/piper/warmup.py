@@ -22,7 +22,12 @@ from pathlib import Path
 def main() -> None:
     """Expose init/cache/train through one configuration and a small local CLI."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "cache", "train"))
+    parser.add_argument("command", choices=("init", "cache", "relabel-cache", "train"))
+    parser.add_argument(
+        "--source-cache",
+        type=Path,
+        help="relabel-cache: verified legacy frozen features",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -55,6 +60,10 @@ def main() -> None:
         help="train: checkpoint at this absolute step within the fixed budget",
     )
     args, overrides = parser.parse_known_args()
+    if (args.command == "relabel-cache") != (args.source_cache is not None):
+        parser.error(
+            "relabel-cache requires --source-cache; other commands do not accept it."
+        )
     if any("=" not in item or item.startswith("--") for item in overrides):
         parser.error(
             "Extra arguments must use dotted overrides, e.g. training.batch_size=64."
@@ -99,6 +108,7 @@ def main() -> None:
             stride=cfg.stride,
             seed=cfg.seed,
             device=cfg.device,
+            video_backend=cfg.video_backend,
         )
         print(
             json.dumps(
@@ -107,6 +117,18 @@ def main() -> None:
                     "episodes": len(manifest["episodes"]),
                     "fingerprint": manifest["content_fingerprint"],
                 },
+                indent=2,
+            )
+        )
+    elif args.command == "relabel-cache":
+        from rlinf.data.datasets.rlt_warmup import relabel_cached_segments
+
+        manifest = relabel_cached_segments(
+            args.source_cache, cfg.annotations, cfg.cache, stage1=cfg.stage1
+        )
+        print(
+            json.dumps(
+                {"cache": cfg.cache, "fingerprint": manifest["content_fingerprint"]},
                 indent=2,
             )
         )

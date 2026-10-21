@@ -22,18 +22,26 @@ import json
 from collections import Counter
 from collections.abc import Callable
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from rlinf.data.schema.critical_phase import critical_phase_intervals
+from rlinf.data.schema.critical_phase import (
+    SEGMENT_LABEL_FORMAT,
+    SEGMENT_SCORING_PROTOCOL,
+    critical_phase_intervals,
+    scored_critical_phase_intervals,
+)
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
 LABEL_FORMAT = "piper-rlt-episodes-v2"
 CACHE_FORMAT = "piper-rlt-cache-v2"
+SEGMENT_CACHE_FORMAT = "piper-rlt-cache-v3"
 
 
 def file_sha256(path: str | Path) -> str:
@@ -49,6 +57,62 @@ def json_fingerprint(value: Any) -> str:
     """Identify a JSON-compatible configuration or data manifest."""
     encoded = json.dumps(value, sort_keys=True, allow_nan=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def implementation_fingerprints(paths: list[str]) -> dict[str, str]:
+    """Bind repository files and Python source trees used by cache or training."""
+    root = Path(__file__).resolve().parents[3]
+    result = {}
+    for name in paths:
+        path = root / name
+        files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
+        for source in files:
+            result[str(source.relative_to(root))] = file_sha256(source)
+    return result
+
+
+def runtime_versions() -> dict[str, str | None]:
+    """Record installed decoder and numerical dependency versions without imports."""
+    result = {}
+    for package in (
+        "torch",
+        "torchvision",
+        "torchcodec",
+        "lerobot",
+        "av",
+        "numpy",
+        "rlinf-openpi",
+        "openpi",
+        "transformers",
+    ):
+        try:
+            result[package] = version(package)
+        except PackageNotFoundError:
+            result[package] = None
+    return result
+
+
+def runtime_source_fingerprints() -> dict[str, str]:
+    """Bind external preprocessing code even for editable or dual installations."""
+    result = {}
+    for package, names in (
+        ("openpi", ("transforms.py", "models/tokenizer.py", "shared/normalize.py")),
+        (
+            "lerobot",
+            (
+                "datasets/video_utils.py",
+                "datasets/lerobot_dataset.py",
+                "datasets/utils.py",
+            ),
+        ),
+    ):
+        spec = find_spec(package)
+        if spec is None or spec.origin is None:
+            raise ImportError(f"Cannot fingerprint {package} preprocessing.")
+        root = Path(spec.origin).parent
+        for name in names:
+            result[f"{package}/{name}"] = file_sha256(root / name)
+    return result
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -77,8 +141,41 @@ def directory_lock(directory: Path):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def _reject_local_outcomes(manifest: dict) -> None:
+    """Keep segment labels out of the legacy global-episode reward pipeline."""
+    if (
+        manifest.get("format") == "piper-rlt-episodes-v3"
+        or manifest.get("reward_scope") == "critical_segment"
+        or any(
+            "outcome" in phase
+            for record in manifest.get("episodes", [])
+            for phase in record.get("critical_phases", [])
+        )
+    ):
+        raise ValueError(
+            "Local critical-segment outcomes require a segment-terminal trainer. "
+            "This legacy warmup uses global episode rewards; refusing local labels."
+        )
+
+
+def annotation_reward_scope(manifest: dict) -> str:
+    """Require an explicit versioned contract before using segment outcomes."""
+    if manifest.get("format") == SEGMENT_LABEL_FORMAT:
+        if (
+            manifest.get("reward_scope") != "critical_segment"
+            or manifest.get("scoring_protocol") != SEGMENT_SCORING_PROTOCOL
+        ):
+            raise ValueError(
+                "Local critical-segment outcomes require the v3 scoring contract."
+            )
+        return "critical_segment"
+    _reject_local_outcomes(manifest)
+    return "global_episode"
+
+
 def _read_annotations(path: Path) -> dict:
     manifest = json.loads(path.read_text())
+    annotation_reward_scope(manifest)
     if manifest.get("format") == "piper-rlt-episodes-v1":
         # The old schema explicitly defined one interval ending at the episode.
         # Preserve that historical meaning; v2 never fills missing end markers.
@@ -90,8 +187,10 @@ def _read_annotations(path: Path) -> dict:
                 else [{"start": start, "end": record["terminal_frame"]}]
             )
         manifest["format"] = LABEL_FORMAT
-    if manifest.get("format") != LABEL_FORMAT:
-        raise ValueError(f"Expected annotation format {LABEL_FORMAT}.")
+    if manifest.get("format") not in (LABEL_FORMAT, SEGMENT_LABEL_FORMAT):
+        raise ValueError(
+            f"Expected annotation format {LABEL_FORMAT} or {SEGMENT_LABEL_FORMAT}."
+        )
     return manifest
 
 
@@ -125,9 +224,12 @@ def load_episode_annotations(path: str | Path) -> dict:
         for field in ("episode", "terminal_frame"):
             if type(record.get(field)) is not int or record[field] < 0:
                 raise ValueError(f"Episode annotation needs an integer {field}.")
-        critical_phase_intervals(
-            record.get("critical_phases"), record["terminal_frame"]
+        validator = (
+            scored_critical_phase_intervals
+            if annotation_reward_scope(manifest) == "critical_segment"
+            else critical_phase_intervals
         )
+        validator(record.get("critical_phases"), record["terminal_frame"])
         for field, choices in (
             ("split", ("train", "validation")),
             ("outcome", ("success", "failure")),
@@ -222,14 +324,24 @@ def split_collection_annotations(
         value = _read_annotations(source)
         if merged is None:
             merged = {**value, "datasets": {}, "episodes": [], "excluded_episodes": []}
-        for key in ("task", "phase_definition", "test_only"):
+        for key in (
+            "format",
+            "reward_scope",
+            "scoring_protocol",
+            "task",
+            "phase_definition",
+            "test_only",
+        ):
             if value.get(key, False) != merged.get(key, False):
                 raise ValueError(f"Collection {key} differs across recordings.")
         for record in value["episodes"]:
             try:
-                critical_phase_intervals(
-                    record.get("critical_phases"), record["terminal_frame"]
+                validator = (
+                    scored_critical_phase_intervals
+                    if annotation_reward_scope(value) == "critical_segment"
+                    else critical_phase_intervals
                 )
+                validator(record.get("critical_phases"), record["terminal_frame"])
             except ValueError as exc:
                 if not skip_unlabeled:
                     raise ValueError(
@@ -294,6 +406,7 @@ def episode_transitions(
     stride: int,
     success: bool,
     human: np.ndarray,
+    reward_scope: str = "global_episode",
 ) -> dict[str, np.ndarray]:
     """Build phase-local actions and discounted transitions between actor decisions.
 
@@ -307,7 +420,13 @@ def episode_transitions(
         raise ValueError("Use 0 < stride <= chunk_length to cover terminal rewards.")
     if type(terminal) is not int or not 0 < terminal < len(actions):
         raise ValueError("Phase bounds must leave a recorded terminal observation.")
-    intervals = critical_phase_intervals(phases, terminal)
+    if reward_scope == "critical_segment":
+        intervals = scored_critical_phase_intervals(phases, terminal)
+    elif reward_scope == "global_episode":
+        _reject_local_outcomes({"episodes": [{"critical_phases": phases}]})
+        intervals = critical_phase_intervals(phases, terminal)
+    else:
+        raise ValueError("Unknown reward_scope.")
     if actions.shape[1:] != (7,) or human.shape != (len(actions),):
         raise ValueError("Expected actions [frames,7] and human flags [frames].")
     if not np.isfinite(actions).all():
@@ -319,7 +438,9 @@ def episode_transitions(
             last = first + length
             next_frame, next_length = last, min(chunk_length, end - last)
             if last == end:
-                if phase_id + 1 < len(intervals):
+                if reward_scope == "critical_segment":
+                    next_frame, next_length = end, 0
+                elif phase_id + 1 < len(intervals):
                     next_frame, next_end = intervals[phase_id + 1]
                     next_length = min(chunk_length, next_end - next_frame)
                 else:
@@ -338,6 +459,10 @@ def episode_transitions(
     chunk_actions = np.zeros((count, chunk_length, 7), dtype=np.float32)
     terminated = next_frames == terminal
     rewards = (terminated & success).astype(np.float32)
+    if reward_scope == "critical_segment":
+        terminated = ends == np.asarray(intervals)[phase_ids, 1]
+        successes = np.asarray([p["outcome"] == "success" for p in phases])
+        rewards = (terminated & successes[phase_ids]).astype(np.float32)
     intervention = np.zeros((count, chunk_length), dtype=np.bool_)
     for row, (first, length) in enumerate(zip(starts, lengths, strict=True)):
         chunk_actions[row, :length] = actions[first : first + length]
@@ -416,6 +541,7 @@ def prepare_piper_cache(
     stride: int = 10,
     seed: int = 1234,
     device: str = "cuda:0",
+    video_backend: str = "torchcodec",
 ) -> dict:
     """Cache annotated LeRobot episodes; resume only an identical data contract."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -450,7 +576,7 @@ def prepare_piper_cache(
             Path(root).name,
             root=Path(root),
             download_videos=False,
-            video_backend="torchcodec",
+            video_backend=video_backend,
         )
         if float(dataset.fps) != float(policy_manifest["fps"]):
             raise ValueError(f"FPS mismatch for {root}.")
@@ -471,7 +597,9 @@ def prepare_piper_cache(
     output = Path(output).resolve()
     with directory_lock(output):
         binding = {
-            "format": CACHE_FORMAT,
+            "format": SEGMENT_CACHE_FORMAT
+            if annotation_reward_scope(labels) == "critical_segment"
+            else CACHE_FORMAT,
             "annotations": labels,
             "source_fingerprints": _source_fingerprints(labels["datasets"]),
             "stage1": policy_manifest,
@@ -481,20 +609,20 @@ def prepare_piper_cache(
             "chunk_length": chunk_length,
             "stride": stride,
             "seed": seed,
-            "preprocessing": "PiperRLTPolicy.extract_rlt_obs/torchcodec/float32/paired-phases-v2",
-            "preprocessing_sha256": {
-                str(path.relative_to(Path(__file__).resolve().parents[3])): file_sha256(
-                    path
-                )
-                for path in (
-                    Path(__file__),
-                    Path(__file__).resolve().parents[1] / "schema/critical_phase.py",
-                    Path(__file__).resolve().parents[2]
-                    / "models/embodiment/piper_inference.py",
-                    Path(__file__).resolve().parents[2]
-                    / "models/embodiment/openpi/policies/piper_policy.py",
-                )
-            },
+            "preprocessing": f"PiperRLTPolicy.extract_rlt_obs/{video_backend}/float32/paired-phases-v2",
+            "runtime_versions": runtime_versions(),
+            "runtime_source_sha256": runtime_source_fingerprints(),
+            "preprocessing_sha256": implementation_fingerprints(
+                [
+                    "rlinf/data/datasets/rlt_warmup.py",
+                    "rlinf/data/schema/critical_phase.py",
+                    "rlinf/data/storage/lerobot",
+                    "rlinf/models/embodiment/piper_inference.py",
+                    "rlinf/models/embodiment/base_policy.py",
+                    "rlinf/models/embodiment/openpi",
+                    "rlinf/models/embodiment/modules/rlt_token_transformer.py",
+                ]
+            ),
         }
         fingerprint = json_fingerprint(binding)
         progress_path = output / "progress.json"
@@ -549,6 +677,7 @@ def prepare_piper_cache(
                 stride=stride,
                 success=record["outcome"] == "success",
                 human=human,
+                reward_scope=annotation_reward_scope(labels),
             )
 
             def extract(frame: int) -> dict[str, np.ndarray]:
@@ -616,14 +745,190 @@ def prepare_piper_cache(
     return manifest
 
 
+def relabel_cached_segments(
+    source: str | Path,
+    annotations: str | Path,
+    output: str | Path,
+    *,
+    stage1: str | Path,
+) -> dict:
+    """Reuse verified frozen features in a new cache with local terminal targets.
+
+    This CPU operation accepts identical physical episodes, splits and boundaries.
+    It hashes original LeRobot sources and Stage 1 weights again. No features,
+    actions or human flags are inferred or regenerated; only TD edges change.
+    """
+    from rlinf.models.embodiment.piper_inference import load_piper_inference_config
+
+    replay = CachedRLTReplay(source)
+    if replay.reward_scope != "global_episode":
+        raise ValueError("Feature relabeling requires a legacy global cache.")
+    labels = load_episode_annotations(annotations)
+    if annotation_reward_scope(labels) != "critical_segment":
+        raise ValueError("Feature relabeling requires scored local annotations.")
+    old = replay.manifest
+    if (
+        labels["datasets"] != old["annotations"]["datasets"]
+        or labels["task"] != old["annotations"]["task"]
+    ):
+        raise ValueError("Dataset aliases/paths or task changed; extract a new cache.")
+    if labels.get("test_only", False) != old["annotations"].get("test_only", False):
+        raise ValueError("Cannot change the test-only data designation.")
+    if len(labels["episodes"]) != len(old["episodes"]):
+        raise ValueError("Parent episodes changed; extract a new cache.")
+    for record, entry in zip(labels["episodes"], old["episodes"], strict=True):
+        for key in (
+            "dataset",
+            "episode",
+            "terminal_frame",
+            "outcome",
+            "split",
+            "session",
+            "behavior",
+        ):
+            if record.get(key) != entry.get(key):
+                raise ValueError(
+                    f"Parent episode {key} changed; cannot reuse features."
+                )
+        if critical_phase_intervals(
+            record["critical_phases"], record["terminal_frame"]
+        ) != critical_phase_intervals(
+            entry["critical_phases"], entry["terminal_frame"]
+        ):
+            raise ValueError("Phase boundaries changed; cannot reuse feature rows.")
+    source_fingerprints = _source_fingerprints(labels["datasets"])
+    if source_fingerprints != old["source_fingerprints"]:
+        raise ValueError("Source LeRobot data changed since feature extraction.")
+    cfg, policy = load_piper_inference_config(stage1)
+    if (
+        policy != old["stage1"]
+        or file_sha256(Path(cfg.model_path) / "model_state_dict/full_weights.pt")
+        != old["stage1_weights_sha256"]
+    ):
+        raise ValueError(
+            "Stage 1 identity or weights changed since feature extraction."
+        )
+    if (
+        file_sha256(cfg.openpi_data.norm_stats_path)
+        != old["stage1"]["norm_stats_sha256"]
+    ):
+        raise ValueError("Stage 1 normalization changed.")
+    model_code = implementation_fingerprints(
+        [
+            "rlinf/models/embodiment/piper_inference.py",
+            "rlinf/models/embodiment/base_policy.py",
+            "rlinf/models/embodiment/openpi",
+            "rlinf/models/embodiment/modules/rlt_token_transformer.py",
+        ]
+    )
+    if any(old["preprocessing_sha256"].get(k) != v for k, v in model_code.items()):
+        raise ValueError("Frozen feature model implementation changed.")
+    if (
+        runtime_versions() != old["runtime_versions"]
+        or runtime_source_fingerprints() != old["runtime_source_sha256"]
+    ):
+        raise ValueError("Feature runtime changed; use the recorded environment.")
+    output = Path(output).resolve()
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"Preserving existing cache: {output}")
+    with directory_lock(output):
+        if any(p.name != ".lock" for p in output.iterdir()):
+            raise FileExistsError(f"Preserving existing cache: {output}")
+        binding = {
+            **{
+                k: v
+                for k, v in old.items()
+                if k not in ("episodes", "fingerprint", "content_fingerprint")
+            },
+            "format": SEGMENT_CACHE_FORMAT,
+            "annotations": labels,
+            "feature_reuse": {
+                "source": str(replay.path),
+                "manifest_sha256": file_sha256(replay.path / "manifest.json"),
+                "content_fingerprint": old["content_fingerprint"],
+                "annotations_sha256": file_sha256(annotations),
+                "verified_model_code": model_code,
+                "transition_implementation": implementation_fingerprints(
+                    [
+                        "rlinf/data/datasets/rlt_warmup.py",
+                        "rlinf/data/schema/critical_phase.py",
+                    ]
+                ),
+            },
+        }
+        (output / "norm_stats.json").write_bytes(
+            (replay.path / "norm_stats.json").read_bytes()
+        )
+        entries = []
+        for record, entry, data in zip(
+            labels["episodes"], old["episodes"], replay.episodes, strict=True
+        ):
+            arrays = {k: v.numpy().copy() for k, v in data.items()}
+            phases = np.asarray(
+                critical_phase_intervals(
+                    record["critical_phases"], record["terminal_frame"]
+                )
+            )
+            arrays["next"] = arrays["action_end"].copy()
+            last = arrays["frames"][arrays["next"]]
+            phase_end = phases[arrays["phase_id"], 1]
+            arrays["terminated"] = last == phase_end
+            arrays["discount_steps"] = arrays["valid_steps"].copy()
+            arrays["next_valid_steps"] = np.minimum(
+                old["chunk_length"], phase_end - last
+            )
+            successful = np.asarray(
+                [p["outcome"] == "success" for p in record["critical_phases"]]
+            )
+            arrays["rewards"] = (
+                arrays["terminated"] & successful[arrays["phase_id"]]
+            ).astype(np.float32)
+            filename = output / entry["file"]
+            with filename.open("xb") as stream:
+                np.savez(stream, **arrays)
+            entries.append({**entry, **record, "sha256": file_sha256(filename)})
+        manifest = {
+            **binding,
+            "fingerprint": json_fingerprint(binding),
+            "episodes": entries,
+        }
+        manifest["content_fingerprint"] = json_fingerprint(manifest)
+        write_json(output / "manifest.json", manifest)
+        CachedRLTReplay(output)
+    return manifest
+
+
 class CachedRLTReplay:
     """Immutable CPU episode pool, with uniform episode then chunk sampling."""
 
-    def __init__(self, path: str | Path, *, seed: int = 1234):
+    def __init__(
+        self, path: str | Path, *, seed: int = 1234, phase_filter: int | None = None
+    ):
         self.path = Path(path).resolve()
         self.manifest = json.loads((self.path / "manifest.json").read_text())
-        if self.manifest.get("format") != CACHE_FORMAT:
-            raise ValueError(f"Expected cache format {CACHE_FORMAT}.")
+        self.reward_scope = annotation_reward_scope(
+            self.manifest.get("annotations", {})
+        )
+        expected_format = (
+            SEGMENT_CACHE_FORMAT
+            if self.reward_scope == "critical_segment"
+            else CACHE_FORMAT
+        )
+        if self.manifest.get("format") != expected_format:
+            raise ValueError(
+                "Local critical-segment outcomes and cache version disagree."
+            )
+        if self.reward_scope == "global_episode":
+            _reject_local_outcomes(self.manifest)
+        if phase_filter is not None and (
+            type(phase_filter) is not int
+            or phase_filter < 0
+            or self.reward_scope != "critical_segment"
+        ):
+            raise ValueError(
+                "phase_filter requires a nonnegative ordinal and local rewards."
+            )
+        self.phase_filter = phase_filter
         content = dict(self.manifest)
         fingerprint = content.pop("content_fingerprint")
         if json_fingerprint(content) != fingerprint:
@@ -634,10 +939,20 @@ class CachedRLTReplay:
         ):
             raise ValueError("Cache normalization fingerprint mismatch.")
         self.rng = np.random.default_rng(seed)
+        if len(self.manifest["episodes"]) != len(
+            self.manifest["annotations"]["episodes"]
+        ):
+            raise ValueError("Cache parent episode count disagrees with annotations.")
         self.episodes: list[dict[str, torch.Tensor]] = []
+        self.selected_rows: list[np.ndarray] = []
         self.splits: dict[str, list[int]] = {"train": [], "validation": []}
         identities, sessions = set(), {}
         for index, entry in enumerate(self.manifest["episodes"]):
+            label = self.manifest["annotations"]["episodes"][index]
+            if any(entry.get(key) != value for key, value in label.items()):
+                raise ValueError(
+                    "Cache shard labels disagree with embedded annotations."
+                )
             filename = (self.path / entry["file"]).resolve()
             if (
                 not filename.is_relative_to(self.path)
@@ -665,7 +980,14 @@ class CachedRLTReplay:
                 }
             self._validate_arrays(arrays, entry)
             self.episodes.append(arrays)
-            self.splits[split].append(index)
+            selected = (
+                np.arange(len(arrays["current"]))
+                if phase_filter is None
+                else np.flatnonzero(arrays["phase_id"].numpy() == phase_filter)
+            )
+            self.selected_rows.append(selected)
+            if len(selected):
+                self.splits[split].append(index)
         if not all(self.splits.values()):
             raise ValueError("Cache requires disjoint train and validation episodes.")
 
@@ -721,11 +1043,21 @@ class CachedRLTReplay:
         ):
             raise ValueError("Invalid cached phase indices.")
         phases = torch.tensor(intervals, dtype=torch.int64)
+        if arrays["frames"].dtype != torch.int64 or not (
+            (arrays["frames"] >= 0).all()
+            and (arrays["frames"] <= entry["terminal_frame"]).all()
+            and (arrays["frames"][1:] > arrays["frames"][:-1]).all()
+        ):
+            raise ValueError(
+                "Cached feature frames must be ordered episode observations."
+            )
         first = arrays["frames"][arrays["current"]]
         last = arrays["frames"][arrays["action_end"]]
         following = arrays["frames"][arrays["next"]]
         if not torch.equal(last - first, lengths):
             raise ValueError("Cached action end is not aligned with executed actions.")
+        if not torch.equal(lengths, (phases[phase_ids, 1] - first).clamp(max=chunk)):
+            raise ValueError("Cached action window length disagrees with its phase.")
         if not ((first >= phases[phase_ids, 0]) & (last <= phases[phase_ids, 1])).all():
             raise ValueError("Cached action window crosses phase boundaries.")
         next_phases = torch.cat(
@@ -741,6 +1073,24 @@ class CachedRLTReplay:
             next_phases[phase_ids, 1] - expected_next,
             phases[phase_ids, 1] - expected_next,
         ).clamp(max=chunk)
+        if self.reward_scope == "critical_segment":
+            scored_critical_phase_intervals(
+                entry["critical_phases"], entry["terminal_frame"]
+            )
+            expected_next = last
+            next_lengths = (phases[phase_ids, 1] - last).clamp(max=chunk)
+        expected_starts = torch.tensor(
+            [
+                first
+                for start, end in intervals
+                for first in range(start, end, self.manifest["stride"])
+            ],
+            dtype=torch.int64,
+        )
+        if not torch.equal(first, expected_starts):
+            raise ValueError(
+                "Cached windows omit or duplicate annotated decision starts."
+            )
         if not torch.equal(following, expected_next):
             raise ValueError(
                 "Cached next decision is not the next critical state or episode terminal."
@@ -760,13 +1110,23 @@ class CachedRLTReplay:
             raise ValueError("Cached outcome and intervention flags must be boolean.")
         if not arrays["terminated"].any():
             raise ValueError("Cached phase is missing its terminal transition.")
-        if not torch.equal(arrays["terminated"], following == entry["terminal_frame"]):
+        expected_done = (
+            at_exit
+            if self.reward_scope == "critical_segment"
+            else following == entry["terminal_frame"]
+        )
+        if not torch.equal(arrays["terminated"], expected_done):
             raise ValueError("Cached terminal flags disagree with annotated endpoint.")
         mask = torch.arange(chunk)[None, :] < lengths[:, None]
         if arrays["actions"][~mask].count_nonzero() or arrays["human"][~mask].any():
             raise ValueError("Cached padding must contain no actions or interventions.")
         rewards = torch.zeros_like(arrays["rewards"])
-        if entry["outcome"] == "success":
+        if self.reward_scope == "critical_segment":
+            successes = torch.tensor(
+                [p["outcome"] == "success" for p in entry["critical_phases"]]
+            )
+            rewards[arrays["terminated"] & successes[phase_ids]] = 1
+        elif entry["outcome"] == "success":
             rewards[arrays["terminated"]] = 1
         if not torch.equal(rewards, arrays["rewards"]):
             raise ValueError("Cached rewards disagree with the terminal outcome.")
@@ -779,8 +1139,20 @@ class CachedRLTReplay:
             "success": counts["success"],
             "failure": counts["failure"],
             "episodes": len(entries),
-            "transitions": sum(e["transitions"] for e in entries),
+            "transitions": sum(len(self.selected_rows[i]) for i in self.splits[split]),
         }
+
+    def metric_groups(self, split: str) -> list[tuple[int, int | None]]:
+        """Keep parent splits while scoring local results by phase ordinal."""
+        if self.reward_scope != "critical_segment":
+            return [(i, None) for i in self.splits[split]]
+        return [
+            (i, int(phase))
+            for i in self.splits[split]
+            for phase in torch.unique(
+                self.episodes[i]["phase_id"][self.selected_rows[i]]
+            ).tolist()
+        ]
 
     def rng_state(self) -> dict:
         """Return a checkpointable sampler RNG state."""
@@ -829,7 +1201,5 @@ class CachedRLTReplay:
         if batch_size <= 0:
             raise ValueError("Batch size must be positive.")
         episodes = self.rng.choice(self.splits["train"], size=batch_size).tolist()
-        rows = [
-            int(self.rng.integers(len(self.episodes[i]["current"]))) for i in episodes
-        ]
+        rows = [int(self.rng.choice(self.selected_rows[i])) for i in episodes]
         return self.batch(episodes, rows, device)

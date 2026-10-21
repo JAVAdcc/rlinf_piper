@@ -45,6 +45,50 @@ class ChunkPolicy(Protocol):
         ...
 
 
+@dataclass
+class PiperPolicySelection:
+    """Latch manual routing changes; each change invalidates queued predictions."""
+
+    actor_enabled: bool = False
+    generation: int = 0
+
+    def set_critical(self, active: bool) -> None:
+        if self.actor_enabled != active:
+            self.actor_enabled = active
+            self.generation += 1
+
+
+@dataclass(frozen=True)
+class _PolicyRequest:
+    generation: int
+    actor_enabled: bool | None
+    source: str
+    horizon: int
+    execute_steps: int
+
+    def infer(self, policy: ChunkPolicy, observation: dict, task: str) -> np.ndarray:
+        if self.actor_enabled is None:
+            return policy.infer(observation, task)
+        return policy.infer(observation, task, actor_enabled=self.actor_enabled)
+
+
+def _policy_request(
+    policy: ChunkPolicy,
+    selection: PiperPolicySelection | None,
+    source: str,
+    replan_steps: int,
+) -> _PolicyRequest:
+    enabled = selection.actor_enabled if selection is not None else None
+    horizon = policy.actor_horizon if enabled else policy.action_horizon
+    return _PolicyRequest(
+        selection.generation if selection is not None else 0,
+        enabled,
+        ("actor" if enabled else "reference") if selection is not None else source,
+        horizon,
+        min(replan_steps, horizon),
+    )
+
+
 @dataclass(frozen=True)
 class PiperExecutionConfig:
     """Control units and maximum changes checked against measured feedback."""
@@ -379,6 +423,7 @@ def rollout_piper(
     manage_session: bool = True,
     policy_source: str = "reference",
     on_policy_resume: Callable[[], None] | None = None,
+    policy_selection: PiperPolicySelection | None = None,
 ) -> int:
     """Execute bounded chunks, with concurrent inference when HIL is enabled.
 
@@ -393,6 +438,10 @@ def rollout_piper(
     """
     if replan_steps is None:
         replan_steps = policy.action_horizon
+    if getattr(policy, "manual_critical", False) != (policy_selection is not None):
+        raise ValueError(
+            "Manual critical policy and execution selection must be supplied together."
+        )
     if steps <= 0 or not 1 <= replan_steps <= policy.action_horizon:
         raise ValueError(
             "Use positive steps and replan_steps within the policy horizon."
@@ -407,6 +456,8 @@ def rollout_piper(
         observation_dir.mkdir(parents=True, exist_ok=False)
     actions = np.empty((0, 7))
     chunk_index = 0
+    request_index = 0
+    request = _policy_request(policy, policy_selection, policy_source, replan_steps)
     with session if manage_session else contextlib.nullcontext(session):
         if getattr(session, "intervention", None) is not None:
             return _rollout_with_intervention(
@@ -421,6 +472,7 @@ def rollout_piper(
                 record_step=record_step,
                 policy_source=policy_source,
                 on_policy_resume=on_policy_resume,
+                policy_selection=policy_selection,
             )
         while completed < steps:
             if stop_requested is not None and stop_requested(completed):
@@ -428,11 +480,21 @@ def rollout_piper(
             started = time.monotonic()
             wall_time = time.time()
             observation = session.observe()
+            if (
+                policy_selection is not None
+                and actions.size
+                and request.generation != policy_selection.generation
+            ):
+                actions, chunk_index = np.empty((0, 7)), 0
             if chunk_index == len(actions):
+                request_index += 1
                 observed_at = started
-                actions = np.asarray(policy.infer(observation, task))
+                request = _policy_request(
+                    policy, policy_selection, policy_source, replan_steps
+                )
+                actions = np.asarray(request.infer(policy, observation, task))
                 if (
-                    actions.shape != (policy.action_horizon, 7)
+                    actions.shape != (request.horizon, 7)
                     or not np.isfinite(actions).all()
                 ):
                     raise ValueError("Policy returned an invalid action chunk.")
@@ -441,19 +503,40 @@ def rollout_piper(
                     "step": completed,
                     "inference_s": time.monotonic() - observed_at,
                     "actions": actions.tolist(),
-                    "replan_steps": replan_steps,
+                    "replan_steps": request.execute_steps,
+                    "action_source": request.source,
+                    "route_generation": request.generation,
                 }
                 if observation_dir is not None:
-                    path = observation_dir / f"step_{completed:06d}.npz"
+                    name = f"step_{completed:06d}"
+                    if policy_selection is not None:
+                        name += f"_request_{request_index:06d}"
+                    path = observation_dir / f"{name}.npz"
                     np.savez(path, **observation, task=np.asarray(task))
                     prediction["observation_file"] = str(path.resolve())
                 log.write(json.dumps(prediction) + "\n")
                 log.flush()
-                actions = actions[:replan_steps]
+                actions = actions[: request.execute_steps]
                 chunk_index = 0
             # Consume labels entered during inference before sending another target.
             if stop_requested is not None and stop_requested(completed):
                 break
+            if (
+                policy_selection is not None
+                and request.generation != policy_selection.generation
+            ):
+                log.write(
+                    json.dumps(
+                        {
+                            "event": "route_discard",
+                            "step": completed,
+                            "route_generation": request.generation,
+                        }
+                    )
+                    + "\n"
+                )
+                actions, chunk_index = np.empty((0, 7)), 0
+                continue
             prediction_age = time.monotonic() - observed_at
             if prediction_age > session.config.max_prediction_age_s:
                 raise TimeoutError(
@@ -466,17 +549,21 @@ def rollout_piper(
             target = actions[chunk_index]
             measured = session.execute(target)
             log.write(
-                json.dumps({
-                    "event": "action",
-                    "step": completed,
-                    "state": measured.tolist(),
-                    "target": target.tolist(),
-                    "command": session.last_command.tolist()
-                    if record_step is not None
-                    else None,
-                    "time": time.time(),
-                    "prediction_age_s": time.monotonic() - observed_at,
-                })
+                json.dumps(
+                    {
+                        "event": "action",
+                        "step": completed,
+                        "state": measured.tolist(),
+                        "target": target.tolist(),
+                        "command": session.last_command.tolist()
+                        if record_step is not None
+                        else None,
+                        "time": time.time(),
+                        "prediction_age_s": time.monotonic() - observed_at,
+                        "action_source": request.source,
+                        "route_generation": request.generation,
+                    }
+                )
                 + "\n"
             )
             log.flush()
@@ -487,6 +574,8 @@ def rollout_piper(
                     requested=target,
                     measured=measured,
                     wall_time=wall_time,
+                    action_source=request.source,
+                    policy_action=target,
                 )
             chunk_index += 1
             completed += 1
@@ -507,6 +596,7 @@ def _rollout_with_intervention(
     record_step: Callable[..., None] | None,
     policy_source: str,
     on_policy_resume: Callable[[], None] | None,
+    policy_selection: PiperPolicySelection | None,
 ) -> int:
     """Keep control and recording responsive while one inference job runs."""
     control = session.intervention
@@ -519,6 +609,11 @@ def _rollout_with_intervention(
     generation = control.generation
     prediction_time = 0.0
     resume_generation = None
+    route_generation = (
+        policy_selection.generation if policy_selection is not None else 0
+    )
+    action_source = policy_source
+    request = _policy_request(policy, policy_selection, policy_source, replan_steps)
     period = 1 / session.config.fps
     try:
         while completed < steps:
@@ -529,37 +624,55 @@ def _rollout_with_intervention(
             if generation != control.generation:
                 actions, index = np.empty((0, 7)), 0
                 generation = control.generation
+            if (
+                policy_selection is not None
+                and route_generation != policy_selection.generation
+            ):
+                actions, index = np.empty((0, 7)), 0
+                route_generation = policy_selection.generation
             if future is not None and future.done():
                 prediction = np.asarray(future.result())
                 future = None
                 if (
-                    prediction.shape != (policy.action_horizon, 7)
+                    prediction.shape != (request.horizon, 7)
                     or not np.isfinite(prediction).all()
                 ):
                     raise ValueError("Policy returned an invalid action chunk.")
-                releasing = control.mode == "release_pending"
-                accepted = control.accept_prediction(request_generation)
-                if accepted and releasing:
-                    resume_generation = control.generation
+                accepted = (
+                    (
+                        policy_selection is None
+                        or request.generation == policy_selection.generation
+                    )
+                    and request_generation == control.generation
+                    and control.mode != "human"
+                )
                 log.write(
-                    json.dumps({
-                        "event": "prediction",
-                        "step": request_step,
-                        "accepted_at_step": completed if accepted else None,
-                        "generation": request_generation,
-                        "discarded": not accepted,
-                        "inference_s": time.monotonic() - requested_at,
-                        "actions": prediction.tolist(),
-                        "replan_steps": replan_steps,
-                    })
+                    json.dumps(
+                        {
+                            "event": "prediction",
+                            "step": request_step,
+                            "accepted_at_step": completed if accepted else None,
+                            "generation": request_generation,
+                            "discarded": not accepted,
+                            "inference_s": time.monotonic() - requested_at,
+                            "actions": prediction.tolist(),
+                            "replan_steps": request.execute_steps,
+                            "action_source": request.source,
+                            "route_generation": request.generation,
+                        }
+                    )
                     + "\n"
                 )
                 log.flush()
                 if accepted:
-                    actions, index = prediction[:replan_steps], 0
+                    actions, index = prediction[: request.execute_steps], 0
+                    action_source = request.source
                     prediction_time = requested_at
             if future is None and index == len(actions) and control.mode != "human":
                 request_generation = control.generation
+                request = _policy_request(
+                    policy, policy_selection, policy_source, replan_steps
+                )
                 request_step, requested_at = completed, started
                 snapshot = {key: value.copy() for key, value in observation.items()}
                 if observation_dir is not None:
@@ -568,13 +681,19 @@ def _rollout_with_intervention(
                         **snapshot,
                         task=np.asarray(task),
                     )
-                future = executor.submit(policy.infer, snapshot, task)
+                future = executor.submit(request.infer, policy, snapshot, task)
             # An input arriving during observation/result handling still wins.
             if stop_requested is not None and stop_requested(completed):
                 break
             if generation != control.generation:
                 actions, index = np.empty((0, 7)), 0
                 generation = control.generation
+            if (
+                policy_selection is not None
+                and route_generation != policy_selection.generation
+            ):
+                actions, index = np.empty((0, 7)), 0
+                route_generation = policy_selection.generation
             policy_target = actions[index] if index < len(actions) else None
             if (
                 policy_target is not None
@@ -582,27 +701,35 @@ def _rollout_with_intervention(
                 > session.config.max_prediction_age_s
             ):
                 raise TimeoutError("Piper policy prediction expired before execution.")
+            if policy_target is not None and control.mode == "release_pending":
+                # Accept only after the final input poll and route invalidation.
+                # A discarded result must not end human-owned release waiting.
+                if control.accept_prediction(generation):
+                    resume_generation = control.generation
             target, source = control.choose(
                 policy_target,
                 observation["observation.state"],
-                source=policy_source,
+                source=action_source,
             )
             measured = session.execute(target)
             log.write(
-                json.dumps({
-                    "event": "action",
-                    "step": completed,
-                    "state": measured.tolist(),
-                    "target": target.tolist(),
-                    "command": session.last_command.tolist(),
-                    "time": time.time(),
-                    "action_source": source,
-                    "is_intervention": source == "human",
-                    "control_generation": control.generation,
-                    "prediction_age_s": time.monotonic() - prediction_time
-                    if source in ("reference", "actor")
-                    else None,
-                })
+                json.dumps(
+                    {
+                        "event": "action",
+                        "step": completed,
+                        "state": measured.tolist(),
+                        "target": target.tolist(),
+                        "command": session.last_command.tolist(),
+                        "time": time.time(),
+                        "action_source": source,
+                        "is_intervention": source == "human",
+                        "control_generation": control.generation,
+                        "route_generation": route_generation,
+                        "prediction_age_s": time.monotonic() - prediction_time
+                        if source in ("reference", "actor")
+                        else None,
+                    }
+                )
                 + "\n"
             )
             log.flush()

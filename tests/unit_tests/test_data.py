@@ -4175,3 +4175,173 @@ def test_piper_warmup_collection_split_rejects_missing_labels_and_keeps_sessions
     source.write_text(json.dumps(labels))
     with pytest.raises(ValueError, match="Unpaired critical phase"):
         split_collection_annotations([source], tmp_path / "invalid.json")
+
+
+@pytest.mark.parametrize("variant", ["v3", "local_outcome_in_v2", "local_scope_in_v2"])
+def test_piper_warmup_refuses_local_rewards_in_global_episode_pipeline(
+    tmp_path, variant
+):
+    from rlinf.data.datasets.rlt_warmup import (
+        load_episode_annotations,
+        split_collection_annotations,
+    )
+
+    labels = {
+        "format": "piper-rlt-episodes-v3"
+        if variant == "v3"
+        else "piper-rlt-episodes-v2",
+        "episodes": [{"critical_phases": [{"start": 1, "end": 2}]}],
+    }
+    if variant == "local_outcome_in_v2":
+        labels["episodes"][0]["critical_phases"][0]["outcome"] = "success"
+    if variant == "local_scope_in_v2":
+        labels["reward_scope"] = "critical_segment"
+    path = tmp_path / "annotations.json"
+    path.write_text(json.dumps(labels))
+    with pytest.raises(ValueError, match="Local critical-segment"):
+        load_episode_annotations(path)
+    with pytest.raises(ValueError, match="Local critical-segment"):
+        split_collection_annotations([path], tmp_path / "output.json")
+    assert not (tmp_path / "output.json").exists()
+
+
+@pytest.mark.parametrize("location", ["annotations", "shard_entry"])
+def test_piper_warmup_cache_refuses_local_labels_even_with_valid_fingerprint(
+    piper_warmup_cache, location
+):
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay, json_fingerprint
+
+    path = piper_warmup_cache / "manifest.json"
+    manifest = json.loads(path.read_text())
+    records = (
+        manifest["annotations"]["episodes"]
+        if location == "annotations"
+        else manifest["episodes"]
+    )
+    records[0]["critical_phases"][0]["outcome"] = "failure"
+    content = {k: v for k, v in manifest.items() if k != "content_fingerprint"}
+    manifest["content_fingerprint"] = json_fingerprint(content)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="segment-terminal trainer"):
+        CachedRLTReplay(piper_warmup_cache)
+
+
+@pytest.mark.parametrize("second_start", [4, 7])
+@pytest.mark.parametrize("stride", [2, 10])
+def test_piper_warmup_local_targets_end_each_scored_segment(second_start, stride):
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+    from rlinf.runners.rlt_warmup_runner import discounted_target
+
+    phases = [
+        {"start": 1, "end": 4, "outcome": "success"},
+        {"start": second_start, "end": second_start + 13, "outcome": "failure"},
+    ]
+    end = second_start + 17
+    data = episode_transitions(
+        np.ones((end + 1, 7), dtype=np.float32),
+        phases=phases,
+        terminal=end,
+        chunk_length=10,
+        stride=stride,
+        success=False,
+        human=np.ones(end + 1, dtype=bool),
+        reward_scope="critical_segment",
+    )
+    np.testing.assert_array_equal(data["next"], data["action_end"])
+    np.testing.assert_array_equal(data["discount_steps"], data["valid_steps"])
+    ends = np.array([p["end"] for p in phases])[data["phase_id"]]
+    np.testing.assert_array_equal(
+        data["terminated"], data["frames"][data["next"]] == ends
+    )
+    assert (data["next_valid_steps"][data["terminated"]] == 0).all()
+    np.testing.assert_array_equal(
+        data["rewards"],
+        (data["terminated"] & (data["phase_id"] == 0)).astype(np.float32),
+    )
+    batch = {key: torch.from_numpy(value) for key, value in data.items()}
+    target = discounted_target(batch, torch.full_like(batch["rewards"], 123.0), 0.5)
+    done = batch["terminated"]
+    torch.testing.assert_close(
+        target[done], batch["rewards"][done] * 0.5 ** (batch["valid_steps"][done] - 1)
+    )
+    mask = np.arange(10)[None] < data["valid_steps"][:, None]
+    assert not data["human"][~mask].any()
+    assert not data["actions"][~mask].any()
+
+
+def test_piper_warmup_local_phase_filter_preserves_parent_splits_and_rng(
+    piper_local_warmup_cache,
+):
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
+
+    replay = CachedRLTReplay(piper_local_warmup_cache, phase_filter=1)
+    assert replay.splits == {"train": [0], "validation": [2]}
+    assert replay.metric_groups("train") == [(0, 1)]
+    state = replay.rng_state()
+    batch = replay.sample(100)
+    replay.restore_rng(state)
+    repeated = replay.sample(100)
+    assert not batch["rewards"].any()
+    assert batch["terminated"].all()
+    assert (batch["curr_obs"]["z_rl"] == 0).all()
+    torch.testing.assert_close(batch["actions"], repeated["actions"], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="disjoint train and validation"):
+        CachedRLTReplay(piper_local_warmup_cache, phase_filter=4)
+
+
+@pytest.mark.parametrize("missing", ["interval", "outcome"])
+def test_piper_warmup_local_split_explicitly_excludes_unlabeled(
+    piper_local_warmup_cache, tmp_path, missing
+):
+    from rlinf.data.datasets.rlt_warmup import (
+        load_episode_annotations,
+        split_collection_annotations,
+    )
+
+    labels = json.loads((piper_local_warmup_cache / "manifest.json").read_text())[
+        "annotations"
+    ]
+    if missing == "interval":
+        labels["episodes"][0]["critical_phases"] = []
+    else:
+        labels["episodes"][0]["critical_phases"][0].pop("outcome")
+    source = tmp_path / "local.json"
+    source.write_text(json.dumps(labels))
+    with pytest.raises(ValueError):
+        load_episode_annotations(source)
+    with pytest.raises(ValueError):
+        split_collection_annotations([source], tmp_path / "strict.json")
+    result = split_collection_annotations(
+        [source], tmp_path / "excluded.json", skip_unlabeled=True
+    )
+    kept = load_episode_annotations(result)
+    assert len(kept["episodes"]) == 3
+    assert len(kept["excluded_episodes"]) == 1
+    assert kept["excluded_episodes"][0]["episode"] == 0
+
+
+@pytest.mark.parametrize("field", ["next", "rewards", "terminated", "discount_steps"])
+def test_piper_warmup_local_cache_rejects_global_edges_and_rewards(
+    piper_local_warmup_cache, field
+):
+    from rlinf.data.datasets.rlt_warmup import (
+        CachedRLTReplay,
+        file_sha256,
+        json_fingerprint,
+    )
+
+    path = piper_local_warmup_cache / "manifest.json"
+    manifest = json.loads(path.read_text())
+    entry = manifest["episodes"][0]
+    shard = piper_local_warmup_cache / entry["file"]
+    with np.load(shard, allow_pickle=False) as src:
+        data = {k: src[k].copy() for k in src.files}
+    data[field][0] = data[field][0] + 1 if field in ("next", "discount_steps") else 0
+    with shard.open("wb") as f:
+        np.savez(f, **data)
+    entry["sha256"] = file_sha256(shard)
+    manifest.pop("content_fingerprint")
+    manifest["content_fingerprint"] = json_fingerprint(manifest)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        CachedRLTReplay(piper_local_warmup_cache)

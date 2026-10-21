@@ -24,6 +24,11 @@ from typing import Any
 
 import numpy as np
 
+from rlinf.data.schema.critical_phase import (
+    SEGMENT_SCORING_PROTOCOL,
+    scored_critical_phase_intervals,
+)
+
 
 @contextmanager
 def collection_lock(output: Path) -> Iterator[None]:
@@ -111,6 +116,17 @@ def load_collection(
         if (output / "summary.json").exists()
         else {}
     )
+    for name in ("run.json", "summary.json"):
+        metadata = (
+            read_collection_json(output / name) if (output / name).exists() else {}
+        )
+        protocol = metadata.get("scoring_protocol")
+        if (name == "run.json" and metadata and protocol is None) or (
+            protocol is not None and protocol != SEGMENT_SCORING_PROTOCOL
+        ):
+            raise ValueError(
+                f"Incompatible scoring protocol in {output / name}; use a new output directory."
+            )
     directories: dict[int, Path] = {}
     for parent in (output, output / "discarded"):
         for directory in parent.glob("episode_*"):
@@ -181,21 +197,18 @@ def load_collection(
             trial["outcome"] = "interrupted"
             trial["recovery_note"] = "Interrupted before scoring or recording commit."
         if trial["outcome"] in ("success", "failure"):
+            if trial.get("scoring_protocol") != SEGMENT_SCORING_PROTOCOL:
+                raise ValueError(
+                    f"Legacy episode-only scoring cannot resume under segment scoring: {result_path}. "
+                    "Keep the original collection and start a new output directory."
+                )
             steps = trial.get("completed_steps")
             if not isinstance(steps, int) or steps < 0:
                 raise ValueError(f"Invalid episode length: {result_path}")
             if not isinstance(trial["critical_phases"], list):
                 raise ValueError(f"Invalid critical phase list: {result_path}")
-            previous_end = 0
-            for phase in trial.get("critical_phases", []):
-                start, end = phase.get("start"), phase.get("end")
-                if not (
-                    isinstance(start, int)
-                    and isinstance(end, int)
-                    and previous_end <= start < end <= steps
-                ):
-                    raise ValueError(f"Invalid critical phase: {result_path}")
-                previous_end = end
+            if trial["critical_phases"]:
+                scored_critical_phase_intervals(trial["critical_phases"], steps)
             if record_dataset:
                 _validate_recording(directory, trial)
             retained += 1

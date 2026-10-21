@@ -25,6 +25,10 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.data.schema.critical_phase import (
+    SEGMENT_PHASE_DEFINITION,
+    SEGMENT_SCORING_PROTOCOL,
+)
 from rlinf.robotics.piper_collection import collection_lock, read_collection_json
 
 
@@ -32,6 +36,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse a new run or restore collection settings with explicit overrides."""
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.set_defaults(scoring_protocol=SEGMENT_SCORING_PROTOCOL)
     parser.add_argument("command", choices=("infer", "rollout"))
     parser.add_argument(
         "--checkpoint",
@@ -42,11 +47,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--actor", type=Path, help="Optional RLT Stage 2 actor checkpoint"
     )
+    parser.add_argument(
+        "--actor-mode",
+        choices=("always", "manual-critical"),
+        default="always",
+        help="manual-critical: b selects actor, s/f returns to reference; reference and actor keep their own horizons",
+    )
+    parser.add_argument(
+        "--allow-offline-actor",
+        action="store_true",
+        help="Explicitly test a shared offline-local actor whose readiness has not passed; requires manual-critical mode",
+    )
+    parser.add_argument(
+        "--infer-actor",
+        action="store_true",
+        help="With manual-critical mode, select actor for an offline infer command (default reference)",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--task", help="Training task text; infer defaults to the dataset task"
     )
     parser.add_argument("--dataset", type=Path, help="Local LeRobot dataset for infer")
+    parser.add_argument(
+        "--video-backend",
+        default="pyav",
+        choices=("pyav", "torchcodec"),
+        help="Decoder for hardware-free dataset inference",
+    )
     parser.add_argument(
         "--frame", type=int, default=0, help="Global dataset sample index"
     )
@@ -69,7 +96,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Right starts/confirms completion; s/f scores; Left stops and discards the current episode",
+        help="Right starts/stops an episode or confirms completion; b starts a segment; s/f scores the segment, then separately the stopped episode; Left discards",
     )
     parser.add_argument(
         "--reset-after-episode",
@@ -86,7 +113,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--record-dataset",
         action="store_true",
-        help="Record every RGB/state/command plus terminal observation; b alternates critical phase start/end",
+        help="Record every RGB/state/command plus terminal observation; b starts a critical segment, s/f ends and scores it",
     )
     parser.add_argument(
         "--streaming-video",
@@ -96,7 +123,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase-definition",
-        default="Each pair of b presses marks a critical interval; s/f ends the task.",
+        default=SEGMENT_PHASE_DEFINITION,
         help="Shared annotation rule for these trials",
     )
     parser.add_argument(
@@ -170,6 +197,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 or saved.get("interactive") is not True
             ):
                 raise ValueError("--resume requires an existing interactive rollout.")
+            if saved.get("scoring_protocol") != SEGMENT_SCORING_PROTOCOL:
+                raise ValueError(
+                    "Legacy episode-only collection cannot resume with segment scoring. "
+                    "Preserve it and use a new --output-dir."
+                )
             if not (output / "hardware.yaml").is_file():
                 raise ValueError(
                     f"Missing hardware snapshot: {output / 'hardware.yaml'}"
@@ -213,6 +245,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--interactive only applies to rollout.")
     if args.backend == "cfg" and args.actor is not None:
         parser.error("--actor is only used by the rlt backend.")
+    if args.actor_mode == "manual-critical":
+        if args.backend != "rlt" or args.actor is None:
+            parser.error(
+                "--actor-mode manual-critical requires --actor with the rlt backend."
+            )
+        if args.command == "rollout" and not args.interactive:
+            parser.error("Manual critical rollout requires --interactive.")
+    if args.allow_offline_actor and args.actor_mode != "manual-critical":
+        parser.error("--allow-offline-actor requires --actor-mode manual-critical.")
+    if args.infer_actor and (
+        args.command != "infer" or args.actor_mode != "manual-critical"
+    ):
+        parser.error("--infer-actor requires infer with --actor-mode manual-critical.")
     if args.record_dataset and (not args.interactive or args.command != "rollout"):
         parser.error("--record-dataset requires interactive rollout.")
     if args.record_dataset and args.backend != "rlt":
@@ -332,7 +377,13 @@ def _run(args: argparse.Namespace, output: Path) -> None:
                     )
     torch.manual_seed(args.seed)
     policy = (
-        PiperRLTPolicy(args.checkpoint, actor=args.actor, device=args.device)
+        PiperRLTPolicy(
+            args.checkpoint,
+            actor=args.actor,
+            device=args.device,
+            manual_critical=args.actor_mode == "manual-critical",
+            allow_offline_actor=args.allow_offline_actor,
+        )
         if args.backend == "rlt"
         else PiperCFGPolicy(args.checkpoint, device=args.device)
     )
@@ -350,12 +401,21 @@ def _run(args: argparse.Namespace, output: Path) -> None:
         from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch
 
         root = args.dataset.expanduser().resolve()
-        dataset = LeRobotDataset(root.name, root=root, download_videos=False)
+        dataset = LeRobotDataset(
+            root.name,
+            root=root,
+            download_videos=False,
+            video_backend=args.video_backend,
+        )
         dataset.hf_dataset.set_transform(decode_image_struct_batch)
         sample = dataset[args.frame]
         task = args.task or sample["task"]
         started = time.monotonic()
-        actions = policy.infer(sample, task)
+        actions = (
+            policy.infer(sample, task, actor_enabled=args.infer_actor)
+            if args.actor_mode == "manual-critical"
+            else policy.infer(sample, task)
+        )
         result = {
             "task": task,
             "frame": args.frame,
@@ -390,7 +450,7 @@ def _run(args: argparse.Namespace, output: Path) -> None:
             print(
                 "Interactive evaluation enables the follower after cameras connect, "
                 f"then waits for Right. Reset after trial: {args.reset_after_episode}. "
-                "Keep this terminal focused; b alternates critical phase start/end; s/f stops and scores a trial; Left stops and discards it.",
+                "Keep this terminal focused: b starts a segment; s/f ends and scores only that segment while actions continue. Right stops the episode for a separate s/f score; Left stops and discards it.",
                 flush=True,
             )
             try:

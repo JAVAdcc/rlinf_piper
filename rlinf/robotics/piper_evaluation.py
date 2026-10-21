@@ -28,8 +28,18 @@ from typing import Any, Protocol, TextIO
 
 import numpy as np
 
+from rlinf.data.schema.critical_phase import (
+    SEGMENT_LABEL_FORMAT,
+    SEGMENT_PHASE_DEFINITION,
+    SEGMENT_SCORING_PROTOCOL,
+)
 from rlinf.robotics.piper_reset import PiperResetTiming, reset_piper
-from rlinf.robotics.piper_runtime import ChunkPolicy, PiperSession, rollout_piper
+from rlinf.robotics.piper_runtime import (
+    ChunkPolicy,
+    PiperPolicySelection,
+    PiperSession,
+    rollout_piper,
+)
 
 
 class EvaluationKeys(Protocol):
@@ -123,7 +133,7 @@ def evaluate_piper(
     save_observations: bool = False,
     record_dataset: bool = False,
     streaming_video: bool = True,
-    phase_definition: str = "Each pair of b presses marks a critical interval; s/f ends the task.",
+    phase_definition: str = SEGMENT_PHASE_DEFINITION,
     session_id: str | None = None,
     reset_after_episode: str = "none",
     reset_timing: PiperResetTiming = PiperResetTiming(),
@@ -133,10 +143,11 @@ def evaluate_piper(
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
 
-    Right starts a trial; b alternates phase start/end; s/f scores and stops it.
-    At the step limit, wait for a label without sending further actions. Errors
-    abort the whole run. Unscored trials are excluded from the success rate.
-    Scoring closes an active final phase at the terminal observation frame.
+    Right starts a trial; b starts a segment; s/f closes and scores that segment
+    while the episode continues. Right during execution or the step limit stops
+    actions. Score any still-open segment first, then score the episode with a
+    separate s/f input batch. Errors abort the run; unscored trials are excluded
+    from the success rate. Local results never determine the episode score.
     Left stops and discards the active trial, including while waiting for a score.
     After stopping, Left can discard that trial until Right starts another one.
     After the requested retained count, Right confirms completion; Left retries.
@@ -192,6 +203,7 @@ def evaluate_piper(
             x["outcome"] == "success" and not x.get("takeovers", 0) for x in scored
         )
         summary = {
+            "scoring_protocol": SEGMENT_SCORING_PROTOCOL,
             "status": status,
             "requested_episodes": num_episodes,
             "completed_episodes": len(scored),
@@ -214,13 +226,19 @@ def evaluate_piper(
             summary["recorded_episodes"] = len(collected)
             summary["phase_labeled_episodes"] = sum(
                 bool(x["critical_phases"])
-                and all(phase["end"] is not None for phase in x["critical_phases"])
+                and all(
+                    phase["end"] is not None
+                    and phase.get("outcome") in ("success", "failure")
+                    for phase in x["critical_phases"]
+                )
                 for x in collected
             )
             _write_json(
                 output / "annotations.json",
                 {
-                    "format": "piper-rlt-episodes-v2",
+                    "format": SEGMENT_LABEL_FORMAT,
+                    "scoring_protocol": SEGMENT_SCORING_PROTOCOL,
+                    "reward_scope": "critical_segment",
                     "task": task,
                     "phase_definition": phase_definition,
                     "test_only": False,
@@ -305,10 +323,12 @@ def evaluate_piper(
                         on_tick=on_tick,
                     )
                 trial["reset"].update(completed_reset, status="complete")
-                trial["reset"]["attempts"].append({
-                    "log": log_name,
-                    "status": "complete",
-                })
+                trial["reset"]["attempts"].append(
+                    {
+                        "log": log_name,
+                        "status": "complete",
+                    }
+                )
                 notify("reset_done")
                 print(
                     "Reset trajectory complete. Check the pose, restore the scene, then press Right.",
@@ -321,11 +341,13 @@ def evaluate_piper(
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 trial["reset"].update(status="error", error=error)
-                trial["reset"]["attempts"].append({
-                    "log": log_name,
-                    "status": "error",
-                    "error": error,
-                })
+                trial["reset"]["attempts"].append(
+                    {
+                        "log": log_name,
+                        "status": "error",
+                        "error": error,
+                    }
+                )
                 _write_json(episode_dir / "result.json", trial)
                 summarize("reset_failed")
                 notify("reset_failed")
@@ -486,6 +508,7 @@ def evaluate_piper(
                 episode_dir = output / f"episode_{attempt_number:03d}"
                 episode_dir.mkdir(exist_ok=False)
                 result = {
+                    "scoring_protocol": SEGMENT_SCORING_PROTOCOL,
                     "episode": number,
                     "attempt": attempt_number,
                     "outcome": "unscored",
@@ -500,29 +523,72 @@ def evaluate_piper(
                 summarize("running_episode")
                 started = time.monotonic()
                 print(
-                    f"[{number}/{num_episodes}] Running: b = enter/exit critical phase, s = success, f = failure; Left discards this trial; q exits.",
+                    f"[{number}/{num_episodes}] Running: b starts a segment; s/f ends and scores only that segment. Right stops the episode for separate scoring; Left discards; q exits.",
                     flush=True,
                 )
                 notify("started", number)
                 post_episode_keys = []
+                selection = (
+                    PiperPolicySelection()
+                    if getattr(policy, "manual_critical", False)
+                    else None
+                )
 
                 def critical_active() -> bool:
                     phases = result["critical_phases"]
                     return bool(phases) and phases[-1]["end"] is None
 
+                def score_segment(completed: int, key: str) -> None:
+                    if selection is not None:
+                        selection.set_critical(False)
+                    phase = result["critical_phases"][-1]
+                    if completed == phase["start"]:
+                        # An observation with no action cannot define a training segment.
+                        result["critical_phases"].pop()
+                        _write_json(episode_dir / "result.json", result)
+                        notify("critical_empty")
+                        print(
+                            "No segment action executed; removing the empty marker.",
+                            flush=True,
+                        )
+                    else:
+                        phase.update(
+                            end=completed,
+                            outcome="success" if key == "s" else "failure",
+                        )
+                        _write_json(episode_dir / "result.json", result)
+                        notify(
+                            "critical_" + phase["outcome"],
+                            len(result["critical_phases"]),
+                        )
+                        print(
+                            f"Critical segment {len(result['critical_phases'])}: {phase['outcome']}, "
+                            f"actions [{phase['start']}, {completed}); episode remains unscored.",
+                            flush=True,
+                        )
+
+                def discard_pressed(pressed: list[str]) -> bool:
+                    if "left" not in pressed:
+                        return False
+                    # Discard wins over labels, takeover and Right in the same batch.
+                    if recorder is not None:
+                        recorder.request_discard()
+                    discard_trial(result)
+                    post_episode_keys.extend(key for key in pressed if key == "q")
+                    return True
+
                 def stop(completed: int) -> bool:
                     result["completed_steps"] = completed
                     pressed = keys.poll()
-                    if "left" in pressed:
-                        # Discard wins over labels/takeover in the same input batch.
-                        if recorder is not None:
-                            recorder.request_discard()
-                        discard_trial(result)
-                        post_episode_keys.extend(key for key in pressed if key == "q")
+                    if discard_pressed(pressed):
                         return True
-                    for key_index, key in enumerate(pressed):
-                        if key == "q":
-                            raise KeyboardInterrupt
+                    if "q" in pressed:
+                        raise KeyboardInterrupt
+                    if "right" in pressed:
+                        # Same-batch scores cannot also score the stopped episode.
+                        result["stop_reason"] = "operator"
+                        return True
+                    for key in pressed:
                         if (
                             control is not None
                             and key == control.config.key
@@ -542,18 +608,20 @@ def evaluate_piper(
                         if key == "b":
                             phases = result["critical_phases"]
                             if critical_active():
-                                if completed == phases[-1]["start"]:
-                                    notify("critical_empty")
-                                    print(
-                                        "No action since phase start; ignoring an empty end marker.",
-                                        flush=True,
-                                    )
-                                    continue
-                                phases[-1]["end"] = completed
-                                event = "ended"
+                                notify("waiting_segment_score")
+                                print(
+                                    "Segment already active; use s/f to end and score it.",
+                                    flush=True,
+                                )
+                                continue
                             elif completed < steps:
-                                phases.append({"start": completed, "end": None})
-                                event = "started"
+                                phases.append(
+                                    {
+                                        "start": completed,
+                                        "end": None,
+                                        "outcome": "unscored",
+                                    }
+                                )
                             else:
                                 notify("phase_limit")
                                 print(
@@ -562,45 +630,87 @@ def evaluate_piper(
                                 )
                                 continue
                             _write_json(episode_dir / "result.json", result)
-                            notify(
-                                "critical_on" if critical_active() else "critical_off",
-                                len(phases),
-                            )
+                            notify("critical_on", len(phases))
+                            if selection is not None:
+                                selection.set_critical(True)
                             print(
-                                f"Critical phase {len(phases)} {event} at frame {completed}; "
-                                f"critical={'ON' if critical_active() else 'OFF'}.",
+                                f"Critical segment {len(phases)} started at frame {completed}.",
                                 flush=True,
                             )
                         if key in ("s", "f"):
-                            result["outcome"] = "success" if key == "s" else "failure"
-                            phase_event = None
                             if critical_active():
-                                phases = result["critical_phases"]
-                                if phases[-1]["start"] < completed:
-                                    phases[-1]["end"] = completed
-                                    phase_event = "critical_closed"
-                                    print(
-                                        f"Critical phase {len(phases)} automatically ended at terminal frame {completed}.",
-                                        flush=True,
-                                    )
-                                else:
-                                    phases.pop()
-                                    phase_event = "critical_empty"
-                                    print(
-                                        "No action after the last b marker; discarding the empty phase.",
-                                        flush=True,
-                                    )
-                            _write_json(episode_dir / "result.json", result)
-                            if phase_event is not None:
-                                notify(phase_event)
-                            notify(result["outcome"], number)
-                            post_episode_keys.extend(
-                                key
-                                for key in pressed[key_index + 1 :]
-                                if key in ("left", "q")
-                            )
-                            return True
+                                score_segment(completed, key)
+                            else:
+                                notify("no_active_segment")
+                                print(
+                                    "No active segment. Right stops the episode for separate s/f scoring.",
+                                    flush=True,
+                                )
+                            # No repeated score or b in this input batch creates another label.
+                            return False
                     return False
+
+                def score_stopped_episode() -> None:
+                    """Score frozen end observations without executing another action."""
+                    episode_score_armed = (
+                        result.get("stop_reason") == "operator"
+                        and not critical_active()
+                    )
+                    while result["outcome"] == "unscored":
+                        segment_pending = critical_active()
+                        summarize(
+                            "waiting_for_segment_score"
+                            if segment_pending
+                            else "waiting_for_score"
+                        )
+                        notify(
+                            "waiting_segment_score"
+                            if segment_pending
+                            else (
+                                "waiting_score"
+                                if episode_score_armed
+                                else "confirm_episode_score"
+                            )
+                        )
+                        print(
+                            "Episode stopped; s/f scores the open SEGMENT first; Left discards."
+                            if segment_pending
+                            else (
+                                "Episode stopped; s/f scores the WHOLE EPISODE; Left discards."
+                                if episode_score_armed
+                                else "Episode stopped; press Right to enter WHOLE EPISODE scoring; repeated s/f is ignored."
+                            ),
+                            flush=True,
+                        )
+                        while True:
+                            pressed = keys.poll()
+                            if discard_pressed(pressed):
+                                return
+                            if "q" in pressed:
+                                raise KeyboardInterrupt
+                            if "right" in pressed:
+                                if not segment_pending and not episode_score_armed:
+                                    episode_score_armed = True
+                                    break
+                                # Right never doubles as a local/global score.
+                                time.sleep(0.02)
+                                continue
+                            if not segment_pending and not episode_score_armed:
+                                time.sleep(0.02)
+                                continue
+                            score = next((k for k in pressed if k in ("s", "f")), None)
+                            if score is not None:
+                                if segment_pending:
+                                    score_segment(result["completed_steps"], score)
+                                else:
+                                    result["outcome"] = (
+                                        "success" if score == "s" else "failure"
+                                    )
+                                    _write_json(episode_dir / "result.json", result)
+                                    notify(result["outcome"], number)
+                                # A segment score and episode score require separate polls.
+                                break
+                            time.sleep(0.02)
 
                 recorder = None
                 quit_requested = False
@@ -661,23 +771,21 @@ def evaluate_piper(
                             manage_session=False,
                             policy_source=policy_source,
                             on_policy_resume=lambda: notify("policy_resumed"),
+                            policy_selection=selection,
                         )
                     result["action_duration_s"] = time.monotonic() - started
                     # Capture before scoring waits or reset can change the scene.
+                    terminal_wall_time = time.time()
                     terminal_observation = (
                         session.observe()
                         if recorder is not None and result["outcome"] != "discarded"
                         else None
                     )
+                    if terminal_observation is not None:
+                        result["terminal_observation_wall_time"] = terminal_wall_time
                     if result["outcome"] == "unscored":
-                        summarize("waiting_for_score")
-                        notify("waiting_score")
-                        print(
-                            "Step limit reached; holding. Press s/f to score, or Left to discard.",
-                            flush=True,
-                        )
-                        while not stop(result["completed_steps"]):
-                            time.sleep(0.02)
+                        result.setdefault("stop_reason", "step_limit")
+                        score_stopped_episode()
                     if recorder is not None and result["outcome"] == "discarded":
                         result["recording"] = {"status": "discarded"}
                     elif recorder is not None:
@@ -691,6 +799,7 @@ def evaluate_piper(
                             terminal_observation,
                             critical=critical_active(),
                             outcome=result["outcome"],
+                            wall_time=terminal_wall_time,
                             poll=poll_after_episode,
                         )
                         result["save_duration_s"] = time.monotonic() - save_started

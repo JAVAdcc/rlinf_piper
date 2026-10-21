@@ -28,7 +28,10 @@ from rlinf.data.datasets.rlt_warmup import (
     CachedRLTReplay,
     directory_lock,
     file_sha256,
+    implementation_fingerprints,
     json_fingerprint,
+    runtime_source_fingerprints,
+    runtime_versions,
     write_json,
 )
 from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
@@ -95,6 +98,9 @@ class WarmupConfig:
     threads: int = 4
     chunk_length: int = 10
     stride: int = 10
+    video_backend: str = "torchcodec"
+    phase_filter: int | None = None
+    critic_action_projection: str = "none"
     training: WarmupTraining = field(default_factory=WarmupTraining)
     validation: WarmupValidation = field(default_factory=WarmupValidation)
 
@@ -111,7 +117,6 @@ def load_warmup_config(path: str | Path, overrides: list[str] = ()) -> WarmupCon
     for key in (
         "bc_steps",
         "critic_steps",
-        "joint_steps",
         "actor_every",
         "batch_size",
         "eval_every",
@@ -120,8 +125,20 @@ def load_warmup_config(path: str | Path, overrides: list[str] = ()) -> WarmupCon
     ):
         if getattr(cfg.training, key) <= 0:
             raise ValueError(f"training.{key} must be positive.")
+    if cfg.training.joint_steps < 0:
+        raise ValueError(
+            "training.joint_steps must be nonnegative; zero stops before joint."
+        )
     if cfg.threads <= 0 or cfg.seed < 0 or not 0 < cfg.stride <= cfg.chunk_length:
         raise ValueError("Invalid threads, seed or cache stride/chunk length.")
+    if cfg.video_backend not in ("torchcodec", "pyav"):
+        raise ValueError("video_backend must be torchcodec or pyav.")
+    if cfg.phase_filter is not None and (
+        type(cfg.phase_filter) is not int or cfg.phase_filter < 0
+    ):
+        raise ValueError("phase_filter must be a nonnegative ordinal or null.")
+    if cfg.critic_action_projection not in ("none", "driver_limits"):
+        raise ValueError("critic_action_projection must be none or driver_limits.")
     for key in ("learning_rate", "grad_clip", "bc_start", "bc_end"):
         if (
             not np.isfinite(getattr(cfg.training, key))
@@ -153,10 +170,26 @@ def action_mask(lengths: torch.Tensor, chunk: int) -> torch.Tensor:
 
 
 def discounted_target(batch: dict, next_q: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Include reference-controlled gaps; reward occurs only at the task terminal."""
+    """Discount actual ticks to the reward endpoint specified by the cache."""
     ticks = batch["discount_steps"]
     returns = batch["rewards"] * gamma ** (ticks - 1)
     return returns + (~batch["terminated"]) * gamma**ticks * next_q
+
+
+def actor_training_observation(batch: dict) -> dict:
+    """Condition actor learning on executed human corrections at valid ticks.
+
+    Keep cached VLA references intact for next-state policy evaluation and
+    deployment-style validation. Reference dropout is applied by the actor
+    after this replacement.
+    """
+    chunk = batch["actions"].shape[1]
+    reference = batch["curr_obs"]["ref_chunk"].clone()
+    human = batch["human"] & action_mask(batch["valid_steps"], chunk)
+    reference[:, :chunk] = torch.where(
+        human[..., None], batch["actions"], reference[:, :chunk]
+    )
+    return {**batch["curr_obs"], "ref_chunk": reference}
 
 
 def masked_behavior_loss(predicted: torch.Tensor, batch: dict) -> torch.Tensor:
@@ -200,7 +233,9 @@ class RLTWarmupRunner:
         torch.set_float32_matmul_precision("high")
         torch.manual_seed(cfg.seed)
         self.device = torch.device(cfg.device)
-        self.replay = CachedRLTReplay(cfg.cache, seed=cfg.seed)
+        self.replay = CachedRLTReplay(
+            cfg.cache, seed=cfg.seed, phase_filter=cfg.phase_filter
+        )
         if self.replay.manifest["chunk_length"] != cfg.chunk_length:
             raise ValueError("Config chunk_length disagrees with cache.")
         self.hardware = OmegaConf.to_container(
@@ -218,6 +253,20 @@ class RLTWarmupRunner:
         )
 
         self.codec = PiperActionCodec(self.replay.path / "norm_stats.json")
+        from rlinf.robotics.parts.arms.piper import PiperArm
+
+        driver_bounds = np.stack(
+            (
+                np.r_[np.rad2deg(PiperArm.JOINT_LIMITS_LOWER), 0.0],
+                np.r_[
+                    np.rad2deg(PiperArm.JOINT_LIMITS_UPPER),
+                    self.execution.gripper_max_width_m * 1000,
+                ],
+            )
+        )
+        self.driver_action_bounds = torch.as_tensor(
+            self.codec.encode(driver_bounds), dtype=torch.float32, device=self.device
+        )
         model_cfg = {
             k: v
             for k, v in self.replay.manifest["model"].items()
@@ -247,7 +296,25 @@ class RLTWarmupRunner:
                 "threads": cfg.threads,
                 "cache": self.replay.manifest["content_fingerprint"],
                 "hardware": self.hardware,
-                "implementation": file_sha256(__file__),
+                "phase_filter": cfg.phase_filter,
+                "critic_action_projection": cfg.critic_action_projection,
+                "driver_action_bounds": self.driver_action_bounds.cpu().tolist(),
+                "implementation": implementation_fingerprints(
+                    [
+                        "rlinf/runners/rlt_warmup_runner.py",
+                        "rlinf/data/datasets/rlt_warmup.py",
+                        "rlinf/data/schema/critical_phase.py",
+                        "rlinf/models/embodiment/mlp_policy",
+                        "rlinf/models/embodiment/base_policy.py",
+                        "rlinf/models/embodiment/modules/q_head.py",
+                        "rlinf/models/embodiment/modules/utils.py",
+                        "rlinf/models/embodiment/openpi/policies/piper_policy.py",
+                        "rlinf/robotics/piper_runtime.py",
+                        "rlinf/robotics/parts/arms/piper.py",
+                    ]
+                ),
+                "runtime_versions": runtime_versions(),
+                "runtime_source_sha256": runtime_source_fingerprints(),
             }
         )
 
@@ -271,10 +338,23 @@ class RLTWarmupRunner:
         )
         chunk = batch["actions"].shape[1]
         actions = (
-            actions.reshape_as(batch["actions"])
+            self.critic_actions(actions.reshape_as(batch["actions"]))
             * action_mask(batch["next_valid_steps"], chunk)[..., None]
         )
         return self.target.sac_q_forward(batch["next_obs"], actions).min(-1).values
+
+    def critic_actions(self, proposed: torch.Tensor) -> torch.Tensor:
+        """Project Q inputs to sent targets, retaining raw actor outputs for BC.
+
+        Affine quantile normalization makes this equivalent to decode, driver
+        joint/gripper clipping, then encode. Apply padding masks afterwards.
+        Clamp gradients are zero outside limits; no straight-through substitute.
+        """
+        if self.cfg.critic_action_projection == "none":
+            return proposed
+        return proposed.clamp(
+            min=self.driver_action_bounds[0], max=self.driver_action_bounds[1]
+        )
 
     def update(self) -> dict:
         """Consume one training batch, respecting actor-only and critic-only phases."""
@@ -294,7 +374,7 @@ class RLTWarmupRunner:
             q = self.model.sac_q_forward(batch["curr_obs"], batch["actions"])
             loss = (q - target[:, None]).square().mean()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.critic_params, t.grad_clip, error_if_nonfinite=True
             )
             self.critic_optimizer.step()
@@ -305,6 +385,7 @@ class RLTWarmupRunner:
                     target_param.lerp_(param, t.tau)
             self.critic_steps += 1
             metrics["critic_loss"] = float(loss.detach())
+            metrics["critic_grad_norm"] = float(critic_grad_norm)
         joint_step = next_step - t.bc_steps - t.critic_steps
         if phase == "actor_bc" or (
             phase == "joint" and joint_step % t.actor_every == 0
@@ -317,7 +398,7 @@ class RLTWarmupRunner:
             self.model.q_head.requires_grad_(False)
             try:
                 predicted, _, _ = self.model.sac_forward(
-                    batch["curr_obs"],
+                    actor_training_observation(batch),
                     deterministic=phase == "actor_bc",
                     apply_reference_dropout=phase == "joint",
                     reference_dropout_prob=dropout,
@@ -326,7 +407,7 @@ class RLTWarmupRunner:
                 actor_loss = bc_weight * bc
                 if phase == "joint":
                     masked = (
-                        predicted.reshape_as(batch["actions"])
+                        self.critic_actions(predicted.reshape_as(batch["actions"]))
                         * action_mask(batch["valid_steps"], self.cfg.chunk_length)[
                             ..., None
                         ]
@@ -339,7 +420,7 @@ class RLTWarmupRunner:
                         ].mean()
                     )
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.actor_params, t.grad_clip, error_if_nonfinite=True
                 )
                 self.actor_optimizer.step()
@@ -352,6 +433,7 @@ class RLTWarmupRunner:
                 reference_dropout=dropout,
                 bc_weight=bc_weight,
                 q_weight=q_weight,
+                actor_grad_norm=float(actor_grad_norm),
             )
         self.step = next_step
         return metrics
@@ -425,11 +507,17 @@ class RLTWarmupRunner:
         # Any metrics after the durable checkpoint belong to the interrupted attempt.
         log = self.output / "metrics.jsonl"
         if log.exists():
-            rows = [
-                json.loads(line)
-                for line in log.read_text().splitlines()
-                if line.strip()
-            ]
+            rows = []
+            lines = log.read_text().splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    if index != len(lines) - 1 or line.endswith("\n"):
+                        raise
+                    logger.warning("Discarding an interrupted final metrics record.")
             log.write_text(
                 "".join(
                     json.dumps(row) + "\n" for row in rows if row["step"] <= self.step
@@ -437,18 +525,23 @@ class RLTWarmupRunner:
             )
 
     @torch.inference_mode()
-    def _episode_metrics(self, index: int) -> dict:
+    def _episode_metrics(self, index: int, phase_id: int | None = None) -> dict:
         data = self.replay.episodes[index]
-        count = len(data["current"])
+        eligible = self.replay.selected_rows[index]
+        if phase_id is not None:
+            eligible = eligible[data["phase_id"][eligible].numpy() == phase_id]
+        count = len(eligible)
         rows = np.unique(
             np.r_[
-                np.linspace(
-                    0,
-                    count - 1,
-                    min(count, self.cfg.validation.max_rows_per_episode),
-                    dtype=int,
-                ),
-                data["terminated"].nonzero().flatten().numpy(),
+                eligible[
+                    np.linspace(
+                        0,
+                        count - 1,
+                        min(count, self.cfg.validation.max_rows_per_episode),
+                        dtype=int,
+                    )
+                ],
+                eligible[data["terminated"][eligible].numpy()],
             ]
         ).tolist()
         batch = self.replay.batch([index] * len(rows), rows, self.device)
@@ -457,7 +550,7 @@ class RLTWarmupRunner:
         mask = action_mask(batch["valid_steps"], self.cfg.chunk_length)
         q = self.model.sac_q_forward(batch["curr_obs"], batch["actions"])
         actor_q = self.model.sac_q_forward(
-            batch["curr_obs"], predicted * mask[..., None]
+            batch["curr_obs"], self.critic_actions(predicted) * mask[..., None]
         )
         next_q = self._next_q(batch, deterministic=True)
         td_target = discounted_target(batch, next_q, self.cfg.training.gamma)
@@ -469,12 +562,30 @@ class RLTWarmupRunner:
         reference = batch["curr_obs"]["ref_chunk"][:, : self.cfg.chunk_length]
         policy_mask = mask & ~batch["human"]
         errors = (predicted - reference).square().mean(-1)[policy_mask]
+        human_mask = mask & batch["human"]
+        human_errors = (predicted - batch["actions"]).square().mean(-1)[human_mask]
         all_q = torch.cat((q, actor_q))
         v = self.cfg.validation
         values = {
             "episode": index,
-            "outcome": self.replay.manifest["episodes"][index]["outcome"],
+            "phase_id": phase_id,
+            "outcome": self.replay.manifest["episodes"][index]["outcome"]
+            if phase_id is None
+            else self.replay.manifest["episodes"][index]["critical_phases"][phase_id][
+                "outcome"
+            ],
+            "sampled_rows": len(rows),
+            "actor_projection_fraction": float(
+                (
+                    (self.critic_actions(predicted) - predicted).abs().amax(-1)[mask]
+                    > 1e-6
+                )
+                .float()
+                .mean()
+            ),
             "actor_mse": float(errors.mean()) if errors.numel() else None,
+            "human_mse": float(human_errors.mean()) if human_errors.numel() else None,
+            "human_ticks": int(human_mask.sum()),
             "td_mse": float(
                 (q.min(-1).values[~terminal] - td_target[~terminal]).square().mean()
             )
@@ -526,9 +637,13 @@ class RLTWarmupRunner:
 
     def validate(self) -> dict:
         """Evaluate fixed episode rows without consuming training RNG or samples."""
-        train = [self._episode_metrics(i) for i in self.replay.splits["train"]]
+        train = [
+            self._episode_metrics(i, phase)
+            for i, phase in self.replay.metric_groups("train")
+        ]
         validation = [
-            self._episode_metrics(i) for i in self.replay.splits["validation"]
+            self._episode_metrics(i, phase)
+            for i, phase in self.replay.metric_groups("validation")
         ]
 
         def mean(rows, key):
@@ -592,6 +707,86 @@ class RLTWarmupRunner:
         )
         tc, vc = self.replay.counts("train"), self.replay.counts("validation")
         v = self.cfg.validation
+        by_phase = {}
+        for phase in sorted(
+            {
+                row["phase_id"]
+                for row in train + validation
+                if row["phase_id"] is not None
+            }
+        ):
+            tr = [r for r in train if r["phase_id"] == phase]
+            va = [r for r in validation if r["phase_id"] == phase]
+            by_phase[str(phase)] = {
+                "train_counts": {
+                    o: sum(r["outcome"] == o for r in tr)
+                    for o in ("success", "failure")
+                },
+                "validation_counts": {
+                    o: sum(r["outcome"] == o for r in va)
+                    for o in ("success", "failure")
+                },
+                "actor_rmse": rmse(va, "actor_mse"),
+                "td_rmse": rmse(va, "td_mse"),
+                "train_td_rmse": rmse(tr, "td_mse"),
+                "terminal_rmse_observed": rmse(va, "terminal_mse"),
+                "terminal_rmse_by_outcome": {
+                    o: rmse([r for r in va if r["outcome"] == o], "terminal_mse")
+                    for o in ("success", "failure")
+                },
+                "q_gap": mean(va, "q_gap"),
+                "q_in_range_fraction": mean(va, "q_in_range_fraction"),
+            }
+            summary = by_phase[str(phase)]
+            covered_phase = all(
+                summary["validation_counts"][o] > 0 for o in ("success", "failure")
+            )
+            baseline_phase = (
+                float(np.mean([np.mean(r["terminal_targets"]) for r in tr]))
+                if tr
+                else None
+            )
+            summary["both_validation_outcomes"] = covered_phase
+            summary["terminal_rmse_balanced"] = (
+                float(
+                    np.sqrt(
+                        np.mean(
+                            [
+                                summary["terminal_rmse_by_outcome"][o] ** 2
+                                for o in ("success", "failure")
+                            ]
+                        )
+                    )
+                )
+                if covered_phase
+                else None
+            )
+            summary["constant_baseline_rmse_balanced"] = (
+                float(
+                    np.sqrt(
+                        np.mean(
+                            [
+                                np.mean(
+                                    [
+                                        np.mean(
+                                            (
+                                                np.asarray(r["terminal_targets"])
+                                                - baseline_phase
+                                            )
+                                            ** 2
+                                        )
+                                        for r in va
+                                        if r["outcome"] == o
+                                    ]
+                                )
+                                for o in ("success", "failure")
+                            ]
+                        )
+                    )
+                )
+                if covered_phase and baseline_phase is not None
+                else None
+            )
         prior = [
             row["td_rmse"]
             for row in self.history
@@ -628,12 +823,21 @@ class RLTWarmupRunner:
             "q_gap": q_gap <= v.q_gap,
             "q_range": q_range >= v.q_in_range_fraction,
         }
+        if self.replay.reward_scope == "critical_segment":
+            checks["local_phase_coverage"] = all(
+                row["train_counts"][o] >= v.min_train_per_outcome
+                and row["validation_counts"][o] >= v.min_validation_per_outcome
+                for row in by_phase.values()
+                for o in ("success", "failure")
+            )
         return {
             "step": self.step,
             "scheduled": self.step % self.cfg.training.eval_every == 0,
             "passed": all(checks.values()),
             "checks": checks,
             "actor_rmse": actor_rmse,
+            "human_rmse": rmse(validation, "human_mse"),
+            "human_validation_ticks": sum(row["human_ticks"] for row in validation),
             "joint_p95_deg": joint_p95,
             "gripper_p95_mm": gripper_p95,
             "terminal_rmse": terminal_rmse,
@@ -645,6 +849,10 @@ class RLTWarmupRunner:
             "train_counts": tc,
             "validation_counts": vc,
             "by_outcome": by_outcome,
+            "by_phase": by_phase,
+            "reward_scope": self.replay.reward_scope,
+            "phase_filter": self.cfg.phase_filter,
+            "actor_projection_fraction": mean(validation, "actor_projection_fraction"),
             "episodes": validation,
         }
 
@@ -661,9 +869,14 @@ class RLTWarmupRunner:
         write_json(
             directory / "piper_rlt_actor.json",
             {
-                "format": "rlinf-piper-rlt-actor-v1",
+                "format": "rlinf-piper-rlt-offline-local-actor-v1"
+                if self.replay.reward_scope == "critical_segment"
+                else "rlinf-piper-rlt-actor-v1",
                 "stage1_checkpoint_id": self.replay.manifest["stage1"]["checkpoint_id"],
                 "model": self.replay.manifest["model"],
+                "reward_scope": self.replay.reward_scope,
+                "phase_filter": self.cfg.phase_filter,
+                "critic_action_projection": self.cfg.critic_action_projection,
             },
         )
         passed = offline_warmup_passed(
@@ -679,9 +892,12 @@ class RLTWarmupRunner:
             "actor_steps": self.actor_steps,
             "critic_steps": self.critic_steps,
             "offline_validation_passed": passed,
-            "ready_for_deterministic_eval": passed,
+            "ready_for_deterministic_eval": passed
+            and self.replay.reward_scope == "global_episode",
             "ready_for_online_exploration": False,
-            "next_requirement": "Operator-scored deterministic trials and episode-boundary online handoff.",
+            "next_requirement": "Local heads are offline-only; implement and review critical-phase routing before hardware evaluation."
+            if self.replay.reward_scope == "critical_segment"
+            else "Operator-scored deterministic trials and episode-boundary online handoff.",
             "actor": str(directory),
             "weights_sha256": file_sha256(weights),
             "cache_fingerprint": self.replay.manifest["content_fingerprint"],

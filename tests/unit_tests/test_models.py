@@ -1645,6 +1645,93 @@ def test_piper_rlt_actor_metadata_binds_the_exact_stage1(tmp_path):
     assert metadata["model"]["model_type"] == "rlt_mlp_policy"
 
 
+def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from rlinf.models.embodiment import openpi
+    from rlinf.models.embodiment.mlp_policy import get_model
+    from rlinf.models.embodiment.piper_inference import PiperRLTPolicy
+
+    root = _piper_test_checkpoint(tmp_path)
+    stage1 = json.loads((root / "piper_inference.json").read_text())
+    actor_root = tmp_path / "stage2"
+    (actor_root / "model_state_dict").mkdir(parents=True)
+    config = {
+        "model_type": "rlt_mlp_policy",
+        "z_dim": 8,
+        "proprio_dim": 7,
+        "action_dim": 7,
+        "num_action_chunks": 10,
+        "ref_num_action_chunks": 50,
+        "add_q_head": True,
+    }
+    metadata = {
+        "format": "rlinf-piper-rlt-offline-local-actor-v1",
+        "stage1_checkpoint_id": stage1["checkpoint_id"],
+        "reward_scope": "critical_segment",
+        "phase_filter": None,
+        "model": config,
+    }
+    path = actor_root / "piper_rlt_actor.json"
+    path.write_text(json.dumps(metadata))
+    model = get_model(OmegaConf.create(config), torch_dtype=torch.float32)
+    weights = actor_root / "model_state_dict/full_weights.pt"
+    torch.save(model.state_dict(), weights)
+
+    class FeatureModel(torch.nn.Module):
+        action_chunk = 50
+
+        def extract_rlt_obs(self, observation):
+            return {
+                "z_rl": torch.zeros(1, 8),
+                "proprio": torch.zeros(1, 7),
+                "ref_chunk": torch.zeros(1, 50, 7),
+            }
+
+    monkeypatch.setattr(openpi, "get_model", lambda cfg: FeatureModel())
+    with pytest.raises(ValueError, match="experimental opt-in"):
+        PiperRLTPolicy(root, actor=actor_root, device="cpu")
+    policy = PiperRLTPolicy(
+        root,
+        actor=actor_root,
+        device="cpu",
+        manual_critical=True,
+        allow_offline_actor=True,
+    )
+    assert policy.action_horizon == 50 and policy.actor_horizon == 10
+    sample = {"observation.state": np.zeros(7)}
+    for camera in ("front", "front_2", "wrist"):
+        sample[f"observation.images.{camera}"] = np.zeros((8, 9, 3), np.uint8)
+    assert policy.infer(sample, "USB", actor_enabled=False).shape == (50, 7)
+    assert policy.infer(sample, "USB", actor_enabled=True).shape == (10, 7)
+    with pytest.raises(ValueError, match="explicit actor_enabled"):
+        policy.infer(sample, "USB")
+    original_manifest = policy.manifest
+    with torch.no_grad():
+        next(model.parameters()).add_(0.01)
+    torch.save(model.state_dict(), weights)
+    changed = PiperRLTPolicy(
+        root,
+        actor=actor_root,
+        device="cpu",
+        manual_critical=True,
+        allow_offline_actor=True,
+    )
+    assert changed.manifest != original_manifest
+    metadata["phase_filter"] = 0
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="specialist routing"):
+        PiperRLTPolicy(
+            root,
+            actor=actor_root,
+            device="cpu",
+            manual_critical=True,
+            allow_offline_actor=True,
+        )
+
+
 def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.models.embodiment.openpi.policies.piper_policy import PiperActionCodec
@@ -2043,6 +2130,110 @@ def test_piper_warmup_loss_masks_padding_and_discounts_real_ticks():
     torch.testing.assert_close(target, torch.tensor([0.5, 1.0]))
 
 
+def test_piper_warmup_driver_projection_matches_execution_and_has_clamp_gradients(
+    piper_local_warmup_cache, tmp_path
+):
+    from rlinf.robotics.parts.arms.piper import PiperArm
+    from rlinf.runners.rlt_warmup_runner import RLTWarmupRunner, WarmupConfig
+
+    runner = RLTWarmupRunner(
+        WarmupConfig(
+            cache=str(piper_local_warmup_cache),
+            output=str(tmp_path / "run"),
+            device="cpu",
+            critic_action_projection="driver_limits",
+        )
+    )
+    raw = np.array(
+        [
+            [-200, -20, -200, -120, -80, -140, -2],
+            [200, 200, 20, 120, 80, 140, 80],
+            [0, 60, -60, 0, 0, 0, 35],
+        ],
+        dtype=np.float32,
+    )
+    normalized = torch.tensor(runner.codec.encode(raw), requires_grad=True)
+    projected = runner.critic_actions(normalized)
+    low = np.r_[np.rad2deg(PiperArm.JOINT_LIMITS_LOWER), 0]
+    high = np.r_[np.rad2deg(PiperArm.JOINT_LIMITS_UPPER), 70]
+    expected = runner.codec.encode(np.clip(raw, low, high))
+    np.testing.assert_allclose(projected.detach().numpy(), expected, atol=2e-6)
+    projected.sum().backward()
+    assert not normalized.grad[:2].any()
+    assert (normalized.grad[2] == 1).all()
+    batch = runner.replay.batch([0], [0], "cpu")
+    observed = []
+    original = runner.target.sac_q_forward
+
+    def capture(obs, actions):
+        observed.append(actions.detach().clone())
+        return original(obs, actions)
+
+    runner.target.sac_q_forward = capture
+    runner._next_q(batch, deterministic=True)
+    assert not observed[0].any()  # projection happens before terminal padding
+
+
+def test_piper_warmup_local_validation_uses_segment_outcomes_and_offline_export(
+    piper_local_warmup_cache, tmp_path
+):
+    import json
+
+    from rlinf.runners.rlt_warmup_runner import RLTWarmupRunner, WarmupConfig
+
+    runner = RLTWarmupRunner(
+        WarmupConfig(
+            cache=str(piper_local_warmup_cache),
+            output=str(tmp_path / "run"),
+            device="cpu",
+        )
+    )
+    report = runner.validate()
+    assert [
+        (r["episode"], r["phase_id"], r["outcome"]) for r in report["episodes"]
+    ] == [(2, 0, "success"), (2, 1, "failure"), (3, 0, "success")]
+    assert report["by_phase"]["0"]["terminal_rmse_balanced"] is None
+    assert report["by_phase"]["0"]["validation_counts"] == {"success": 2, "failure": 0}
+    assert not report["checks"]["local_phase_coverage"]
+    runner.history.append(report)
+    runner.output.mkdir()
+    exported = runner.export()
+    metadata = json.loads((runner.output / "actor/piper_rlt_actor.json").read_text())
+    assert metadata["format"] == "rlinf-piper-rlt-offline-local-actor-v1"
+    assert not exported["ready_for_deterministic_eval"]
+    filtered = RLTWarmupRunner(
+        WarmupConfig(
+            cache=str(piper_local_warmup_cache),
+            output=str(tmp_path / "filtered"),
+            device="cpu",
+            phase_filter=1,
+        )
+    )
+    assert filtered.binding != runner.binding
+    assert set(filtered.validate()["by_phase"]) == {"1"}
+    runner.replay.selected_rows[0] = runner.replay.selected_rows[0][:1]
+    missing_train_phase = runner.validate()
+    assert missing_train_phase["by_phase"]["1"]["train_counts"] == {
+        "success": 0,
+        "failure": 0,
+    }
+    assert (
+        missing_train_phase["by_phase"]["1"]["constant_baseline_rmse_balanced"] is None
+    )
+    assert not missing_train_phase["checks"]["local_phase_coverage"]
+
+
+def test_piper_warmup_zero_joint_budget_stops_at_critic(tmp_path):
+    from rlinf.runners.rlt_warmup_runner import load_warmup_config
+
+    path = tmp_path / "pre_joint.yaml"
+    path.write_text("training:\n  joint_steps: 0\n")
+    cfg = load_warmup_config(path)
+    assert cfg.training.joint_steps == 0
+    with pytest.raises(ValueError, match="nonnegative"):
+        load_warmup_config(path, ["training.joint_steps=-1"])
+
+
 def test_piper_warmup_target_includes_reference_gaps_and_scores_only_the_task_end():
     from rlinf.runners.rlt_warmup_runner import discounted_target
 
@@ -2054,6 +2245,124 @@ def test_piper_warmup_target_includes_reference_gaps_and_scores_only_the_task_en
     }
     target = discounted_target(batch, torch.tensor([2.0, 100.0]), gamma=0.5)
     torch.testing.assert_close(target, torch.tensor([0.5**12 * 2, 0.5**5]))
+
+
+def test_piper_warmup_human_conditioning_preserves_reference_and_padding():
+    from rlinf.runners.rlt_warmup_runner import actor_training_observation
+
+    reference = torch.full((3, 5, 7), 0.1)
+    batch = {
+        "actions": torch.full((3, 3, 7), 0.6),
+        "curr_obs": {"ref_chunk": reference, "z_rl": torch.ones(3, 2048)},
+        "next_obs": {"ref_chunk": reference},
+        "human": torch.tensor(
+            [[True, False, True], [False, False, False], [True, True, True]]
+        ),
+        "valid_steps": torch.tensor([2, 3, 3]),
+    }
+    observation = actor_training_observation(batch)
+    # Mixed HIL, a reference-only sample and a complete human demonstration.
+    expected = torch.full((3, 5, 7), 0.1)
+    expected[0, 0] = 0.6
+    expected[2, :3] = 0.6
+    torch.testing.assert_close(observation["ref_chunk"], expected)
+    torch.testing.assert_close(reference, torch.full_like(reference, 0.1))
+    torch.testing.assert_close(batch["next_obs"]["ref_chunk"], reference)
+    assert observation["z_rl"] is batch["curr_obs"]["z_rl"]
+
+
+@pytest.mark.parametrize("dropout_end", [0.0, 1.0])
+def test_piper_warmup_updates_use_human_conditioning_and_recorded_critic_actions(
+    piper_warmup_cache, tmp_path, dropout_end
+):
+    import json
+
+    from rlinf.data.datasets.rlt_warmup import file_sha256, json_fingerprint
+    from rlinf.runners.rlt_warmup_runner import (
+        RLTWarmupRunner,
+        WarmupConfig,
+        WarmupTraining,
+    )
+
+    manifest_path = piper_warmup_cache / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for entry in manifest["episodes"]:
+        if entry["split"] != "train":
+            continue
+        path = piper_warmup_cache / entry["file"]
+        with np.load(path) as shard:
+            arrays = {key: shard[key] for key in shard.files}
+        arrays["human"][:, 0] = True
+        arrays["actions"][:, 0] = 0.6
+        np.savez(path, **arrays)
+        entry["sha256"] = file_sha256(path)
+    manifest.pop("content_fingerprint")
+    manifest["content_fingerprint"] = json_fingerprint(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    runner = RLTWarmupRunner(
+        WarmupConfig(
+            cache=str(piper_warmup_cache),
+            output=str(tmp_path / "run"),
+            hardware=str(
+                Path(__file__).resolve().parents[2]
+                / "examples/embodiment/config/piper_usb_hardware.yaml"
+            ),
+            device="cpu",
+            threads=1,
+            training=WarmupTraining(
+                bc_steps=1,
+                critic_steps=1,
+                joint_steps=2,
+                actor_every=1,
+                batch_size=4,
+                dropout_end=dropout_end,
+            ),
+        )
+    )
+    actor_inputs, critic_actions = [], []
+    actor_hook = runner.model.backbone.register_forward_pre_hook(
+        lambda module, args: actor_inputs.append(args[0].detach().clone())
+    )
+    critic_hook = runner.model.q_head.register_forward_pre_hook(
+        lambda module, args: critic_actions.append(args[1].detach().clone())
+    )
+    try:
+        for step in range(1, 5):
+            state = runner.replay.rng_state()
+            batch = runner.replay.sample(4)
+            runner.replay.restore_rng(state)
+            actor_inputs.clear()
+            critic_actions.clear()
+            metrics = runner.update()
+            if step > 1:
+                # Bellman bootstrap uses the VLA proposal at the next state.
+                torch.testing.assert_close(
+                    actor_inputs[0][:, :70],
+                    batch["next_obs"]["ref_chunk"][:, :10].flatten(1),
+                )
+                # The TD loss evaluates actions that were actually recorded.
+                torch.testing.assert_close(
+                    critic_actions[0], batch["actions"].flatten(1)
+                )
+            if step != 2:
+                expected = batch["curr_obs"]["ref_chunk"][:, :10].clone()
+                expected[:, 0] = 0.6
+                if step == 4 and dropout_end == 1.0:
+                    expected.zero_()
+                torch.testing.assert_close(
+                    actor_inputs[-1][:, :70], expected.flatten(1)
+                )
+                assert np.isfinite(metrics["actor_grad_norm"])
+            for episode in runner.replay.episodes:
+                torch.testing.assert_close(
+                    episode["ref_chunk"],
+                    torch.full_like(episode["ref_chunk"], 0.1),
+                )
+    finally:
+        actor_hook.remove()
+        critic_hook.remove()
+    for entry in manifest["episodes"]:
+        assert file_sha256(piper_warmup_cache / entry["file"]) == entry["sha256"]
 
 
 def test_piper_warmup_gate_requires_validation_of_the_exported_update():
@@ -2137,6 +2446,9 @@ def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
     resumed_cfg = copy.deepcopy(cfg)
     resumed_cfg.output = str(tmp_path / "resumed")
     RLTWarmupRunner(resumed_cfg).run(until_step=3)
+    # A killed log write must not invalidate a complete optimizer checkpoint.
+    with (Path(resumed_cfg.output) / "metrics.jsonl").open("a") as log:
+        log.write('{"step": 4, "validation":')
     resumed = RLTWarmupRunner(resumed_cfg)
     restored_report = resumed.run(resume=True)
     assert report["actor_steps"] == restored_report["actor_steps"] == 3
@@ -2151,6 +2463,8 @@ def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
         and not report["ready_for_online_exploration"]
     )
     assert not report["validation"]["checks"]["real_data"]
+    assert "human_rmse" in report["validation"]
+    assert report["validation"]["human_validation_ticks"] >= 0
     metadata = json.loads((Path(report["actor"]) / "piper_rlt_actor.json").read_text())
     exported = get_actor(OmegaConf.create(metadata["model"]), torch_dtype=torch.float32)
     exported.load_state_dict(
@@ -2169,3 +2483,100 @@ def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
     resumed_cfg.training.gamma = 0.9
     with pytest.raises(ValueError, match="config, implementation or cache changed"):
         RLTWarmupRunner(resumed_cfg).run(resume=True)
+
+
+@pytest.mark.parametrize("corruption", ["{broken}\n", '{broken}\n{"step": 9}\n'])
+def test_piper_warmup_resume_rejects_complete_corrupt_log_records(
+    piper_warmup_cache, tmp_path, corruption
+):
+    from rlinf.runners.rlt_warmup_runner import RLTWarmupRunner, WarmupConfig
+
+    cfg = WarmupConfig(
+        cache=str(piper_warmup_cache),
+        output=str(tmp_path / "run"),
+        hardware=str(
+            Path(__file__).resolve().parents[2]
+            / "examples/embodiment/config/piper_usb_hardware.yaml"
+        ),
+        device="cpu",
+        threads=1,
+    )
+    RLTWarmupRunner(cfg).run(until_step=1)
+    with (Path(cfg.output) / "metrics.jsonl").open("a") as log:
+        log.write(corruption)
+    import json
+
+    with pytest.raises(json.JSONDecodeError):
+        RLTWarmupRunner(cfg).run(resume=True, until_step=1)
+
+
+def test_piper_warmup_resume_binds_actor_implementation(
+    piper_warmup_cache, tmp_path, monkeypatch
+):
+    import rlinf.runners.rlt_warmup_runner as module
+
+    cfg = module.WarmupConfig(
+        cache=str(piper_warmup_cache),
+        output=str(tmp_path / "run"),
+        hardware=str(
+            Path(__file__).resolve().parents[2]
+            / "examples/embodiment/config/piper_usb_hardware.yaml"
+        ),
+        device="cpu",
+        threads=1,
+    )
+    module.RLTWarmupRunner(cfg).run(until_step=1)
+    original = module.implementation_fingerprints
+
+    def changed(paths):
+        hashes = original(paths)
+        hashes["rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py"] = "changed"
+        return hashes
+
+    monkeypatch.setattr(module, "implementation_fingerprints", changed)
+    with pytest.raises(ValueError, match="config, implementation or cache changed"):
+        module.RLTWarmupRunner(cfg).run(resume=True, until_step=1)
+
+
+def test_piper_warmup_validation_measures_human_targets_without_padding(
+    piper_warmup_cache, tmp_path
+):
+    import json
+
+    from rlinf.data.datasets.rlt_warmup import file_sha256, json_fingerprint
+    from rlinf.runners.rlt_warmup_runner import RLTWarmupRunner, WarmupConfig
+
+    manifest_path = piper_warmup_cache / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    entry = manifest["episodes"][2]
+    shard_path = piper_warmup_cache / entry["file"]
+    with np.load(shard_path) as shard:
+        arrays = {key: shard[key] for key in shard.files}
+    mask = np.arange(10)[None, :] < arrays["valid_steps"][:, None]
+    arrays["human"] = mask
+    arrays["actions"][mask] = 0.5
+    np.savez(shard_path, **arrays)
+    entry["sha256"] = file_sha256(shard_path)
+    manifest.pop("content_fingerprint")
+    manifest["content_fingerprint"] = json_fingerprint(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    cfg = WarmupConfig(
+        cache=str(piper_warmup_cache),
+        output=str(tmp_path / "run"),
+        hardware=str(
+            Path(__file__).resolve().parents[2]
+            / "examples/embodiment/config/piper_usb_hardware.yaml"
+        ),
+        device="cpu",
+        threads=1,
+    )
+    runner = RLTWarmupRunner(cfg)
+    # A constant 0.1 actor exactly matches the reference, but misses human 0.5.
+    with torch.no_grad():
+        for parameter in runner.model.parameters():
+            parameter.zero_()
+        runner.model.actor_mean.bias.fill_(float(np.arctanh(0.1)))
+    report = runner.validate()
+    assert report["actor_rmse"] == pytest.approx(0, abs=1e-7)
+    assert report["human_rmse"] == pytest.approx(0.4)
+    assert report["human_validation_ticks"] == int(mask.sum())

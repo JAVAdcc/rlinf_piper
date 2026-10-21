@@ -7,6 +7,7 @@ hardware: examples/embodiment/config/piper_usb_hardware.yaml
 device: cuda:0
 seed: 1234
 threads: 4
+video_backend: torchcodec
 
 # The frozen Stage 1 metadata supplies the H50 model and normalization contract.
 chunk_length: 10

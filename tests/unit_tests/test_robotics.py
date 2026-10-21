@@ -104,6 +104,37 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
+def test_piper_phase_monitor_hysteresis_and_input_contract(tmp_path):
+    from rlinf.robotics.piper_phase_monitor import PiperPhaseMonitor
+
+    weights = tmp_path / "monitor.npz"
+    np.savez(
+        weights,
+        feature=np.asarray("state"),
+        cameras=np.asarray(["front", "front_2", "wrist"]),
+        mean=np.zeros(7),
+        scale=np.ones(7),
+        weight=np.array([1, 0, 0, 0, 0, 0, 0]),
+        bias=0,
+        image_size=16,
+    )
+    monitor = PiperPhaseMonitor(weights)
+    observation = {"observation.state": np.array([3.0, 0, 0, 0, 0, 0, 0])}
+    assert not monitor.update(observation)["advisory_active"]
+    assert monitor.update(observation)["advisory_active"]
+    observation["complementary_info.critical_phase"] = False
+    observation["observation.state"][0] = 0
+    assert monitor.update(observation)["advisory_active"]
+    observation["observation.state"][0] = -3
+    assert monitor.update(observation)["advisory_active"]
+    assert not monitor.update(observation)["advisory_active"]
+    monitor.reset()
+    assert not monitor.active and monitor.count == 0
+    observation["observation.state"][0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        monitor.predict(observation)
+
+
 class FakePart(RobotPart):
     """Record lifecycle calls through the standard driver hooks."""
 

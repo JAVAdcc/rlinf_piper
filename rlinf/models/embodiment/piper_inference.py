@@ -219,6 +219,8 @@ class PiperRLTPolicy:
         *,
         actor: str | Path | None = None,
         device: str = "cuda:0",
+        manual_critical: bool = False,
+        allow_offline_actor: bool = False,
     ) -> None:
         from rlinf.models.embodiment.openpi import get_model
         from rlinf.models.embodiment.openpi.policies.piper_policy import (
@@ -230,12 +232,9 @@ class PiperRLTPolicy:
             raise ValueError(
                 "The rlt backend requires RLinf Stage 1 trained with use_rlt=True."
             )
-        cfg.openpi.task = "eval"
-        cfg.openpi.torch_compile = False
-        self.feature_model = get_model(cfg).to(device).eval().requires_grad_(False)
-        self.codec = PiperActionCodec(cfg.openpi_data.norm_stats_path)
-        self.fps = float(self.manifest["fps"])
-        self.action_horizon = int(self.feature_model.action_chunk)
+        self.manual_critical = manual_critical
+        if (manual_critical or allow_offline_actor) and actor is None:
+            raise ValueError("Manual critical routing requires an actor checkpoint.")
         self.actor = None
         if actor is not None:
             from rlinf.models.embodiment.mlp_policy import get_model as get_actor
@@ -244,9 +243,27 @@ class PiperRLTPolicy:
             if not (root / "piper_rlt_actor.json").is_file():
                 root = root / "actor"
             metadata = json.loads((root / "piper_rlt_actor.json").read_text())
+            local = metadata.get("format") == "rlinf-piper-rlt-offline-local-actor-v1"
+            if local and not (manual_critical and allow_offline_actor):
+                raise ValueError(
+                    "Offline local actors require manual critical routing and explicit experimental opt-in."
+                )
+            if local and (
+                "phase_filter" not in metadata
+                or metadata.get("phase_filter") is not None
+                or metadata.get("reward_scope") != "critical_segment"
+            ):
+                raise ValueError(
+                    "Manual routing currently supports only the shared local actor; specialist routing is not implemented."
+                )
             if (
-                metadata.get("format") != "rlinf-piper-rlt-actor-v1"
-                or metadata["stage1_checkpoint_id"] != self.manifest["checkpoint_id"]
+                metadata.get("format")
+                not in (
+                    "rlinf-piper-rlt-actor-v1",
+                    "rlinf-piper-rlt-offline-local-actor-v1",
+                )
+                or metadata.get("stage1_checkpoint_id")
+                != self.manifest["checkpoint_id"]
             ):
                 raise ValueError(
                     "Stage 2 actor was trained against a different Stage 1 checkpoint."
@@ -258,6 +275,13 @@ class PiperRLTPolicy:
                 raise ValueError(
                     "Piper RLT actor requires seven-dimensional actions and proprio."
                 )
+        cfg.openpi.task = "eval"
+        cfg.openpi.torch_compile = False
+        self.feature_model = get_model(cfg).to(device).eval().requires_grad_(False)
+        self.codec = PiperActionCodec(cfg.openpi_data.norm_stats_path)
+        self.fps = float(self.manifest["fps"])
+        self.action_horizon = int(self.feature_model.action_chunk)
+        if actor is not None:
             self.actor = get_actor(actor_cfg, torch_dtype=torch.float32)
             state = torch.load(
                 root / "model_state_dict/full_weights.pt",
@@ -266,20 +290,49 @@ class PiperRLTPolicy:
             )
             self.actor.load_state_dict(state, strict=True)
             self.actor.to(device).eval().requires_grad_(False)
-            self.action_horizon = int(actor_cfg.num_action_chunks)
-            if self.action_horizon > self.feature_model.action_chunk:
+            self.actor_horizon = int(actor_cfg.num_action_chunks)
+            if self.actor_horizon > self.feature_model.action_chunk:
                 raise ValueError(
                     "Actor execution horizon exceeds the reference horizon."
                 )
+            if not manual_critical:
+                self.action_horizon = self.actor_horizon
+            # Bind resume to the actual actor bytes, not only its directory name.
+            self.manifest = dict(
+                self.manifest,
+                stage2={
+                    "metadata": metadata,
+                    "weights_sha256": hashlib.sha256(
+                        (root / "model_state_dict/full_weights.pt").read_bytes()
+                    ).hexdigest(),
+                    "routing": "manual_critical" if manual_critical else "always",
+                    "allow_offline_actor": allow_offline_actor,
+                    "actor_horizon": self.actor_horizon,
+                    "reference_horizon": int(self.feature_model.action_chunk),
+                },
+            )
 
     @torch.inference_mode()
-    def infer(self, observation: dict[str, Any], task: str) -> np.ndarray:
+    def infer(
+        self,
+        observation: dict[str, Any],
+        task: str,
+        *,
+        actor_enabled: bool | None = None,
+    ) -> np.ndarray:
         """Predict in normalized RLT action space, then decode for the executor."""
         from rlinf.algorithms.rlt import predict_rlt_actions
         from rlinf.algorithms.rlt.route import RealworldRLTRoute
 
         env_obs = piper_env_observation(observation, task)
-        if self.actor is None:
+        if getattr(self, "manual_critical", False) and actor_enabled is None:
+            raise ValueError(
+                "Manual inference requires an explicit actor_enabled snapshot."
+            )
+        use_actor = self.actor is not None and actor_enabled is not False
+        if actor_enabled is True and self.actor is None:
+            raise ValueError("No actor checkpoint is loaded.")
+        if not use_actor:
             actions = self.feature_model.extract_rlt_obs(env_obs)["ref_chunk"]
         else:
             actions, _ = predict_rlt_actions(
@@ -292,6 +345,11 @@ class PiperRLTPolicy:
                 rlt_switch_flags=torch.ones(1, dtype=torch.bool),
             )
         actions = actions.detach().float().cpu().numpy()
-        if actions.shape != (1, self.action_horizon, 7):
+        expected = (
+            getattr(self, "actor_horizon", self.action_horizon)
+            if use_actor
+            else int(getattr(self.feature_model, "action_chunk", self.action_horizon))
+        )
+        if actions.shape != (1, expected, 7):
             raise ValueError(f"Unexpected RLT action shape: {actions.shape}.")
         return self.codec.decode(actions[0])

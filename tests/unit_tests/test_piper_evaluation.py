@@ -86,6 +86,259 @@ class Keys:
         return event
 
 
+def test_manual_critical_routing_drops_queues_and_records_actual_source(tmp_path):
+    class ManualPolicy(Policy):
+        manual_critical = True
+        actor_horizon = 10
+
+        def infer(self, obs, task, *, actor_enabled):
+            return np.full((10 if actor_enabled else 50, 7), 2 if actor_enabled else 1)
+
+    session = Session()
+
+    class RouteKeys:
+        events = set()
+        polls = 0
+
+        def clear(self):
+            pass
+
+        def poll(self):
+            self.polls += 1
+            assert self.polls < 100, self.events
+            if "finish" in self.events:
+                return ["right"]
+            count = len(session.targets)
+            for name, condition, key in (
+                ("start", True, "right"),
+                ("enter", count == 2, "b"),
+                ("exit", count == 4, "s"),
+                ("stop", count == 6, "right"),
+                ("score", count == 6, "s"),
+                ("finish", count == 6, "right"),
+            ):
+                if condition and name not in self.events:
+                    self.events.add(name)
+                    return [key]
+            return []
+
+    result = evaluate_piper(
+        ManualPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=10,
+        keys=RouteKeys(),
+        replan_steps=50,
+    )
+    np.testing.assert_array_equal(np.asarray(session.targets)[:, 0], [1, 1, 2, 2, 1, 1])
+    assert result["completed_episodes"] == 1
+    trace = [
+        json.loads(line)
+        for line in (tmp_path / "episode_001/trace.jsonl").read_text().splitlines()
+    ]
+    assert [r["action_source"] for r in trace if r["event"] == "action"] == [
+        "reference"
+    ] * 2 + ["actor"] * 2 + ["reference"] * 2
+    assert [r["replan_steps"] for r in trace if r["event"] == "prediction"] == [
+        50,
+        10,
+        50,
+    ]
+
+
+def test_manual_critical_switch_during_sync_inference_discards_result(tmp_path):
+    from rlinf.robotics.piper_runtime import PiperPolicySelection
+
+    selection = PiperPolicySelection()
+
+    class ManualPolicy(Policy):
+        manual_critical = True
+        actor_horizon = 10
+
+        def infer(self, obs, task, *, actor_enabled):
+            if not actor_enabled:
+                selection.set_critical(True)
+                return np.full((50, 7), 77)
+            return np.ones((10, 7))
+
+    session = Session()
+    log = io.StringIO()
+    rollout_piper(
+        ManualPolicy(),
+        session,
+        "USB",
+        steps=2,
+        log=log,
+        policy_selection=selection,
+        observation_dir=tmp_path / "observations",
+    )
+    np.testing.assert_array_equal(session.targets, np.ones((2, 7)))
+    assert '"event": "route_discard"' in log.getvalue()
+    paths = [
+        r["observation_file"]
+        for r in map(json.loads, log.getvalue().splitlines())
+        if r["event"] == "prediction"
+    ]
+    assert len(paths) == len(set(paths)) == 2
+    assert all(Path(path).is_file() for path in paths)
+
+
+def test_manual_route_change_after_result_acceptance_keeps_human_release():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+    from rlinf.robotics.piper_intervention import (
+        PiperIntervention,
+        PiperInterventionConfig,
+    )
+    from rlinf.robotics.piper_runtime import PiperPolicySelection
+
+    selection = PiperPolicySelection()
+    received = []
+
+    class Log(io.StringIO):
+        def write(self, text):
+            row = json.loads(text)
+            if row["event"] == "prediction" and not row["discarded"]:
+                received.append(row)
+            return super().write(text)
+
+    class ManualPolicy(Policy):
+        manual_critical = True
+        actor_horizon = 10
+
+        def infer(self, obs, task, *, actor_enabled):
+            return np.full((10 if actor_enabled else 50, 7), 2 if actor_enabled else 1)
+
+    class Follower(Session):
+        def execute(self, target):
+            self.last_command = target.copy()
+            return super().execute(target)
+
+    with mocked_sdks():
+        control = PiperIntervention(
+            PiperLeader("can-hil", config=PiperLeaderConfig(startup_sleep_s=0)),
+            PiperInterventionConfig(toggle_cooldown_s=1e-9),
+        )
+        control.connect()
+        control.toggle(np.zeros(7))
+        control.toggle(np.zeros(7))
+        session = Follower()
+        session.intervention = control
+        frames = []
+
+        def stop(step):
+            if received:
+                selection.set_critical(True)
+            return any(r["action_source"] == "actor" for r in frames)
+
+        try:
+            rollout_piper(
+                ManualPolicy(),
+                session,
+                "USB",
+                steps=200,
+                log=Log(),
+                stop_requested=stop,
+                record_step=lambda obs, action, **kw: frames.append(dict(kw)),
+                policy_selection=selection,
+            )
+            assert frames[-1]["action_source"] == "actor"
+            assert all(r["action_source"] == "human" for r in frames[:-1])
+        finally:
+            control.close()
+
+
+def test_manual_critical_hil_rejects_pending_result_and_routes_after_release():
+    from threading import Event
+
+    from robot_mocks import mocked_sdks
+
+    from rlinf.robotics.parts.teleop.piper_leader import PiperLeader, PiperLeaderConfig
+    from rlinf.robotics.piper_intervention import (
+        PiperIntervention,
+        PiperInterventionConfig,
+    )
+    from rlinf.robotics.piper_runtime import PiperPolicySelection
+
+    started, finish = Event(), Event()
+    selection = PiperPolicySelection()
+
+    class ManualPolicy(Policy):
+        manual_critical = True
+        actor_horizon = 10
+        calls = 0
+
+        def infer(self, obs, task, *, actor_enabled):
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                assert finish.wait(3)
+                return np.full((50, 7), 77)
+            return np.full((10 if actor_enabled else 50, 7), 2 if actor_enabled else 1)
+
+    class Follower(Session):
+        def execute(self, target):
+            self.last_command = target.copy()
+            return super().execute(target)
+
+    with mocked_sdks():
+        control = PiperIntervention(
+            PiperLeader("can-hil", config=PiperLeaderConfig(startup_sleep_s=0)),
+            PiperInterventionConfig(toggle_cooldown_s=1e-9),
+        )
+        control.connect()
+        session = Follower()
+        session.intervention = control
+        events, frames = set(), []
+
+        def stop(step):
+            if step >= 5 and "human" not in events:
+                assert started.is_set()
+                control.toggle(np.zeros(7))
+                selection.set_critical(True)
+                events.add("human")
+            if step >= 10 and "release" not in events:
+                control.toggle(session.last_command)
+                finish.set()
+                events.add("release")
+            if (
+                sum(r["action_source"] == "actor" for r in frames) >= 2
+                and "exit" not in events
+            ):
+                selection.set_critical(False)
+                events.add("exit")
+            return "exit" in events and any(
+                r["action_source"] == "reference" for r in frames
+            )
+
+        try:
+            rollout_piper(
+                ManualPolicy(),
+                session,
+                "USB",
+                steps=300,
+                log=io.StringIO(),
+                stop_requested=stop,
+                record_step=lambda obs, action, **kw: frames.append(dict(kw)),
+                policy_selection=selection,
+            )
+            assert events == {"human", "release", "exit"}
+            assert not any(np.any(a == 77) for a in session.targets)
+            assert sum(r["action_source"] == "actor" for r in frames) == 2
+            assert frames[-1]["action_source"] == "reference"
+            assert all(
+                r["policy_action"] is None
+                for r in frames
+                if r["action_source"] in ("hold", "human")
+            )
+        finally:
+            finish.set()
+            control.close()
+
+
 def test_human_controls_during_inference_and_release_discards_old_chunk(tmp_path):
     from threading import Event
 
@@ -225,7 +478,9 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
             # Right starts, one alignment poll, then b and i together before tick 0.
             return next(self.events, [])
 
-        events = iter([["right"], [], ["b", "i"], [], [], [], ["b"], [], ["s"]])
+        events = iter(
+            [["right"], [], ["b", "i"], [], [], [], ["s"], [], ["right"], ["s"]]
+        )
 
     with mocked_sdks():
         announcements = []
@@ -257,7 +512,8 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
         "started",
         "critical_on",
         "human",
-        "critical_off",
+        "critical_success",
+        "waiting_score",
         "success",
         "saving",
         "saved",
@@ -268,11 +524,9 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
     assert summary["intervention_rate"] == 1
     result = summary["episodes"][0]
     assert result["takeovers"] == 1 and result["human_steps"] == 3
-    assert result["critical_phases"] == [{"start": 0, "end": 2}]
+    assert result["critical_phases"] == [{"start": 0, "end": 2, "outcome": "success"}]
     root = tmp_path / "episode_001/dataset"
-    dataset = lerobot.LeRobotDataset(
-        "piper/rollout", root=root, video_backend="torchcodec"
-    )
+    dataset = lerobot.LeRobotDataset("piper/rollout", root=root, video_backend="pyav")
     for idx in range(3):
         assert dataset[idx]["complementary_info.is_intervention"].item()
         assert dataset[idx]["complementary_info.action_source"].item() == 2
@@ -288,10 +542,19 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
 @pytest.mark.parametrize("num_episodes", [20, 100])
 def test_trials_score_once_and_keep_one_session(tmp_path, num_episodes):
     session = Session()
-    keys = Keys([
-        [["s"], ["right"], [], [], ["s" if i % 2 else "f", "right", "s"]]
-        for i in range(num_episodes)
-    ])
+    keys = Keys(
+        [
+            [
+                ["s"],
+                ["right"],
+                [],
+                [],
+                ["right", "s"],
+                ["s" if i % 2 else "f", "s"],
+            ]
+            for i in range(num_episodes)
+        ]
+    )
     result = evaluate_piper(
         Policy(),
         session,
@@ -324,14 +587,14 @@ def test_label_during_inference_prevents_first_action(tmp_path):
         output=tmp_path,
         num_episodes=1,
         steps=300,
-        keys=Keys([[["right"], [], ["s"]]]),
+        keys=Keys([[["right"], [], ["right"], ["s"]]]),
     )
     assert not session.targets
     assert result["successes"] == 1
     assert result["episodes"][0]["completed_steps"] == 0
 
 
-def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
+def test_step_limit_requires_right_before_episode_label(tmp_path):
     session = Session()
     announcements = []
     result = evaluate_piper(
@@ -349,6 +612,7 @@ def test_step_limit_waits_for_label_and_ignores_right(tmp_path):
     assert announcements == [
         "ready",
         "started",
+        "confirm_episode_score",
         "waiting_score",
         "failure",
         "review",
@@ -369,10 +633,12 @@ def test_abort_saves_partial_results_and_closes_session(tmp_path, failure, statu
             assert session.closes == 1
         announcements.append(event)
 
-    keys = Keys([
-        [["right"], [], [], ["s"]],
-        [["right"], failure],
-    ])
+    keys = Keys(
+        [
+            [["right"], [], [], ["right"], ["s"]],
+            [["right"], failure],
+        ]
+    )
     with pytest.raises(type(failure)):
         evaluate_piper(
             Policy(),
@@ -490,7 +756,9 @@ def test_score_is_saved_before_reset_and_reset_reuses_connection(
         output=tmp_path,
         num_episodes=2,
         steps=300,
-        keys=Keys([[["right"], [], ["s"]], [["right"], [], ["f"]]]),
+        keys=Keys(
+            [[["right"], [], ["right"], ["s"]], [["right"], [], ["right"], ["f"]]]
+        ),
         reset_after_episode=mode,
     )
     target = bounded if mode == "initial" else np.zeros(7)
@@ -526,7 +794,7 @@ def test_reset_fault_preserves_score_and_aborts_next_trial(tmp_path, monkeypatch
             output=tmp_path,
             num_episodes=20,
             steps=300,
-            keys=Keys([[["right"], [], ["s"]], [["right"], ["q"]]]),
+            keys=Keys([[["right"], [], ["right"], ["s"]], [["right"], ["q"]]]),
             reset_after_episode="zero",
         )
     summary = json.loads((tmp_path / "summary.json").read_text())
@@ -564,7 +832,7 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
         num_episodes=1,
         steps=300,
         reset_after_episode="zero",
-        keys=Keys([[["right"], [], ["s"]], [["right"], ["s"], ["r"]]]),
+        keys=Keys([[["right"], [], ["right"], ["s"]], [["right"], ["s"], ["r"]]]),
         announce=lambda event, number: announcements.append(event),
     )
     assert summary["successes"] == summary["completed_episodes"] == 1
@@ -574,6 +842,7 @@ def test_reset_retry_keeps_score_and_connection_without_starting_next_trial(
     assert announcements == [
         "ready",
         "started",
+        "waiting_score",
         "success",
         "reset_start",
         "reset_failed",
@@ -635,27 +904,30 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
         output=tmp_path,
         num_episodes=2,
         steps=100,
-        keys=Keys([
+        keys=Keys(
             [
-                ["right"],
-                [],
-                [],
-                ["b"],
-                [],
-                [],
-                [],
-                ["b"],
-                [],
-                [],
-                [],
-                ["b"],
-                [],
-                ["b"],
-                [],
-                ["s"],
-            ],
-            [["right"], ["b"], [], ["f"]],
-        ]),
+                [
+                    ["right"],
+                    [],
+                    [],
+                    ["b"],
+                    [],
+                    [],
+                    [],
+                    ["s"],
+                    [],
+                    [],
+                    [],
+                    ["b"],
+                    [],
+                    ["s"],
+                    [],
+                    ["right"],
+                    ["s"],
+                ],
+                [["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]],
+            ]
+        ),
         record_dataset=True,
         streaming_video=streaming_video,
         announce=announce,
@@ -664,16 +936,20 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
         ("ready", 1),
         ("started", 1),
         ("critical_on", 1),
-        ("critical_off", 1),
+        ("critical_success", 1),
         ("critical_on", 2),
-        ("critical_off", 2),
+        ("critical_success", 2),
+        ("waiting_score", 0),
         ("success", 1),
         ("saving", 1),
         ("saved", 1),
         ("ready", 2),
         ("started", 2),
         ("critical_on", 1),
-        ("critical_closed", 0),
+        ("waiting_segment_score", 0),
+        ("critical_failure", 1),
+        ("confirm_episode_score", 0),
+        ("waiting_score", 0),
         ("failure", 2),
         ("saving", 2),
         ("saved", 2),
@@ -686,18 +962,18 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
         "streaming" if streaming_video else "png"
     )
     labels = json.loads((tmp_path / "annotations.json").read_text())
-    assert labels["format"] == "piper-rlt-episodes-v2"
+    assert labels["format"] == "piper-rlt-episodes-v3"
     assert labels["episodes"][0]["critical_phases"] == [
-        {"start": 1, "end": 3},
-        {"start": 5, "end": 6},
+        {"start": 1, "end": 3, "outcome": "success"},
+        {"start": 5, "end": 6, "outcome": "success"},
     ]
     assert labels["episodes"][0]["terminal_frame"] == 7
-    assert labels["episodes"][1]["critical_phases"] == [{"start": 0, "end": 1}]
+    assert labels["episodes"][1]["critical_phases"] == [
+        {"start": 0, "end": 1, "outcome": "failure"}
+    ]
     assert labels["episodes"][1]["terminal_frame"] == 1
     root = tmp_path / "episode_001/dataset"
-    dataset = lerobot.LeRobotDataset(
-        "piper/rollout", root=root, video_backend="torchcodec"
-    )
+    dataset = lerobot.LeRobotDataset("piper/rollout", root=root, video_backend="pyav")
     assert len(dataset) == 8 and load_episode_outcomes(root) == {0: True}
     for i in range(8):
         sample = dataset[i]
@@ -719,7 +995,7 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
     extended = lerobot.LeRobotDataset(
         "piper/rollout",
         root=tmp_path / "episode_002/dataset",
-        video_backend="torchcodec",
+        video_backend="pyav",
     )
     assert bool(extended[0]["complementary_info.critical_phase"].item())
     assert not bool(extended[1]["complementary_info.critical_phase"].item())
@@ -727,80 +1003,173 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
 
 
 @pytest.mark.parametrize("score", ["s", "f"])
-@pytest.mark.parametrize("has_prior_pair", [False, True])
+@pytest.mark.parametrize("has_prior_segment", [False, True])
 @pytest.mark.parametrize("steps", [3, 100])
-def test_scoring_extends_only_the_unpaired_final_phase_to_terminal(
-    tmp_path, score, has_prior_pair, steps
+def test_stopped_episode_scores_open_segment_separately(
+    tmp_path, score, has_prior_segment, steps
 ):
+    session = Session()
+    global_score = "f" if score == "s" else "s"
+    events = [
+        ["right"],
+        ["b"],
+        [],
+        ["s"] if has_prior_segment else [],
+        [],
+        ["b"] if has_prior_segment else [],
+        [],
+    ]
+    if steps > 3:
+        events.append(["right", "s"])  # Same-batch score must be ignored.
+    events += [
+        ["right", global_score],  # Pending local score: Right cannot also label it.
+        [score, score],
+        [score],
+        [score],
+        ["right", score],  # Arm whole-episode scoring, without a score.
+        ["right", score],  # Already armed: still ignore this same-batch score.
+        [global_score],
+    ]
     summary = evaluate_piper(
         Policy(),
-        Session(),
+        session,
         "USB",
         output=tmp_path,
         num_episodes=1,
         steps=steps,
-        keys=Keys([
-            [
-                ["right"],
-                ["b"],
-                [],
-                ["b"] if has_prior_pair else [],
-                [],
-                ["b"] if has_prior_pair else [],
-                [],
-                [score],
-            ]
-        ]),
+        keys=Keys([events]),
     )
     saved = json.loads((tmp_path / "episode_001/result.json").read_text())
+    local_outcome = "success" if score == "s" else "failure"
     assert saved["critical_phases"] == (
-        [{"start": 0, "end": 1}, {"start": 2, "end": 3}]
-        if has_prior_pair
-        else [{"start": 0, "end": 3}]
+        [
+            {"start": 0, "end": 1, "outcome": "success"},
+            {"start": 2, "end": 3, "outcome": local_outcome},
+        ]
+        if has_prior_segment
+        else [{"start": 0, "end": 3, "outcome": local_outcome}]
     )
-    assert saved["completed_steps"] == 3
-    assert saved["outcome"] == ("success" if score == "s" else "failure")
+    assert saved["completed_steps"] == len(session.targets) == 3
+    assert saved["outcome"] != local_outcome
     assert summary["episodes"][0] == saved
 
 
-def test_scoring_ignores_a_new_phase_with_no_executed_actions(tmp_path):
+def test_scoring_removes_zero_action_segment_without_scoring_episode(tmp_path):
+    session = Session()
     summary = evaluate_piper(
         Policy(),
-        Session(),
+        session,
         "USB",
         output=tmp_path,
         num_episodes=1,
         steps=100,
-        keys=Keys([[["right"], [], [], ["b", "s"]]]),
+        keys=Keys([[["right"], ["b"], ["right"], ["s"], ["s"], ["right"], ["f"]]]),
     )
     assert summary["episodes"][0]["critical_phases"] == []
-    assert summary["episodes"][0]["completed_steps"] == 1
+    assert summary["episodes"][0]["completed_steps"] == 0
+    assert summary["failures"] == 1 and not session.targets
 
 
-def test_phase_can_close_at_step_limit_but_cannot_start_there(tmp_path):
+def test_step_limit_cannot_start_another_segment_or_score_without_confirmation(
+    tmp_path,
+):
+    session = Session()
     summary = evaluate_piper(
         Policy(),
-        Session(),
+        session,
         "USB",
         output=tmp_path,
         num_episodes=1,
         steps=1,
-        keys=Keys([[["right"], ["b"], [], ["b", "b", "s"]]]),
+        keys=Keys([[["right"], [], [], ["b", "s"], ["s"], ["right", "s"], ["f"]]]),
     )
-    assert summary["episodes"][0]["critical_phases"] == [{"start": 0, "end": 1}]
+    assert summary["episodes"][0]["critical_phases"] == []
+    assert summary["failures"] == 1 and len(session.targets) == 1
 
 
-def test_duplicate_b_at_same_frame_cannot_create_an_empty_phase(tmp_path):
+def test_duplicate_b_never_closes_an_active_segment(tmp_path):
+    session = Session()
     summary = evaluate_piper(
         Policy(),
-        Session(),
+        session,
         "USB",
         output=tmp_path,
         num_episodes=1,
         steps=100,
-        keys=Keys([[["right"], ["b", "b"], [], ["b", "s"]]]),
+        keys=Keys([[["right"], ["b", "b"], [], ["b"], ["b"], ["f"], ["right"], ["s"]]]),
     )
-    assert summary["episodes"][0]["critical_phases"] == [{"start": 0, "end": 1}]
+    assert summary["episodes"][0]["critical_phases"] == [
+        {"start": 0, "end": 2, "outcome": "failure"}
+    ]
+    assert summary["successes"] == 1 and len(session.targets) == 2
+
+
+@pytest.mark.parametrize("local_scores,global_score", [("sf", "f"), ("fs", "s")])
+def test_local_scores_continue_execution_and_do_not_determine_episode_result(
+    tmp_path, local_scores, global_score
+):
+    session = Session()
+    summary = evaluate_piper(
+        Policy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys(
+            [
+                [
+                    ["right"],
+                    ["b"],
+                    [],
+                    [local_scores[0]],
+                    [],
+                    ["b"],
+                    [],
+                    [local_scores[1]],
+                    [],
+                    ["right"],
+                    [global_score],
+                ]
+            ]
+        ),
+    )
+    trial = summary["episodes"][0]
+    assert trial["critical_phases"] == [
+        {
+            "start": 0,
+            "end": 1,
+            "outcome": "success" if local_scores[0] == "s" else "failure",
+        },
+        {
+            "start": 2,
+            "end": 3,
+            "outcome": "success" if local_scores[1] == "s" else "failure",
+        },
+    ]
+    assert trial["outcome"] == ("success" if global_score == "s" else "failure")
+    assert trial["completed_steps"] == len(session.targets) == 4
+
+
+@pytest.mark.parametrize("pressed", [["s", "q"], ["f", "q"], ["right", "q"]])
+def test_quit_in_same_batch_as_score_or_right_prevents_scoring(tmp_path, pressed):
+    session = Session()
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_piper(
+            Policy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=100,
+            keys=Keys([[["right"], ["b"], [], pressed]]),
+        )
+    saved = json.loads((tmp_path / "episode_001/result.json").read_text())
+    assert saved["outcome"] == "interrupted"
+    assert saved["critical_phases"] == [
+        {"start": 0, "end": None, "outcome": "unscored"}
+    ]
+    assert len(session.targets) == 1
 
 
 def test_quit_at_start_saves_completed_trials_without_executing(tmp_path):
@@ -848,7 +1217,9 @@ def test_recording_failure_preserves_operator_score_and_excludes_invalid_data(
     def fail_encoding(self, *args, **kwargs):
         saved = json.loads((tmp_path / "episode_001/result.json").read_text())
         assert saved["outcome"] == "success"
-        assert saved["critical_phases"] == [{"start": 0, "end": 1}]
+        assert saved["critical_phases"] == [
+            {"start": 0, "end": 1, "outcome": "success"}
+        ]
         raise OSError("video write failed")
 
     monkeypatch.setattr(PiperEpisodeRecorder, "finish", fail_encoding)
@@ -861,7 +1232,7 @@ def test_recording_failure_preserves_operator_score_and_excludes_invalid_data(
             output=tmp_path,
             num_episodes=100,
             steps=100,
-            keys=Keys([[["right"], ["b"], [], ["s"]]]),
+            keys=Keys([[["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]]),
             record_dataset=True,
             announce=lambda event, number: announcements.append(event),
         )
@@ -939,7 +1310,7 @@ def test_speech_disabled_or_unavailable_does_not_break_collection(
             output=tmp_path,
             num_episodes=1,
             steps=10,
-            keys=Keys([[["right"], [], [], ["s"]]]),
+            keys=Keys([[["right"], [], [], ["right"], ["s"]]]),
             announce=announce,
         )
     assert result["successes"] == 1 and len(session.targets) == 1
@@ -1020,13 +1391,13 @@ def test_terminal_speech_is_delivered_after_hardware_closes(tmp_path, monkeypatc
             output=tmp_path / "collection",
             num_episodes=1,
             steps=10,
-            keys=Keys([[["right"], ["b"], [], ["s"]]]),
+            keys=Keys([[["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]]),
             announce=announce,
         )
     assert [call["args"][-1] for call in backend.calls] == [
         "Ready.",
-        "Phase closed.",
-        "Success.",
+        "Segment succeeded.",
+        "Episode succeeded.",
         "Complete.",
     ]
 
@@ -1046,7 +1417,7 @@ def test_failed_announcement_callback_preserves_scoring_and_cleanup(tmp_path, ca
         output=tmp_path,
         num_episodes=1,
         steps=10,
-        keys=Keys([[["right"], [], [], ["s"]]]),
+        keys=Keys([[["right"], [], [], ["right"], ["s"]]]),
         announce=announce,
     )
     assert summary["successes"] == 1 and len(session.targets) == 1
@@ -1077,6 +1448,141 @@ class VideoPolicy(Policy):
     fps = 30
 
 
+def test_scoring_wait_preserves_terminal_view_and_capture_time(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    from rlinf.robotics import piper_evaluation
+
+    now = [1000.0]
+    monkeypatch.setattr(
+        piper_evaluation,
+        "time",
+        SimpleNamespace(
+            time=lambda: now[0], monotonic=time.monotonic, sleep=time.sleep
+        ),
+    )
+
+    class MovingScene(VideoSession):
+        changed = False
+
+        def observe(self):
+            observation = super().observe()
+            if self.changed:
+                observation["observation.state"] += 100
+            return observation
+
+    session = MovingScene()
+
+    def announce(event, number):
+        if event == "waiting_segment_score":
+            assert len(session.targets) == 1
+            now[0] = 2000.0
+            session.changed = True
+
+    summary = evaluate_piper(
+        VideoPolicy(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        record_dataset=True,
+        announce=announce,
+        keys=Keys(
+            [
+                [
+                    ["right"],
+                    ["b"],
+                    [],
+                    ["right"],
+                    ["s", "s"],
+                    ["s"],
+                    ["b", "i", "s"],
+                    ["right", "s"],
+                    ["f"],
+                ]
+            ]
+        ),
+    )
+    assert len(session.targets) == 1
+    trial = summary["episodes"][0]
+    assert trial["outcome"] == "failure"
+    assert trial["critical_phases"] == [{"start": 0, "end": 1, "outcome": "success"}]
+    assert trial["terminal_observation_wall_time"] == 1000.0
+    table = pq.read_table(
+        next((tmp_path / "episode_001/dataset/data").rglob("*.parquet"))
+    )
+    assert table["observation.state"].to_pylist()[-1] == [1.0] * 7
+    assert (
+        np.asarray(table["complementary_info.wall_time"].to_pylist()[-1]).item()
+        == 1000.0
+    )
+    assert not np.asarray(
+        table["complementary_info.action_valid"].to_pylist()[-1]
+    ).item()
+
+
+@pytest.mark.parametrize("damage", ["protocol", "local_outcome"])
+def test_resume_rejects_legacy_or_missing_local_labels_without_mutation(
+    tmp_path, damage
+):
+    evaluate_piper(
+        Policy(),
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys([[["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]]),
+    )
+    result_path = tmp_path / "episode_001/result.json"
+    trial = json.loads(result_path.read_text())
+    if damage == "protocol":
+        trial.pop("scoring_protocol")
+    else:
+        trial["critical_phases"][0].pop("outcome")
+    result_path.write_text(json.dumps(trial))
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    session = Session()
+    with pytest.raises(ValueError, match="Legacy|own success/failure"):
+        evaluate_piper(
+            Policy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=2,
+            steps=100,
+            keys=Keys([]),
+            resume=True,
+        )
+    assert session.opens == 0
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+
+def test_resume_cli_refuses_legacy_protocol_before_model_or_directory_writes(
+    tmp_path, monkeypatch
+):
+    from toolkits.piper.run_policy import main
+
+    (tmp_path / "run.json").write_text(
+        json.dumps(
+            {
+                "command": "rollout",
+                "interactive": True,
+                "checkpoint": "/not-a-model",
+            }
+        )
+    )
+    before = {p: p.read_bytes() for p in tmp_path.iterdir()}
+    monkeypatch.setattr(
+        "sys.argv", ["run_policy", "rollout", "--resume", str(tmp_path)]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert before == {p: p.read_bytes() for p in tmp_path.iterdir()}
+
+
 @pytest.mark.parametrize("streaming_video", [False, True])
 def test_resume_keeps_recordings_labels_and_skips_discarded_or_unfinished_attempts(
     tmp_path, streaming_video
@@ -1091,11 +1597,13 @@ def test_resume_keeps_recordings_labels_and_skips_discarded_or_unfinished_attemp
             steps=100,
             record_dataset=True,
             streaming_video=streaming_video,
-            keys=Keys([
-                [["right"], ["b"], [], ["s"]],
-                [["right"], ["b"], [], ["f"]],
-                [["left"], ["q"]],
-            ]),
+            keys=Keys(
+                [
+                    [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                    [["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]],
+                    [["left"], ["q"]],
+                ]
+            ),
         )
     labels_before = json.loads((tmp_path / "annotations.json").read_text())
     # Older collections did not store a separate attempt field.
@@ -1123,7 +1631,7 @@ def test_resume_keeps_recordings_labels_and_skips_discarded_or_unfinished_attemp
         steps=100,
         record_dataset=True,
         resume=True,
-        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+        keys=Keys([[["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]]]),
         announce=lambda event, number: events.append((event, number)),
     )
     assert summary["completed_episodes"] == summary["recorded_episodes"] == 2
@@ -1156,7 +1664,7 @@ def test_resume_uses_results_when_summary_lags_and_excludes_uncommitted_video(
         num_episodes=1,
         steps=100,
         record_dataset=True,
-        keys=Keys([[["right"], ["b"], [], ["s"]]]),
+        keys=Keys([[["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]]),
     )
     if lost_commit:
         path = tmp_path / "episode_001/result.json"
@@ -1177,7 +1685,7 @@ def test_resume_uses_results_when_summary_lags_and_excludes_uncommitted_video(
         steps=100,
         record_dataset=True,
         resume=True,
-        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+        keys=Keys([[["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]]]),
     )
     assert summary["completed_episodes"] == (1 if lost_commit else 2)
     assert summary["successes"] == (0 if lost_commit else 1)
@@ -1198,7 +1706,7 @@ def test_resume_allows_discarding_last_saved_episode_before_another_start(tmp_pa
         output=tmp_path,
         num_episodes=1,
         steps=100,
-        keys=Keys([[["right"], [], ["s"]]]),
+        keys=Keys([[["right"], [], ["right"], ["s"]]]),
     )
     summary = evaluate_piper(
         Policy(),
@@ -1208,7 +1716,7 @@ def test_resume_allows_discarding_last_saved_episode_before_another_start(tmp_pa
         num_episodes=1,
         steps=100,
         resume=True,
-        keys=Keys([[["left"], ["left"], ["right"], [], ["f"]]]),
+        keys=Keys([[["left"], ["left"], ["right"], [], ["right"], ["f"]]]),
     )
     assert summary["completed_episodes"] == summary["discarded_episodes"] == 1
     assert summary["failures"] == 1 and summary["successes"] == 0
@@ -1261,7 +1769,7 @@ def test_resume_restores_first_reset_pose_and_gates_unfinished_reset(
             steps=100,
             reset_after_episode="initial",
             reset_timing=timing,
-            keys=Keys([[["right"], [], ["s"]]]),
+            keys=Keys([[["right"], [], ["right"], ["s"]]]),
         )
     except KeyboardInterrupt:
         assert interrupted_reset
@@ -1278,7 +1786,7 @@ def test_resume_restores_first_reset_pose_and_gates_unfinished_reset(
         events.append(event)
 
     key_batches = [[["right"], ["r"]]] if interrupted_reset else []
-    key_batches.append([["right"], [], ["f"]])
+    key_batches.append([["right"], [], ["right"], ["f"]])
     summary = evaluate_piper(
         Policy(),
         second,
@@ -1315,7 +1823,7 @@ def test_resume_refuses_damaged_history_before_connecting_or_rewriting(
         num_episodes=1,
         steps=100,
         record_dataset=True,
-        keys=Keys([[["right"], ["b"], [], ["s"]]]),
+        keys=Keys([[["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]]),
     )
     if damage == "video":
         next((tmp_path / "episode_001/dataset/videos").rglob("*.mp4")).unlink()
@@ -1352,7 +1860,9 @@ def test_resume_target_cannot_shrink_history_and_existing_run_requires_resume(tm
         output=tmp_path,
         num_episodes=2,
         steps=100,
-        keys=Keys([[["right"], [], ["s"]], [["right"], [], ["f"]]]),
+        keys=Keys(
+            [[["right"], [], ["right"], ["s"]], [["right"], [], ["right"], ["f"]]]
+        ),
     )
     saved = (tmp_path / "summary.json").read_bytes()
     for resume in (True, False):
@@ -1375,26 +1885,28 @@ def test_resume_target_cannot_shrink_history_and_existing_run_requires_resume(tm
 def test_resume_cli_restores_settings_and_wrapper_preserves_overrides(tmp_path):
     from toolkits.piper.run_policy import parse_args
 
-    original = parse_args([
-        "rollout",
-        "--checkpoint",
-        str(tmp_path / "checkpoint"),
-        "--hardware",
-        str(tmp_path / "old_hardware.yaml"),
-        "--task",
-        "USB",
-        "--interactive",
-        "--teleop",
-        "piper_leader",
-        "--record-dataset",
-        "--reset-after-episode",
-        "initial",
-        "--steps",
-        "7200",
-        "--no-action-limits",
-        "--num-episodes",
-        "2",
-    ])
+    original = parse_args(
+        [
+            "rollout",
+            "--checkpoint",
+            str(tmp_path / "checkpoint"),
+            "--hardware",
+            str(tmp_path / "old_hardware.yaml"),
+            "--task",
+            "USB",
+            "--interactive",
+            "--teleop",
+            "piper_leader",
+            "--record-dataset",
+            "--reset-after-episode",
+            "initial",
+            "--steps",
+            "7200",
+            "--no-action-limits",
+            "--num-episodes",
+            "2",
+        ]
+    )
     values = {
         k: str(v) if isinstance(v, Path) else v for k, v in vars(original).items()
     }
@@ -1465,13 +1977,16 @@ def test_collection_lock_blocks_second_writer_and_releases_on_error(
     from toolkits.piper.run_policy import main
 
     (tmp_path / "run.json").write_text(
-        json.dumps({
-            "command": "rollout",
-            "interactive": True,
-            "checkpoint": "/unused",
-            "hardware": "/unused",
-            "task": "USB",
-        })
+        json.dumps(
+            {
+                "command": "rollout",
+                "interactive": True,
+                "checkpoint": "/unused",
+                "scoring_protocol": "critical-segment-v1",
+                "hardware": "/unused",
+                "task": "USB",
+            }
+        )
     )
     (tmp_path / "hardware.yaml").write_text("{}\n")
     monkeypatch.setattr(
@@ -1529,11 +2044,13 @@ def test_left_stops_active_trial_without_scoring_or_saving_and_preserves_previou
         record_dataset=True,
         streaming_video=streaming_video,
         announce=announce,
-        keys=Keys([
-            [["right"], ["b"], [], ["s"]],
-            [["right"], ["b"], [], ["s", "left", "f", "right", "i"]],
-            [["left"], ["right"], ["b"], [], ["f"]],
-        ]),
+        keys=Keys(
+            [
+                [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                [["right"], ["b"], [], ["s", "left", "f", "right", "i"]],
+                [["left"], ["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]],
+            ]
+        ),
     )
     assert summary["completed_episodes"] == summary["recorded_episodes"] == 2
     assert summary["discarded_episodes"] == 1 and summary["success_rate"] == 0.5
@@ -1558,7 +2075,8 @@ def test_left_stops_active_trial_without_scoring_or_saving_and_preserves_previou
     labels = json.loads((tmp_path / "annotations.json").read_text())
     assert list(labels["datasets"]) == ["episode_001", "episode_003"]
     assert all(
-        x["critical_phases"] == [{"start": 0, "end": 1}] for x in labels["episodes"]
+        x["critical_phases"] == [{"start": 0, "end": 1, "outcome": x["outcome"]}]
+        for x in labels["episodes"]
     )
 
 
@@ -1584,7 +2102,7 @@ def test_left_before_first_action_needs_no_score_or_recorder(
         output=tmp_path,
         num_episodes=1,
         steps=100,
-        keys=Keys([first_keys, [["right"], [], ["f"]]]),
+        keys=Keys([first_keys, [["right"], [], ["right"], ["f"]]]),
     )
     assert policy.calls == (1 if before_inference else 2)
     assert not session.targets
@@ -1604,10 +2122,12 @@ def test_left_at_step_limit_discards_without_success_or_failure(tmp_path):
         num_episodes=1,
         steps=1,
         record_dataset=True,
-        keys=Keys([
-            [["right"], ["b"], [], ["left"]],
-            [["right"], ["b"], [], ["s"]],
-        ]),
+        keys=Keys(
+            [
+                [["right"], ["b"], [], ["left"]],
+                [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+            ]
+        ),
     )
     assert summary["completed_episodes"] == summary["successes"] == 1
     assert summary["discarded_episodes"] == 1
@@ -1675,7 +2195,10 @@ def test_left_during_human_control_discards_pending_prediction_before_next_trial
                 and not event
                 and any(np.all(x == 1) for x in session.targets)
             ):
-                return ["s"]
+                if not getattr(self, "stop_sent", False):
+                    self.stop_sent = True
+                    self.events.extend([["s"], ["right"], ["s"]])
+                    return ["right"]
             return event
 
     with mocked_sdks():
@@ -1705,10 +2228,12 @@ def test_left_during_human_control_discards_pending_prediction_before_next_trial
                 steps=100,
                 record_dataset=True,
                 announce=announce,
-                keys=HumanKeys([
-                    [["right"], [], [], ["b", "i"], ["left"]],
-                    [["right"], [], ["b"]],
-                ]),
+                keys=HumanKeys(
+                    [
+                        [["right"], [], [], ["b", "i"], ["left"]],
+                        [["right"], [], ["b"]],
+                    ]
+                ),
             )
         finally:
             release.set()
@@ -1757,10 +2282,21 @@ def test_left_during_encoding_cancels_before_publication_and_replaces_trial(
             output=tmp_path,
             num_episodes=1,
             steps=100,
-            keys=Keys([
-                [["right"], ["b"], [], ["s"], ["left"]],
-                [["right"], ["b"], [], ["f"]],
-            ]),
+            keys=Keys(
+                [
+                    [
+                        ["right"],
+                        ["b"],
+                        [],
+                        ["right"],
+                        ["s"],
+                        ["right"],
+                        ["s"],
+                        ["left"],
+                    ],
+                    [["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]],
+                ]
+            ),
             record_dataset=True,
             streaming_video=streaming_video,
             announce=announce,
@@ -1779,7 +2315,9 @@ def test_left_during_encoding_cancels_before_publication_and_replaces_trial(
     assert not (tmp_path / "episode_001").exists()
     labels = json.loads((tmp_path / "annotations.json").read_text())
     assert list(labels["datasets"]) == ["episode_002"]
-    assert labels["episodes"][0]["critical_phases"] == [{"start": 0, "end": 1}]
+    assert labels["episodes"][0]["critical_phases"] == [
+        {"start": 0, "end": 1, "outcome": "failure"}
+    ]
 
 
 @pytest.mark.parametrize("record_dataset", [False, True])
@@ -1794,11 +2332,23 @@ def test_left_at_final_review_discards_only_last_trial_and_keeps_target_count(
         output=tmp_path,
         num_episodes=2,
         steps=100,
-        keys=Keys([
-            [["right"], ["b"], [], ["s"]],
-            [["right"], ["b"], [], ["s"]],
-            [["left", "right"], ["left"], ["right"], ["b"], [], ["f"]],
-        ]),
+        keys=Keys(
+            [
+                [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                [
+                    ["left", "right"],
+                    ["left"],
+                    ["right"],
+                    ["b"],
+                    [],
+                    ["right"],
+                    ["f"],
+                    ["right"],
+                    ["f"],
+                ],
+            ]
+        ),
         record_dataset=record_dataset,
     )
     assert summary["completed_episodes"] == 2 and summary["discarded_episodes"] == 1
@@ -1849,7 +2399,7 @@ def test_left_and_quit_never_publish_discarded_recording_and_allow_resume(
         steps=100,
         record_dataset=True,
         resume=True,
-        keys=Keys([[["right"], ["b"], [], ["f"]]]),
+        keys=Keys([[["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]]]),
     )
     assert summary["completed_episodes"] == summary["recorded_episodes"] == 1
     assert summary["episodes"][-1]["directory"] == "episode_002"
@@ -1861,10 +2411,16 @@ def test_left_keeps_reset_and_excludes_trial(tmp_path, monkeypatch, discard_when
 
     session = VideoSession()
     session.read_state = lambda: np.zeros(7)
-    keys = Keys([
-        [["right"], ["b"], [], ["left" if discard_when == "active" else "s"]],
-        [["right"], ["b"], [], ["f"]],
-    ])
+    keys = Keys(
+        [
+            (
+                [["right"], ["b"], [], ["left"]]
+                if discard_when == "active"
+                else [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]]
+            ),
+            [["right"], ["b"], [], ["right"], ["f"], ["right"], ["f"]],
+        ]
+    )
     resets = []
 
     def reset(session_arg, target, *, log, timing, on_tick):

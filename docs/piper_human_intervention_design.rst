@@ -34,13 +34,13 @@ Piper 人工接管与训练数据
    * - 按键
      - 行为
    * - 右方向键
-     - 恢复场景后，对齐主臂并开始回合。
+     - 就绪时对齐主臂并开始；运行中停止下发新动作并进入整条评分。
    * - ``i``
      - 接管 / 交还，可用 ``--intervention-key o`` 改为 ``o``。
    * - ``b``
-     - 进入 / 退出 critical phase，可标注多段，与接管独立。
+     - 开始 critical phase；使用 s/f 结束并评分该段，段内重复 b 不关闭，与接管独立。
    * - ``s`` / ``f``
-     - 停止动作、评分、保存数据，然后按已选配置复位。
+     - 运行中只结束并评分当前关键段，执行继续；整回合停下后单独评分、保存并按配置复位。
    * - 左方向键
      - 运行、接管或等待评分时直接停止并丢弃当前回合；评分后的保存、复位和等待阶段也可撤销。就绪后按右键重采。
    * - ``q`` / Ctrl-C
@@ -50,7 +50,7 @@ Piper 人工接管与训练数据
 
 本地 HIL 在独立线程推理，控制循环继续处理按键、人工动作和记录。每次接管或交还都会使之前的预测失效，即使旧推理稍后返回，也不执行其剩余动作。普通推理等待期间记录 ``hold``，不作为人工示范。相机、CAN 和磁盘仍可能影响周期，30 Hz 是配置目标，不代表已经完成真机延迟验收。
 
-``b`` 的配对区间仍为 ``[start, end)``，奇数次标记在评分时延长到终止帧。复位先结束接管、关闭本回合记录，再按现有轨迹控制从臂并同步主臂；复位帧不进入训练数据。``--no-action-limits`` 沿用此前命令，关闭额外的 rollout 步幅检查，驱动行程限制继续生效。
+``b → s/f`` 标记局部 ``[start, end)`` 和独立的局部结果。右键结束 episode，若仍有打开的段先补评该段，再右键进入全局评分；到步数上限同样等待确认。长按 s/f 的重复字符不能越过右键确认。新标注为 v3，离线 warmup 已按版本接入局部终止 TD，v2 保持全局回报。共享局部 actor 已有显式手动评测入口，按关键段切换 actor/reference，见 ``piper_shared_deployment.rst``；默认加载器和专用网络仍拒绝局部格式。复位先结束接管、关闭本回合记录，再按现有轨迹控制从臂并同步主臂；复位帧不进入训练数据。``--no-action-limits`` 沿用此前命令，关闭额外的 rollout 步幅检查，驱动行程限制继续生效。
 
 视频编码与撤销
 --------------
@@ -70,7 +70,7 @@ Piper 人工接管与训练数据
 中断后继续采集
 --------------
 
-使用 ``bash toolkits/piper/eval_stage1.sh rollout --resume <原采集目录> --num-episodes 100`` 继续采集到累计 100 条。入口从原 ``run.json`` 恢复参数，并使用原 ``hardware.yaml``；原始启动快照保持不变，续采快照追加到 ``resumes/``。可覆盖目标条数、计算设备、语音和视频编码开关，其他采集配置沿用原设置。完整可执行命令见 ``order.md`` 第 8 节。
+仅新协议 ``critical-segment-v1`` 的目录支持续采，旧协议目录在模型加载前拒绝，需保留并另开新目录。使用 ``bash toolkits/piper/eval_stage1.sh rollout --resume <原采集目录> --num-episodes 100`` 继续采集到累计 100 条。入口从原 ``run.json`` 恢复参数，并使用原 ``hardware.yaml``；原始启动快照保持不变，续采快照追加到 ``resumes/``。可覆盖目标条数、计算设备、语音和视频编码开关，其他采集配置沿用原设置。完整可执行命令见 ``order.md`` 第 8 节。
 
 CLI 从模型加载到硬件、录制和语音清理结束一直持有目录文件锁。``rlinf/robotics/piper_collection.py`` 只读扫描各回合的 ``result.json`` 和目录编号，以回合结果恢复可能滞后的汇总，兼容旧目录没有 ``attempt`` 字段的情况。已发布录制核对动作表、视频头和元数据帧数；未评分或录制未提交的尝试保持原文件，恢复后的汇总将其排除。已发布文件损坏时在连接硬件前报错。``summary.json`` 和 ``annotations.json`` 从完整保留的回合重建，编号从所有尝试的最大值继续。
 
@@ -110,9 +110,9 @@ Evo-RL 的 ``action_values`` 和 ``_sent_action`` 表示选中目标与发送接
 继续使用离线 warmup
 -------------------
 
-采集时不需要 latent cache。后续继续通过 ``python -m toolkits.piper.warmup init -> cache -> train`` 处理，具体命令见 ``piper_offline_warmup.rst``。缓存由固定 Stage 1 生成，数据池保持为不可变 CPU 数据集；新增回合需要生成新清单和缓存。
+采集时不需要 latent cache。v2、v3 数据均可通过 ``python -m toolkits.piper.warmup init -> cache -> train`` 处理，分别使用全局或局部终止回报，具体边界见 ``piper_offline_warmup.rst``。缓存由固定 Stage 1 生成，数据池保持为不可变 CPU 数据集；新增回合需要生成新清单和缓存。
 
-混合回合的默认 behavior 仍为 reference 或 actor，逐帧人工标签决定 BC 的 human target，不能把整条混合回合标为 human。现有 critical-only warmup 只使用标注区间内的数据，区间外人工动作保留在原始数据中。
+混合回合的默认 behavior 仍为 reference 或 actor，逐帧人工标签决定 BC 的 human target，不能把整条混合回合标为 human。v2、v3 的 critical-only warmup 都只使用标注区间内的数据；区间外人工动作保留在原始数据中。
 
 原生在线接口与边界
 ------------------

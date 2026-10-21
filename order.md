@@ -1,10 +1,10 @@
 **RLinf critical phase 数据采集与离线 warmup（2026-10-18）**
 
-沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、按 `s/f` 评分，数据用于离线 actor-critic warmup。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。
+沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、用 `s/f` 结束并评分当前关键段，整条 episode 停下后另行评分。新标注为 v3，warmup 已接通局部终止训练。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。共享 RLT actor 的手动切换评测使用 `toolkits/piper/eval_shared.sh`，部署步骤见 [共享网络部署说明](docs/piper_shared_deployment.rst)。
 
 **1. 启动采集**
 
-在本机前台终端执行整段命令。先测试 20 条，正式采集时将 `piper_episodes` 改为 `100`。使用合并后的 `rlinf_piper`，其中已经包含多段 `b` 标注与奇数次自动补终点的改动。
+在本机前台终端执行整段命令。先测试 20 条，正式采集时将 `piper_episodes` 改为 `100`。使用包含 ``critical-segment-v1`` 采集协议的代码：b 开始、s/f 结束并评分局部，右键结束 episode 后独立评分整条；下文说明按键和 v3 数据的训练边界。
 
 ```bash
 cd /home/descfly/code/rlinf_piper
@@ -33,7 +33,7 @@ bash toolkits/piper/eval_stage1.sh rollout \
 
 `--no-action-limits` 和 `--reset-after-episode initial` 沿用原文件设置：前者关闭额外的 rollout 动作范围/步幅检查，驱动行程限制仍保留；后者在每条评分并保存后，张开夹爪、返回第一条开始时的姿态，再恢复夹爪位置。若本次希望手动复位，将后者改为 `--reset-after-episode none`。
 
-复位在 `s/f` 评分并保存完成后，或 `←` 撤销并释放录制资源后开始；首次启动程序不会先复位。`initial` 会将第一条开始时的关节/夹爪读数限制到驱动的合法目标范围，并在 `reset_pose.json` 中同时记录原始读数和实际复位目标，避免零位附近的小幅反馈偏差使复位被拒绝。若要每回合返回零位，使用 `--reset-after-episode zero`。
+复位在整条 episode 独立评分并保存完成后，或 `←` 撤销并释放录制资源后开始；首次启动程序不会先复位。`initial` 会将第一条开始时的关节/夹爪读数限制到驱动的合法目标范围，并在 `reset_pose.json` 中同时记录原始读数和实际复位目标，避免零位附近的小幅反馈偏差使复位被拒绝。若要每回合返回零位，使用 `--reset-after-episode zero`。
 
 **2. 按键与标注**
 
@@ -41,16 +41,18 @@ bash toolkits/piper/eval_stage1.sh rollout \
 
 | 按键 | 行为 |
 | --- | --- |
-| `→` | 恢复场景后开始当前回合。 |
-| `b` | 第一次进入 critical phase，第二次退出；第三、四次标记下一段，可以继续添加。 |
-| `s` / `f` | 停止下发动作，分别记为成功 / 失败并保存。 |
+| `→` | 就绪时开始；运行中停止下发新动作、保持最后目标并进入评分。 |
+| `b` | 进入 critical phase；段内重复 b 只提示需要 s/f 评分。 |
+| `s` / `f` | 运行中只关闭并评分当前关键段，继续普通阶段；整条任务停止后的独立评分界面才保存全局结果。 |
 | `←` | 直接停止并丢弃当前回合，无需评分；保存、复位或等待阶段也能撤销刚结束的回合。清理和复位完成后按 `→` 重采。 |
 | `r` | 复位失败时重试；续采发现上次复位未完成时，确认工作区后按此键完成复位。 |
 | `q` / `Ctrl-C` | 退出；此前完成的回合保留，当前未评分回合不进入训练标注清单。 |
 
-如果结束时 `b` 为奇数次，按 `s/f` 会自动将最后一段延长到终止帧，前面已配对的段保持原边界。完全没按 `b` 的回合仍保存录像和评分，但需要补标才能用于 warmup。刚按 `b` 就评分、尚未执行动作的空段会被忽略。
+正常顺序是 `b → s/f` 标第一段，再 `b → s/f` 标第二段；按 `→` 结束本回合后，另按 `s/f` 评分整条 episode。局部结果不自动决定全局结果。
 
-全回合由 SFT 模型执行，`b` 只改变标签。达到步数上限后程序停止下发动作，可按 `s/f` 评分或 `←` 丢弃。视频默认随采集流式编码，评分后只需收尾并保存元数据；等待保存和复位完成，再恢复场景并按 `→`。采够指定条数后，最后一条仍可按 `←` 撤销，按 `→` 确认结束。
+如果结束时段仍开启，按 `→` 停止下发新动作、先 `s/f` 补评局部，再 `→` 确认进入整体评分，最后 `s/f`。达到步数上限后同样先补评打开段，再右键确认整体评分。重复 s/f 不能越过确认键。零动作空段会删除；等待评分时不会恢复执行。左键、q 退出优先于同批评分。
+
+全回合由选定的 policy 执行，b 和局部 s/f 只改标注，不切换 actor/reference；右键结束不是硬件急停。视频随采集编码，整回合终止观测在等待评分前捕获，时间戳使用捕获时刻。保存和已配置复位完成后，再恢复场景、按右键开始下一条。采够指定条数后仍可左键撤销、右键确认结束。
 
 **3. 采集后检查数据**
 
@@ -87,9 +89,11 @@ PY
 - `reset_pose.json`：整次采集固定使用的复位目标；各回合的 `reset.jsonl` 记录实际复位过程。复位出错时先查看 `result.json` 的 `reset.error`，程序保持连接并等待 `r` 重试或 `q` 退出。
 - `discarded/`：左键撤销的采集尝试，保留结果、trace、已写入的文件和撤销时间供检查；未评分的尝试保留 `original_outcome=unscored`，视频可能不完整。这些目录不进入 `annotations.json`，也不计入成功率。
 
-`start` 包含该帧动作，`end` 不包含；最后一段自动延长时，`end` 等于 `terminal_frame`。终止帧只有观测，`action_valid=False`，不会作为训练动作。
+`start` 包含该帧动作，`end` 不包含；局部段在 episode 停止后补评分时，`end` 等于 `terminal_frame`。每段独立的 `outcome` 保存在 v3 annotations/result 中，LeRobot 的 episode_success 仍只表示全局结果。终止帧只有观测，`action_valid=False`，不会作为训练动作。
 
 **4. 数据确认后运行离线 warmup**
+
+本节命令按格式区分 v2 全局回报与 v3 局部终止回报。不得在 v2 内补写局部 outcome 或混用版本。v3 共享 actor 可通过显式手动评测入口加载；默认入口及专用网络仍拒绝，见上方共享网络部署说明。
 
 先用 `init` 固定训练/验证划分，这一步不启动训练或机械臂。需要有足够的独立回合用于划分；正式训练同时保留成功和失败。完全漏标的回合默认报错：补标后再执行，或明确加 `--skip-unlabeled` 排除这些回合。已有输出文件不会被覆盖。
 
@@ -171,18 +175,18 @@ bash toolkits/piper/eval_stage1.sh rollout \
 | `→` | 主臂对齐从臂，然后开始本回合。对齐中可按 `q` 退出。 |
 | `i` | 接管：主臂进入重力补偿，从臂跟随主臂；reference / actor 都不能覆盖人工动作。 |
 | 再按 `i` | 交还：两臂先保持最后的人工目标，等当前观测的新预测返回；接管前剩余动作作废。 |
-| `b` | 独立进入 / 退出 critical phase；接管本身不自动更改 critical 标签。 |
-| `s/f` | 停止、评分、保存，再复位；复位时主臂跟随，复位帧不录入训练数据。 |
+| `b` | 开始关键段，用 s/f 结束并评分；接管不自动更改 critical 标签。 |
+| `s/f` | 运行中只评当前关键段；右键结束整回合后独立评分，随后保存、复位。 |
 | `←` | 运行中或人工接管时直接停止并丢弃当前回合，无需 `s/f`；保存、复位和等待下一条时也可撤销。就绪后按 `→` 重采。 |
 | `q` / `Ctrl-C` | 退出，已完成回合保留。 |
 
 若习惯 Evo-RL 的 `o` 键，可加 `--intervention-key o`。交还后的等待保持仍记为人工段；普通推理等待记为 `hold`。采集线程在推理期间继续响应按键，但实际周期还受相机、CAN 和写盘影响，30 Hz 是名义配置。
 
-采集后仍用第 3、4 节检查并生成 warmup 清单。数据会保存逐帧 `is_intervention`、`critical_phase`、实际下发目标与请求目标；`action_source` 的编码为 `0=reference、1=actor、2=human、3=hold`，另存于 `dataset/meta/piper_control.json`。`policy_action_valid=False` 表示该帧没有有效 policy 输出，不能把占位零值当作预测。
+采集后用第 3 节检查数据；第 4 节按 v2/v3 分别使用全局/局部回报。数据会保存逐帧 `is_intervention`、`critical_phase`、实际下发目标与请求目标；`action_source` 的编码为 `0=reference、1=actor、2=human、3=hold`，另存于 `dataset/meta/piper_control.json`。`policy_action_valid=False` 表示该帧没有有效 policy 输出，不能把占位零值当作预测。
 
 `summary.json` 中 `success_rate` 是最终成功率，`autonomous_success_rate` 只把未接管的成功计入分子，分母仍为全部已评分回合；`intervention_rate` 是发生接管的回合比例。每回合另存 `takeovers` 和 `human_steps`。验收 SFT 自主效果时看自主成功率，避免把人工救回算成模型独立成功。
 
-HIL 采集前不需要 latent cache，后续继续用 `warmup init -> cache -> train`。当前 critical-only warmup 只取标注区间，区间外的人工动作保留在原始数据中；混合回合不要整条改成 `behavior=human`。
+HIL 采集前不需要 latent cache；新 v3 使用 `warmup init -> cache -> train` 的局部终止路径；相同边界的旧特征可用 `relabel-cache` 在新目录复用。当前 critical-only warmup 只取标注区间，区间外的人工动作保留在原始数据中；混合回合不要整条改成 `behavior=human`。
 
 原生在线 `PiperPolicyEnv` 已接入接管动作和标签回传，交还到新 chunk 才生效；它在分布式推理等待期间仍不能像本地入口一样连续响应接管。在线有效长度、跨阶段折扣和数据池恢复仍需后续接通，不能直接把 HIL 采集通过视为在线探索就绪。实现细节见 `/home/descfly/code/rlinf_piper/docs/piper_human_intervention_design.rst`。本次开发使用 CPU 和 mock 验证，尚未启动真机验收。
 
@@ -195,12 +199,12 @@ HIL 采集前不需要 latent cache，后续继续用 `warmup init -> cache -> t
 | 操作 / 状态 | 英文（默认） | 中文 |
 | --- | --- | --- |
 | 等待 / 开始 / 主臂对齐 | Ready / Start / Aligning | 就绪 / 开始 / 对齐 |
-| `b` 进入 / 退出 | Critical on / Critical off | 关键段开始 / 关键段结束 |
-| 自动补齐终点 / 空段 | Phase closed / Empty phase | 终点补齐 / 空段 |
+| `b` / 局部 `s/f` | Critical on / Segment succeeded or failed | 关键段开始 / 关键段成功或失败 |
+| 补评局部 / 空段 | Score the segment / Empty phase | 请评关键段 / 空段 |
 | `i` 接管 | Human control | 人工接管 |
 | 交还后等待预测 / 新 policy 动作生效 | Predicting / Policy control | 等待预测 / 模型接管 |
-| 等待评分 / 步数上限 | Score now / Step limit | 请评分 / 步数上限 |
-| `s/f` | Success / Failure | 成功 / 失败 |
+| 进入整体评分 / 等待整体结果 | Right to score the episode / Score the whole episode | 按右键进入整条评分 / 请评整条任务 |
+| 整体 `s/f` | Episode succeeded / Episode failed | 整条任务成功 / 整条任务失败 |
 | 保存中 / 保存完成 | Saving / Saved | 保存中 / 已保存 |
 | 漏标 critical phase | Unmarked phase | 未标关键段 |
 | 复位开始 / 轨迹结束 / 失败 | Resetting / Reset finished / Reset failed | 复位中 / 复位结束 / 复位失败 |
@@ -238,12 +242,12 @@ spd-say --wait --language cmn '采集语音播报测试。'
 
 **8. 中断后续采或增加目标条数**
 
-用 `--resume` 指向原来的整次采集目录，自动恢复模型路径、任务、主臂接管、critical 标注规则、步数上限、录制和复位配置。纯 SFT 与 HIL 共用这个入口。下面用已有 HIL 目录示例；如要接着另一批数据采，将 `piper_run_dir` 改成对应目录。
+仅新协议 `critical-segment-v1` 支持续采，旧协议目录须保留并另开新目录；入口在模型加载前拒绝旧 run.json。用 `--resume` 指向新协议的整次采集目录，自动恢复模型路径、任务、主臂接管、critical 标注规则、步数上限、录制和复位配置。纯 SFT 与 HIL 共用这个入口。下面用已有 HIL 目录示例；如要接着另一批数据采，将 `piper_run_dir` 改成对应目录。
 
 ```bash
 cd /home/descfly/code/rlinf_piper
 export PIPER_PYTHON="/home/descfly/code/rlinf_piper/.venv-piper/bin/python"
-piper_run_dir="/home/descfly/code/rlinf_piper/data/rlinf_sft50k_hil_20261018_143541"
+piper_run_dir="/home/descfly/code/rlinf_piper/outputs/piper/segment_scoring_collection"
 
 bash toolkits/piper/eval_stage1.sh rollout \
   --resume "$piper_run_dir" \

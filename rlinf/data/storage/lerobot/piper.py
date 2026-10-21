@@ -174,30 +174,34 @@ class PiperEpisodeRecorder:
             policy_action = requested
         policy_valid = valid and policy_action is not None
         frame["observation.state"] = frame["observation.state"].astype(np.float32)
-        frame.update({
-            "action": np.asarray(action, dtype=np.float32),
-            "task": self.task,
-            "complementary_info.requested_action": np.asarray(
-                requested, dtype=np.float32
-            ),
-            "complementary_info.command_state": np.asarray(measured, dtype=np.float32),
-            "complementary_info.action_valid": np.array([valid], dtype=bool),
-            "complementary_info.critical_phase": np.array([critical], dtype=bool),
-            "complementary_info.is_intervention": np.array(
-                [is_intervention], dtype=bool
-            ),
-            "complementary_info.action_source": np.array(
-                [ACTION_SOURCES[source]], dtype=np.int64
-            ),
-            "complementary_info.policy_action": np.asarray(
-                policy_action if policy_valid else np.zeros(7),
-                dtype=np.float32,
-            ),
-            "complementary_info.policy_action_valid": np.array(
-                [policy_valid], dtype=bool
-            ),
-            "complementary_info.wall_time": np.array([wall_time], dtype=np.float64),
-        })
+        frame.update(
+            {
+                "action": np.asarray(action, dtype=np.float32),
+                "task": self.task,
+                "complementary_info.requested_action": np.asarray(
+                    requested, dtype=np.float32
+                ),
+                "complementary_info.command_state": np.asarray(
+                    measured, dtype=np.float32
+                ),
+                "complementary_info.action_valid": np.array([valid], dtype=bool),
+                "complementary_info.critical_phase": np.array([critical], dtype=bool),
+                "complementary_info.is_intervention": np.array(
+                    [is_intervention], dtype=bool
+                ),
+                "complementary_info.action_source": np.array(
+                    [ACTION_SOURCES[source]], dtype=np.int64
+                ),
+                "complementary_info.policy_action": np.asarray(
+                    policy_action if policy_valid else np.zeros(7),
+                    dtype=np.float32,
+                ),
+                "complementary_info.policy_action_valid": np.array(
+                    [policy_valid], dtype=bool
+                ),
+                "complementary_info.wall_time": np.array([wall_time], dtype=np.float64),
+            }
+        )
         add_frame_to_dataset(self.dataset, frame)
 
     def add_step(
@@ -239,16 +243,25 @@ class PiperEpisodeRecorder:
         *,
         critical: bool,
         outcome: str,
+        wall_time: float | None = None,
         poll: Callable[[], None] | None = None,
     ) -> dict:
-        """Finish on a worker while the caller optionally services terminal input."""
+        """Publish the terminal observation with its capture time, not scoring time."""
+        if wall_time is None:
+            wall_time = time.time()
         if poll is None:
-            return self._finish(observation, critical=critical, outcome=outcome)
+            return self._finish(
+                observation, critical=critical, outcome=outcome, wall_time=wall_time
+            )
         with ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="piper-save"
         ) as worker:
             future = worker.submit(
-                self._finish, observation, critical=critical, outcome=outcome
+                self._finish,
+                observation,
+                critical=critical,
+                outcome=outcome,
+                wall_time=wall_time,
             )
             try:
                 while not future.done():
@@ -260,7 +273,9 @@ class PiperEpisodeRecorder:
                 self.request_discard()
                 raise
 
-    def _finish(self, observation: dict, *, critical: bool, outcome: str) -> dict:
+    def _finish(
+        self, observation: dict, *, critical: bool, outcome: str, wall_time: float
+    ) -> dict:
         """Append the terminal observation and publish a readable dataset."""
         try:
             if self.cancelled.is_set():
@@ -273,7 +288,7 @@ class PiperEpisodeRecorder:
                 measured=state,
                 critical=critical,
                 valid=False,
-                wall_time=time.time(),
+                wall_time=wall_time,
                 action_source="hold",
             )
             self.dataset.save_episode(parallel_encoding=False)
@@ -290,11 +305,13 @@ class PiperEpisodeRecorder:
             # Preserve explicit outcomes for the existing LeRobot metadata reader.
             with (self.root / "meta/episodes.jsonl").open("x") as stream:
                 stream.write(
-                    json.dumps({
-                        "episode_index": 0,
-                        "length": self.steps + 1,
-                        "episode_success": outcome == "success",
-                    })
+                    json.dumps(
+                        {
+                            "episode_index": 0,
+                            "length": self.steps + 1,
+                            "episode_success": outcome == "success",
+                        }
+                    )
                     + "\n"
                 )
             return {

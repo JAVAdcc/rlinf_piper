@@ -131,3 +131,65 @@ def piper_warmup_cache(tmp_path):
     manifest["content_fingerprint"] = json_fingerprint(manifest)
     write_json(root / "manifest.json", manifest)
     return root
+
+
+@pytest.fixture
+def piper_local_warmup_cache(piper_warmup_cache):
+    """Scored local segments whose outcomes deliberately differ from parents."""
+    import json
+
+    import numpy as np
+
+    from rlinf.data.datasets.rlt_warmup import (
+        cache_episode,
+        episode_transitions,
+        file_sha256,
+        json_fingerprint,
+        write_json,
+    )
+
+    root = piper_warmup_cache
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["format"] = "piper-rlt-cache-v3"
+    manifest["annotations"].update(
+        format="piper-rlt-episodes-v3",
+        reward_scope="critical_segment",
+        scoring_protocol="critical-segment-v1",
+    )
+    for entry, label in zip(
+        manifest["episodes"], manifest["annotations"]["episodes"], strict=True
+    ):
+        for record in (entry, label):
+            for ordinal, phase in enumerate(record["critical_phases"]):
+                phase["outcome"] = "success" if ordinal == 0 else "failure"
+        with np.load(root / entry["file"], allow_pickle=False) as shard:
+            old = {key: shard[key].copy() for key in shard.files}
+        end = entry["terminal_frame"]
+        transitions = episode_transitions(
+            np.zeros((end + 1, 7), dtype=np.float32),
+            phases=entry["critical_phases"],
+            terminal=end,
+            chunk_length=10,
+            stride=10,
+            success=entry["outcome"] == "success",
+            human=np.zeros(end + 1, dtype=bool),
+            reward_scope="critical_segment",
+        )
+
+        def features(frame):
+            row = np.flatnonzero(old["frames"] == frame).item()
+            return {
+                key: old[key][row]
+                for key in ("z_rl", "proprio", "ref_chunk", "raw_state")
+            }
+
+        cache_episode(root / entry["file"], transitions, features)
+        entry.update(
+            sha256=file_sha256(root / entry["file"]),
+            states=len(transitions["frames"]),
+            transitions=len(transitions["current"]),
+        )
+    manifest.pop("content_fingerprint")
+    manifest["content_fingerprint"] = json_fingerprint(manifest)
+    write_json(root / "manifest.json", manifest)
+    return root

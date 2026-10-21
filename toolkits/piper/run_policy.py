@@ -70,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, help="Local LeRobot dataset for infer")
     parser.add_argument(
         "--video-backend",
-        default="pyav",
+        default="torchcodec",
         choices=("pyav", "torchcodec"),
         help="Decoder for hardware-free dataset inference",
     )

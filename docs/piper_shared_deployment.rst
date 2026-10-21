@@ -17,6 +17,8 @@
 
 先解压共享 actor 包到 ``checkpoints/piper_shared_prejoint/actor``，使用现场现有的 Stage1 和环境。以下两个 ``infer`` 命令读取录像，不连接机器人；先比较 H50 reference 与 C10 actor 的结果及耗时。
 
+离线推理默认使用 TorchCodec 解码，与 warmup cache 一致。本机 torchvision 0.26 已无 ``VideoReader``，旧 ``pyav`` 路径会在读帧时报错；保留该接口的旧环境仍可显式选择 ``--video-backend pyav``。
+
 .. code-block:: bash
 
    cd /home/descfly/code/rlinf_piper

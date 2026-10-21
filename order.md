@@ -1,6 +1,6 @@
-**RLinf critical phase 数据采集与离线 warmup（2026-10-18）**
+**RLinf critical phase 数据采集、离线 warmup 与共享 actor 评测（2026-10-21）**
 
-沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、用 `s/f` 结束并评分当前关键段，整条 episode 停下后另行评分。新标注为 v3，warmup 已接通局部终止训练。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。共享 RLT actor 的手动切换评测使用 `toolkits/piper/eval_shared.sh`，部署步骤见 [共享网络部署说明](docs/piper_shared_deployment.rst)。
+沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、用 `s/f` 结束并评分当前关键段，整条 episode 停下后另行评分。新标注为 v3，warmup 已接通局部终止训练。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。共享 RLT actor 的本机路径、评测和续采命令见第 9 节，原部署流程见 [共享网络部署说明](docs/piper_shared_deployment.rst)。
 
 **1. 启动采集**
 
@@ -263,3 +263,64 @@ bash toolkits/piper/eval_stage1.sh rollout \
 `initial` 始终使用第一次采集的 `reset_pose.json`，重启时不会把当前姿态替换为原复位点。如果上次在回合、保存或复位途中退出，且启用了自动复位，先确认工作区并按 `r` 返回原复位点，再恢复场景、按 `→` 开始。上次复位已经完成时直接等待 `→`。这两种状态均有终端和语音提示。
 
 启动时检查已完成录制的动作表和视频帧数；已完成数据缺文件、元数据损坏或复位目标缺失时会报错，修复后再续采。CLI 对目录持有进程锁，防止两个新版本采集进程同时写入；退出后锁自动释放，无须删除 `.collection.lock`。原 `run.json`、`hardware.yaml` 和 `policy.json` 保留，每次续采的启动快照另存于 `resumes/`。采集全部确认后再执行第 4 节；已有 warmup 清单和 cache 不会随续采自动扩充，新增数据需使用新的清单、cache 和训练输出路径。
+
+**9. 共享 actor 在本机评测（2026-10-21）**
+
+已拉取分支 `piper/warmup-shared-20261021` 的部署提交 `6378dc4686fdb28cdb305366a11be47277838b3d`。阿里云原始说明和压缩包保存在 `/home/descfly/deploy/piper_20261021/`；小网络解压到 `checkpoints/piper_shared_prejoint/actor/`，Stage1 继续使用下方的本地 50k 权重。压缩包、包内文件、完整 Stage1 权重及归一化文件均已核对 SHA256。部署包记录 BC 5,000 步、critic 10,000 步、joint 0 步，原始 readiness 保存在 `checkpoints/piper_shared_prejoint/original_readiness.json`。
+
+以下设置供离线推理和真机评测共用；`PIPER_DATA_PATH` 是已有录像，只用于不连接硬件的推理检查。
+
+```bash
+cd /home/descfly/code/rlinf_piper
+
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_shared_prejoint/actor"
+export PIPER_DATA_PATH="$PWD/data/rlinf_sft50k_hil_20261018_143541/episode_001/dataset"
+
+bash toolkits/piper/eval_shared.sh infer-reference --frame 300
+bash toolkits/piper/eval_shared.sh infer-actor --frame 300
+```
+
+本机默认使用 TorchCodec 解码；旧 `pyav` 路径依赖的 `torchvision.io.VideoReader` 在当前环境已不存在。2026-10-21 在 RTX 5090 上读取上述第 300 帧，两路完整 GPU 推理均通过：reference 为 `50×7`、约 0.50 秒，actor 为 `10×7`、约 0.42 秒，输出均为有限值。这是单帧加载与推理检查，实际循环频率和成功率需由 rollout 测量。249 项 Piper 回归通过；结果及日志位于 `/home/descfly/deploy/piper_20261021/checks/`。
+
+准备好场景后，在前台终端启动一条带主臂接管的评测。脚本默认录制、流式编码，保留动作范围/步幅检查；下面选择手动复位。需要自动回到第一条起点时，将 `none` 改为 `initial`。
+
+```bash
+cd /home/descfly/code/rlinf_piper
+piper_run_dir="$PWD/outputs/piper/shared_prejoint_$(date +%Y%m%d_%H%M%S)"
+
+bash toolkits/piper/eval_shared.sh rollout \
+  --teleop piper_leader \
+  --num-episodes 1 \
+  --steps 3600 \
+  --replan-steps 50 \
+  --speech-language zh \
+  --reset-after-episode none \
+  --output-dir "$piper_run_dir"
+```
+
+| 操作 | 共享 actor 评测中的行为 |
+| --- | --- |
+| 就绪时 `→` | 开始整条 episode，先执行 H50 reference。 |
+| `b` | 开始关键段并切到共享 C10 actor；段内重复 `b` 不结束该段。 |
+| 段内 `s/f` | 独立评分该段并切回 reference，整条任务继续运行。 |
+| 运行中 `→` | 停止下发新动作，进入整条任务的评分流程。 |
+| `i` | 人工接管 / 交还，接管优先于 actor/reference；critical 标注保持独立。 |
+| `←` | 直接丢弃当前 episode；评分后的保存、复位、等待阶段也可撤销。 |
+
+按 `→` 停止时若没有未评分段，另按一次 `s/f` 评分整条；若还有未评分段，则先 `s/f` 补评段，再 `→` 进入整体评分，最后 `s/f`。达到步数上限时也需要右键确认整体评分。每段保存 `[start, end)` 和独立的 `outcome`，整条 `outcome` 另存；段评分不会推断整条结果。切换会清空旧 chunk、拒绝过期异步预测，人工交还等到新命令真正下发才结束人工归属。保存与已配置的复位完成后，右键开始下一条或确认全部结束。
+
+共享 actor 的续采使用公共入口，从原目录恢复权重身份、接管和采集设置。例如将累计保留目标增加到 5 条：
+
+```bash
+cd /home/descfly/code/rlinf_piper
+# 换终端后，将 piper_run_dir 设为上次实际输出目录。
+USE_TF=0 JAX_PLATFORMS=cpu "$PIPER_PYTHON" -m toolkits.piper.run_policy rollout \
+  --resume "$piper_run_dir" \
+  --num-episodes 5
+```
+
+不能将旧版 v2 数采目录续采成 v3，也不能在同一目录替换 actor 权重；更换协议或模型时新建输出目录。续采直接调用上述公共入口，`eval_shared.sh` 的新建运行默认参数不适用于 `--resume`。
+
+当前入口执行共享 actor 的手动切换评测和数据采集，不启动在线更新。脚本显式使用 `--allow-offline-actor`，原 readiness 仍为 false：验证中的失败段覆盖、动作检查和部分 TD/Q 指标未通过，不能把离线训练步数完成或本次推理通过当作在线探索已验收。旧 `examples/embodiment/config/piper_rlt_stage2.yaml` 仍配置 H10 reference、BF16 和非离散 state，`PiperPolicyEnv` 仍用 `a/b/c/q` 及整条奖励；后续在线学习需对齐当前 H50 FP32 权重、逐段评分和局部终止回报，再接训练更新。二分类 phase monitor 目前只提供建议状态，未参与自动切换。

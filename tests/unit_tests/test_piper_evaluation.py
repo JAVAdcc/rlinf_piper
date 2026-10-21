@@ -526,7 +526,9 @@ def test_hil_recording_keeps_critical_labels_independent_and_scores_autonomy(tmp
     assert result["takeovers"] == 1 and result["human_steps"] == 3
     assert result["critical_phases"] == [{"start": 0, "end": 2, "outcome": "success"}]
     root = tmp_path / "episode_001/dataset"
-    dataset = lerobot.LeRobotDataset("piper/rollout", root=root, video_backend="pyav")
+    dataset = lerobot.LeRobotDataset(
+        "piper/rollout", root=root, video_backend="torchcodec"
+    )
     for idx in range(3):
         assert dataset[idx]["complementary_info.is_intervention"].item()
         assert dataset[idx]["complementary_info.action_source"].item() == 2
@@ -973,7 +975,9 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
     ]
     assert labels["episodes"][1]["terminal_frame"] == 1
     root = tmp_path / "episode_001/dataset"
-    dataset = lerobot.LeRobotDataset("piper/rollout", root=root, video_backend="pyav")
+    dataset = lerobot.LeRobotDataset(
+        "piper/rollout", root=root, video_backend="torchcodec"
+    )
     assert len(dataset) == 8 and load_episode_outcomes(root) == {0: True}
     for i in range(8):
         sample = dataset[i]
@@ -995,7 +999,7 @@ def test_recorded_trials_have_aligned_actions_terminal_views_and_phase_labels(
     extended = lerobot.LeRobotDataset(
         "piper/rollout",
         root=tmp_path / "episode_002/dataset",
-        video_backend="pyav",
+        video_backend="torchcodec",
     )
     assert bool(extended[0]["complementary_info.critical_phase"].item())
     assert not bool(extended[1]["complementary_info.critical_phase"].item())

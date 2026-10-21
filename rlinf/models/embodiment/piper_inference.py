@@ -244,11 +244,18 @@ class PiperRLTPolicy:
                 root = root / "actor"
             metadata = json.loads((root / "piper_rlt_actor.json").read_text())
             local = metadata.get("format") == "rlinf-piper-rlt-offline-local-actor-v1"
+            online_segment = (
+                metadata.get("format") == "rlinf-piper-rlt-online-segment-actor-v1"
+            )
+            if online_segment and not manual_critical:
+                raise ValueError(
+                    "Segment-trained online actors require manual critical routing."
+                )
             if local and not (manual_critical and allow_offline_actor):
                 raise ValueError(
                     "Offline local actors require manual critical routing and explicit experimental opt-in."
                 )
-            if local and (
+            if (local or online_segment) and (
                 "phase_filter" not in metadata
                 or metadata.get("phase_filter") is not None
                 or metadata.get("reward_scope") != "critical_segment"
@@ -261,6 +268,7 @@ class PiperRLTPolicy:
                 not in (
                     "rlinf-piper-rlt-actor-v1",
                     "rlinf-piper-rlt-offline-local-actor-v1",
+                    "rlinf-piper-rlt-online-segment-actor-v1",
                 )
                 or metadata.get("stage1_checkpoint_id")
                 != self.manifest["checkpoint_id"]
@@ -319,11 +327,14 @@ class PiperRLTPolicy:
         task: str,
         *,
         actor_enabled: bool | None = None,
+        mode: str = "eval",
     ) -> np.ndarray:
         """Predict in normalized RLT action space, then decode for the executor."""
         from rlinf.algorithms.rlt import predict_rlt_actions
         from rlinf.algorithms.rlt.route import RealworldRLTRoute
 
+        if mode not in ("train", "eval"):
+            raise ValueError("RLT inference mode must be train or eval.")
         env_obs = piper_env_observation(observation, task)
         if getattr(self, "manual_critical", False) and actor_enabled is None:
             raise ValueError(
@@ -341,7 +352,7 @@ class PiperRLTPolicy:
                 rlt_route=RealworldRLTRoute(),
                 env_obs=env_obs,
                 final_obs=None,
-                mode="eval",
+                mode=mode,
                 rlt_switch_flags=torch.ones(1, dtype=torch.bool),
             )
         actions = actions.detach().float().cpu().numpy()

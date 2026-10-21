@@ -323,4 +323,46 @@ USE_TF=0 JAX_PLATFORMS=cpu "$PIPER_PYTHON" -m toolkits.piper.run_policy rollout 
 
 不能将旧版 v2 数采目录续采成 v3，也不能在同一目录替换 actor 权重；更换协议或模型时新建输出目录。续采直接调用上述公共入口，`eval_shared.sh` 的新建运行默认参数不适用于 `--resume`。
 
-当前入口执行共享 actor 的手动切换评测和数据采集，不启动在线更新。脚本显式使用 `--allow-offline-actor`，原 readiness 仍为 false：验证中的失败段覆盖、动作检查和部分 TD/Q 指标未通过，不能把离线训练步数完成或本次推理通过当作在线探索已验收。旧 `examples/embodiment/config/piper_rlt_stage2.yaml` 仍配置 H10 reference、BF16 和非离散 state，`PiperPolicyEnv` 仍用 `a/b/c/q` 及整条奖励；后续在线学习需对齐当前 H50 FP32 权重、逐段评分和局部终止回报，再接训练更新。二分类 phase monitor 目前只提供建议状态，未参与自动切换。
+`eval_shared.sh` 执行共享 actor 的手动切换评测和数据采集，不启动在线更新。在线训练使用下面的独立配置，沿用当前 H50 FP32 / C10 和逐段评分。原 readiness 仍为 false；脚本的实验选项不会改写报告。二分类 phase monitor 目前只提供建议状态，未参与自动切换。
+
+## 10. 原生 RLT online 训练与续训
+
+`train_online.sh` 在现有数采入口上启用原生 RLT learner、replay 和权重同步。首版在每条 episode 确认保留后训练，下一条使用新 actor；机械臂执行期间不更新权重。初始化加载云端共享 actor 和 critic，Stage1 保持冻结，不再重复离线 warmup。以下命令由操作员在现场终端运行：
+
+```bash
+cd /home/descfly/code/rlinf_piper
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_shared_prejoint/actor"
+piper_online_dir="/media/descfly/新加卷/value/data_inference/rlinf_online_$(date +%Y%m%d_%H%M%S)"
+
+bash toolkits/piper/train_online.sh \
+  --teleop piper_leader \
+  --num-episodes 5 \
+  --no-action-limits \
+  --output-dir "$piper_online_dir"
+```
+
+脚本默认 `--steps 7200 --replan-steps 50 --record-dataset --reset-after-episode initial`；关键段仍只执行 C10。`--no-action-limits` 沿用此前现场命令，底层驱动裁剪仍保留。若需要额外的步幅检查，去掉该参数。默认使用第 9 节下载的共享权重，也可通过上述环境变量指定另一个相容 checkpoint。
+
+操作仍为 `→` 开始、`b` 进入关键段、`s/f` 结束并评分该段、`i` 人工接管；运行中 `→` 停止整条，再另行 `s/f` 评分。段内 `s/f` 不停止整条任务。`←` 在执行、评分、编码、复位或等待下一条时丢弃当前或上一条，丢弃数据不入池。**保存、复位结束后的 `→` 会确认保留上一条并启动训练，此后这一条不能撤销；训练和权重同步结束后开始下一条。** 最后一条也要按 `→` 确认，才会提交训练。`q` 退出时尚未确认的数据保持可撤销，续训时再确认。
+
+默认每次确认执行 32 次 critic 更新、8 次 actor 更新，batch 上限 64，`gamma=0.995` 按实际执行 tick 折扣。Q 权重在前 1,000 次 online critic 更新中从 0 渐增至 0.1，BC 权重从 5 降至 2；actor 使用 checkpoint 的 `fixed_std=0.002` 采样探索。这是首测配置，不是已经证明最优的训练配方。
+
+参数集中在 `examples/embodiment/config/piper_rlt_online.yaml`，公共入口等价于 `run_policy rollout ... --online-config <配置>`。数据在确认后自动提取 frozen latent，每个需要的帧提取一次，保存在该 episode 的 `online_features.npz`；无需事先为新数据运行 warmup cache 命令。首版提取和训练都在回合间完成，长关键段会增加等待时间。
+
+默认只采样新确认的数据，窗口是最近 200 条含有效关键段的 episode。若已有与此 Stage1、任务及 H50/C10 一致的 warmup cache，可复制配置并设置 `piper.offline_cache`，然后通过 `--online-config` 指定；只导入其 train split，validation 不进训练池。启用后使用原生双池采样，online 池与 demo 池各提供半个 batch，人工接管 chunk 也进入 demo 池；数据不足时实际 batch 会较小。云端 warmup 权重本身不包含旧数据池。
+
+续训仍用同一个输出目录，恢复 actor、critic、target、optimizer、replay、更新计数和随机数状态：
+
+```bash
+cd /home/descfly/code/rlinf_piper
+# 换终端后，将此变量设为上次实际输出目录。
+bash toolkits/piper/train_online.sh --resume "$piper_online_dir" --num-episodes 100
+```
+
+`--num-episodes` 是累计保留目标。续训读取目录内 `online.yaml` 和硬件快照，不能同时传入新的权重或训练配置；确认后中断的更新会从最后完整 checkpoint 重做，已完成提交不会重复训练。新开训练目录加载 warmup 导出时会新建 optimizer 和 target，这与 `--resume` 不同。
+
+每条 `result.json` 记录实际使用的 `policy_version`；`online_update.json` 记录 loss、训练耗时和执行端收到的新权重版本及摘要。最新 checkpoint 由 `online/latest.json` 指向，`online/checkpoint_XXXXXX/actor` 同时提供完整续训状态和可供 `eval_shared.sh` 加载的完整小网络权重。默认保留最近 3 份 checkpoint，续训进程正在读取的旧 checkpoint 也会保留。原始录像与 replay 文件持续保留。
+
+已验证录制图像 → 真实 Stage1 特征 → 原生 replay → actor/critic 更新 → 原生权重广播 → 新版本推理，并验证恢复及重复提交保护。GPU 检查使用合成段标签验证程序闭环，不代表任务成功率；真机 online 效果需运行上述命令验收。完整流程和无硬件复测命令见 `docs/piper_online_training.rst`。

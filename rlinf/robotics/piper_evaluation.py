@@ -140,6 +140,7 @@ def evaluate_piper(
     policy_source: str = "reference",
     announce: Callable[[str, int], None] | None = None,
     resume: bool = False,
+    on_accept: Callable[[Path, dict], None] | None = None,
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
 
@@ -154,6 +155,9 @@ def evaluate_piper(
     Optional announcement delivery is best-effort and cannot abort collection.
     Resume restores attempts and the reset target from this exclusively owned
     output directory. ``num_episodes`` remains the total retained target.
+    With ``on_accept``, Right commits the previous trial before starting another
+    one. The callback runs while stopped, after recording/reset and the undo
+    window. Accepted trials cannot be discarded, including after resume.
     """
     if num_episodes <= 0 or steps <= 0:
         raise ValueError("Episode count and step limit must be positive.")
@@ -265,6 +269,8 @@ def evaluate_piper(
         return summary
 
     def discard_trial(trial: dict) -> None:
+        if trial.get("accepted", False):
+            raise ValueError("An accepted training episode cannot be discarded.")
         if trial["outcome"] == "discarded":
             return
         trial["original_outcome"] = trial["outcome"]
@@ -376,7 +382,9 @@ def evaluate_piper(
     attempt_number = max((x["attempt"] for x in episodes), default=0)
     undoable = (
         episodes[-1]
-        if episodes and episodes[-1]["outcome"] in ("success", "failure")
+        if episodes
+        and episodes[-1]["outcome"] in ("success", "failure")
+        and not episodes[-1].get("accepted", False)
         else None
     )
     if resume:
@@ -469,6 +477,20 @@ def evaluate_piper(
                     if "right" in pressed:
                         break
                     time.sleep(0.02)
+                if undoable is not None and on_accept is not None:
+                    # Persist acceptance first. A failed update is retried from the
+                    # last committed learner checkpoint on resume, never undone.
+                    undoable["accepted"] = True
+                    _write_json(
+                        output / undoable["directory"] / "result.json", undoable
+                    )
+                    summarize("training")
+                    notify("training")
+                    on_accept(output / undoable["directory"], undoable)
+                    notify("updated")
+                    if "q" in keys.poll():
+                        raise KeyboardInterrupt
+                    keys.clear()
                 if final_review:
                     break
                 undoable = None
@@ -519,6 +541,8 @@ def evaluate_piper(
                     "takeovers": 0,
                     "human_steps": 0,
                 }
+                if on_accept is not None:
+                    result["policy_version"] = int(policy.version)
                 _write_json(episode_dir / "result.json", result)
                 summarize("running_episode")
                 started = time.monotonic()

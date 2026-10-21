@@ -304,6 +304,7 @@ class TrajectoryReplayBuffer:
 
         # Async save executor for add_trajectories
         self._save_executor = ThreadPoolExecutor(max_workers=20)
+        self._pending_saves = []
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
         self._index_lock = threading.Lock()
@@ -513,7 +514,7 @@ class TrajectoryReplayBuffer:
                 self._save_metadata()
                 self._save_trajectory_index()
 
-            self._save_executor.submit(_flush_metadata)
+            self._pending_saves.append(self._save_executor.submit(_flush_metadata))
 
     def _reshape_flat_for_save(self, value: object, T: int, B: int) -> object:
         if isinstance(value, torch.Tensor):
@@ -533,6 +534,14 @@ class TrajectoryReplayBuffer:
             self._save_executor.shutdown(wait=wait)
         if self._checkpoint_executor is not None:
             self._checkpoint_executor.shutdown(wait=wait)
+        if wait:
+            self.flush()
+
+    def flush(self):
+        """Wait for accepted writes and propagate asynchronous save failures."""
+        for future in self._pending_saves:
+            future.result()
+        self._pending_saves.clear()
 
     def sample(
         self,
@@ -928,6 +937,7 @@ class TrajectoryReplayBuffer:
         """
         Save buffer state (metadata and indices) to save_path.
         """
+        self.flush()
         # Create save directory
         os.makedirs(save_path, exist_ok=True)
 
@@ -970,15 +980,19 @@ class TrajectoryReplayBuffer:
                     )
                 )
         else:
-            for trajectory_id in self._window_cache_ids:
+            # A checkpoint must contain every indexed trajectory, including
+            # unsampled data and data restored from an earlier checkpoint.
+            for trajectory_id in self._trajectory_id_list:
                 model_weights_id = self._trajectory_index[trajectory_id][
                     "model_weights_id"
                 ]
                 trajectory_path = self._get_trajectory_path(
-                    trajectory_id, model_weights_id
+                    trajectory_id,
+                    model_weights_id,
+                    base_dir=self._trajectory_file_path[trajectory_id],
                 )
                 if not os.path.isfile(trajectory_path):
-                    continue
+                    raise FileNotFoundError(trajectory_path)
 
                 # copy trajectory file from trajectory_path to save_path
                 target_path = os.path.join(save_path, os.path.basename(trajectory_path))

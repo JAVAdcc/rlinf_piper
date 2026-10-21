@@ -1061,6 +1061,7 @@ class Trajectory:
                     dones=dones,
                     prev_logprobs=prev_logprobs,
                     prev_values=prev_values,
+                    versions=apply_mask(self.versions, i),
                     forward_inputs=forward_inputs,
                     curr_obs=curr_obs,
                     next_obs=next_obs,

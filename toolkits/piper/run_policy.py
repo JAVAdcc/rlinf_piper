@@ -19,6 +19,7 @@ import json
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="With manual-critical mode, select actor for an offline infer command (default reference)",
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--online-config",
+        type=Path,
+        help="Train native RLT workers after Right accepts an episode; requires recorded manual-critical rollout",
+    )
     parser.add_argument(
         "--task", help="Training task text; infer defaults to the dataset task"
     )
@@ -212,7 +218,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 if key in vars(args) and key not in ("command", "resume", "output_dir")
             }
             # Historical wrapper runs used the repository as their working directory.
-            for key in ("checkpoint", "actor", "hardware", "dataset"):
+            for key in ("checkpoint", "actor", "hardware", "dataset", "online_config"):
                 if defaults.get(key) is not None:
                     path = Path(defaults[key]).expanduser()
                     if not path.is_absolute():
@@ -262,6 +268,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--record-dataset requires interactive rollout.")
     if args.record_dataset and args.backend != "rlt":
         parser.error("The warmup data recorder requires the RLT backend.")
+    if args.online_config is not None:
+        if (
+            args.command != "rollout"
+            or not args.record_dataset
+            or args.actor_mode != "manual-critical"
+        ):
+            parser.error(
+                "--online-config requires --record-dataset and --actor-mode manual-critical rollout."
+            )
+        if args.device != "cuda:0":
+            parser.error("The current online profile uses the single local GPU cuda:0.")
+        if args.replan_steps is not None and args.replan_steps < 10:
+            parser.error("Online H50/C10 execution requires --replan-steps >= 10.")
     if any(
         value is not None
         for value in (args.teleop, args.leader_usb_serial, args.intervention_key)
@@ -306,6 +325,13 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, output: Path) -> None:
+    with ExitStack() as stack:
+        _run_with_resources(args, output, stack)
+
+
+def _run_with_resources(
+    args: argparse.Namespace, output: Path, stack: ExitStack
+) -> None:
     """Execute under the run lock, keeping original launch snapshots immutable."""
     from rlinf.models.embodiment.piper_inference import PiperCFGPolicy, PiperRLTPolicy
     from rlinf.robotics.piper_reset import PiperResetTiming
@@ -376,17 +402,35 @@ def _run(args: argparse.Namespace, output: Path) -> None:
                         f"Missing {module}; install requirements/embodied/piper-hil.txt."
                     )
     torch.manual_seed(args.seed)
-    policy = (
-        PiperRLTPolicy(
+    online = None
+    if args.online_config is not None:
+        from rlinf.runners.piper_online_runner import PiperOnlineRunner, online_config
+
+        cfg = online_config(
+            output / "online.yaml" if args.resume is not None else args.online_config,
+            stage1=args.checkpoint,
+            actor=args.actor,
+            hardware=OmegaConf.to_container(hardware, resolve=True),
+            task=args.task,
+            output=output,
+            allow_offline_actor=args.allow_offline_actor,
+        )
+        OmegaConf.save(cfg, metadata_output / "online.yaml")
+        online = stack.enter_context(
+            PiperOnlineRunner(cfg, output, resume=args.resume is not None)
+        )
+    if online is not None:
+        policy = online.policy
+    elif args.backend == "rlt":
+        policy = PiperRLTPolicy(
             args.checkpoint,
             actor=args.actor,
             device=args.device,
             manual_critical=args.actor_mode == "manual-critical",
             allow_offline_actor=args.allow_offline_actor,
         )
-        if args.backend == "rlt"
-        else PiperCFGPolicy(args.checkpoint, device=args.device)
-    )
+    else:
+        policy = PiperCFGPolicy(args.checkpoint, device=args.device)
     if args.resume is not None and (output / "policy.json").exists():
         if policy.manifest != read_collection_json(output / "policy.json"):
             raise ValueError(
@@ -448,11 +492,18 @@ def _run(args: argparse.Namespace, output: Path) -> None:
                 )
 
             print(
-                "Interactive evaluation enables the follower after cameras connect, "
+                f"Interactive {'online training' if online is not None else 'evaluation'} enables the follower after cameras connect, "
                 f"then waits for Right. Reset after trial: {args.reset_after_episode}. "
                 "Keep this terminal focused: b starts a segment; s/f ends and scores only that segment while actions continue. Right stops the episode for a separate s/f score; Left stops and discards it.",
                 flush=True,
             )
+            if online is not None:
+                print(
+                    f"Online policy version: {policy.version}. After recording and reset, "
+                    "Right accepts the previous episode, trains, and installs the next policy. "
+                    "Accepted episodes cannot be discarded; q leaves an unaccepted episode pending for resume.",
+                    flush=True,
+                )
             try:
                 with (
                     PiperAnnouncer(
@@ -481,6 +532,7 @@ def _run(args: argparse.Namespace, output: Path) -> None:
                         else "reference",
                         announce=announcements,
                         resume=args.resume is not None,
+                        on_accept=online.accept_episode if online is not None else None,
                     )
             except KeyboardInterrupt:
                 print(

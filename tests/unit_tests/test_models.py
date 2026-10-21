@@ -51,6 +51,114 @@ from rlinf.utils.env_helpers.delay_sampler import (
 )
 
 
+def test_piper_online_native_losses_match_masked_segment_warmup():
+    import copy
+
+    from rlinf.algorithms.rlt.segment import (
+        action_mask,
+        actor_training_observation,
+        discounted_target,
+        masked_behavior_loss,
+    )
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.workers.actor.piper_rlt_worker import PiperRLTActor, segment_loss_batch
+
+    # Process setup is exercised by the GPU smoke test; these are real model
+    # forwards with the same native replay tensors passed to the worker.
+    worker = object.__new__(PiperRLTActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"num_action_chunks": 10, "action_dim": 7}},
+            "algorithm": {
+                "gamma": 0.995,
+                "bc_weight": 2.0,
+                "q_weight": 0.1,
+                "reference_dropout_prob": 0.0,
+            },
+            "piper": {"driver_action_bounds": [[-0.2] * 7, [0.2] * 7]},
+        }
+    )
+    worker.model = RLTMLPPolicy(
+        z_dim=8,
+        proprio_dim=7,
+        action_dim=7,
+        num_action_chunks=10,
+        ref_num_action_chunks=50,
+    )
+    worker.target_model = copy.deepcopy(worker.model).requires_grad_(False)
+    obs = {
+        "z_rl": torch.randn(3, 8),
+        "proprio": torch.randn(3, 7),
+        "ref_chunk": torch.randn(3, 50, 7),
+    }
+    batch = {
+        "curr_obs": obs,
+        "next_obs": obs,
+        "actions": torch.zeros(3, 70),
+        "intervene_flags": torch.zeros(3, 70, dtype=torch.bool),
+        "rewards": torch.zeros(3, 10),
+        "terminations": torch.zeros(3, 10, dtype=torch.bool),
+        "forward_inputs": {
+            "valid_steps": torch.tensor([10, 3, 4]),
+            "discount_steps": torch.tensor([10, 3, 4]),
+            "next_valid_steps": torch.tensor([3, 0, 0]),
+        },
+    }
+    batch["rewards"][1, 2] = 1
+    batch["terminations"][1, 2] = True
+    batch["terminations"][2, 3] = True
+    batch["intervene_flags"][1, :14] = True
+    batch["actions"][1, :14] = 0.15
+    data = segment_loss_batch(batch, 10, 7)
+    original_ref = obs["ref_chunk"].clone()
+    conditioned = actor_training_observation(data)
+    torch.testing.assert_close(
+        conditioned["ref_chunk"][1, :2], torch.full((2, 7), 0.15)
+    )
+    torch.testing.assert_close(obs["ref_chunk"], original_ref)
+    torch.manual_seed(123)
+    with torch.no_grad():
+        predicted, _, _ = worker.model.sac_forward(obs)
+        masked = (
+            predicted.reshape(3, 10, 7).clamp(-0.2, 0.2)
+            * action_mask(data["next_valid_steps"], 10)[..., None]
+        )
+        next_q = worker.target_model.sac_q_forward(obs, masked).min(-1).values
+        target = discounted_target(data, next_q, 0.995)
+        assert target[1].item() == pytest.approx(0.995**2)
+        assert target[2].item() == 0
+        expected = (
+            (worker.model.sac_q_forward(obs, data["actions"]) - target[:, None])
+            .square()
+            .mean()
+        )
+    torch.manual_seed(123)
+    actual, _ = worker.forward_critic(batch)
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    assert all(p.grad is None for p in worker.model.backbone.parameters())
+    assert any(p.grad is not None for p in worker.model.q_head.parameters())
+    worker.model.zero_grad()
+    torch.manual_seed(456)
+    predicted, _, _ = worker.model.sac_forward(conditioned)
+    masked = (
+        predicted.reshape(3, 10, 7).clamp(-0.2, 0.2)
+        * action_mask(data["valid_steps"], 10)[..., None]
+    )
+    expected_actor = (
+        2 * masked_behavior_loss(predicted, data)
+        - 0.1 * worker.model.sac_q_forward(obs, masked)[:, 0].mean()
+    )
+    torch.manual_seed(456)
+    actual_actor, _, _ = worker.forward_actor(batch)
+    torch.testing.assert_close(actual_actor, expected_actor)
+    actual_actor.backward()
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in worker.model.backbone.parameters()
+    )
+
+
 @pytest.mark.parametrize("parameter_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_openpi_stem_preserves_float32_values_gradients_and_checkpoint_keys(
@@ -1720,6 +1828,17 @@ def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
         allow_offline_actor=True,
     )
     assert changed.manifest != original_manifest
+    metadata["format"] = "rlinf-piper-rlt-online-segment-actor-v1"
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="manual critical"):
+        PiperRLTPolicy(root, actor=actor_root, device="cpu")
+    online = PiperRLTPolicy(root, actor=actor_root, device="cpu", manual_critical=True)
+    assert online.infer(sample, "USB", actor_enabled=True, mode="train").shape == (
+        10,
+        7,
+    )
+    with pytest.raises(ValueError, match="mode must"):
+        online.infer(sample, "USB", actor_enabled=True, mode="unknown")
     metadata["phase_filter"] = 0
     path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="specialist routing"):

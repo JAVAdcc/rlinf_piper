@@ -88,6 +88,137 @@ from rlinf.workers.rollout.hf.async_huggingface_worker import (
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
+def test_piper_online_segment_replay_keeps_partial_human_targets(tmp_path):
+    from rlinf.data.datasets.piper_online import segment_trajectory
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+
+    actions = np.arange(30 * 7, dtype=np.float32).reshape(30, 7) / 100
+    human = np.zeros(30, dtype=bool)
+    human[4:7] = True
+    values = episode_transitions(
+        actions,
+        phases=[
+            {"start": 2, "end": 15, "outcome": "success"},
+            {"start": 20, "end": 24, "outcome": "failure"},
+        ],
+        terminal=29,
+        chunk_length=10,
+        stride=10,
+        success=True,
+        human=human,
+        reward_scope="critical_segment",
+    )
+    arrays = {key: torch.from_numpy(value) for key, value in values.items()}
+    states = len(arrays["frames"])
+    arrays.update(
+        z_rl=torch.zeros(states, 8),
+        proprio=torch.zeros(states, 7),
+        ref_chunk=torch.ones(states, 50, 7),
+    )
+    trajectory = segment_trajectory(arrays, 32)
+    assert trajectory.actions.shape == (3, 1, 70)
+    assert trajectory.forward_inputs["valid_steps"].flatten().tolist() == [10, 3, 4]
+    assert trajectory.forward_inputs["next_valid_steps"].flatten().tolist() == [3, 0, 0]
+    assert trajectory.rewards[1, 0, 2] == 1
+    assert trajectory.rewards[2].sum() == 0
+    assert trajectory.terminations.any(-1).flatten().tolist() == [False, True, True]
+    torch.testing.assert_close(
+        trajectory.actions[0, 0].reshape(10, 7), torch.from_numpy(actions[2:12])
+    )
+    assert not trajectory.actions[1, 0].reshape(10, 7)[3:].any()
+    assert trajectory.intervene_flags[0, 0].reshape(10, 7).any(-1).tolist() == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    intervention = trajectory.extract_intervene_traj()[0]
+    assert intervention.versions.flatten().tolist() == [32]
+    assert intervention.forward_inputs["valid_steps"].flatten().tolist() == [10]
+
+    # Save before any sampling, then save a restored pool into a new checkpoint.
+    # Both snapshots must contain all indexed trajectories, including evicted cache entries.
+    first = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(tmp_path / "live"),
+        cache_size=1,
+        sample_window_size=2,
+    )
+    second = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(tmp_path / "live2"),
+        cache_size=1,
+        sample_window_size=2,
+    )
+    third = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(tmp_path / "live3"),
+        cache_size=1,
+        sample_window_size=2,
+    )
+    try:
+        first.add_trajectories([trajectory, trajectory])
+        first.save_checkpoint(str(tmp_path / "checkpoint1"))
+        assert len(list((tmp_path / "checkpoint1").glob("trajectory_*.pt"))) == 2
+        second.load_checkpoint(str(tmp_path / "checkpoint1"))
+        second.add_trajectories([trajectory])
+        second.save_checkpoint(str(tmp_path / "checkpoint2"))
+        assert len(list((tmp_path / "checkpoint2").glob("trajectory_*.pt"))) == 3
+        third.load_checkpoint(str(tmp_path / "checkpoint2"))
+        assert third.total_samples == 9
+        batch = third.sample(16)
+        assert batch["actions"].shape == (6, 70)
+        assert set(batch["forward_inputs"]) == {
+            "valid_steps",
+            "discount_steps",
+            "next_valid_steps",
+        }
+    finally:
+        first.close()
+        second.close()
+        third.close()
+
+
+def test_piper_online_demo_pool_excludes_validation(piper_local_warmup_cache):
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+    from rlinf.workers.actor.piper_rlt_worker import PiperRLTActor
+
+    cache = CachedRLTReplay(piper_local_warmup_cache)
+    worker = object.__new__(PiperRLTActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"model": cache.manifest["model"]},
+            "piper": {
+                "stage1_manifest": cache.manifest["stage1"],
+                "task": cache.manifest["annotations"]["task"],
+            },
+        }
+    )
+    worker.demo_buffer = TrajectoryReplayBuffer(sample_window_size=10)
+    try:
+        expected = sum(len(cache.episodes[i]["current"]) for i in cache.splits["train"])
+        assert worker.seed_offline_cache(str(piper_local_warmup_cache)) == expected
+        assert len(worker.demo_buffer) == 2
+        batch = worker.demo_buffer.sample(100)
+        assert (
+            batch["curr_obs"]["z_rl"].max() <= 0.1
+        )  # Held-out parents use 0.2 and 0.3.
+        assert batch["versions"].eq(-1).all()
+        worker.cfg.piper.task = "other task"
+        with pytest.raises(ValueError, match="task differs"):
+            worker.seed_offline_cache(str(piper_local_warmup_cache))
+    finally:
+        worker.demo_buffer.close()
+
+
 class TestD4RLDataset:
     """Tests for loading D4RL transition datasets."""
 

@@ -24,6 +24,12 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.algorithms.rlt.segment import (
+    action_mask,
+    actor_training_observation,
+    discounted_target,
+    masked_behavior_loss,
+)
 from rlinf.data.datasets.rlt_warmup import (
     CachedRLTReplay,
     directory_lock,
@@ -162,47 +168,6 @@ def load_warmup_config(path: str | Path, overrides: list[str] = ()) -> WarmupCon
     if cfg.validation.q_low >= cfg.validation.q_high:
         raise ValueError("Invalid Q interval.")
     return cfg
-
-
-def action_mask(lengths: torch.Tensor, chunk: int) -> torch.Tensor:
-    """Select executed ticks, excluding terminal padding."""
-    return torch.arange(chunk, device=lengths.device)[None, :] < lengths[:, None]
-
-
-def discounted_target(batch: dict, next_q: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Discount actual ticks to the reward endpoint specified by the cache."""
-    ticks = batch["discount_steps"]
-    returns = batch["rewards"] * gamma ** (ticks - 1)
-    return returns + (~batch["terminated"]) * gamma**ticks * next_q
-
-
-def actor_training_observation(batch: dict) -> dict:
-    """Condition actor learning on executed human corrections at valid ticks.
-
-    Keep cached VLA references intact for next-state policy evaluation and
-    deployment-style validation. Reference dropout is applied by the actor
-    after this replacement.
-    """
-    chunk = batch["actions"].shape[1]
-    reference = batch["curr_obs"]["ref_chunk"].clone()
-    human = batch["human"] & action_mask(batch["valid_steps"], chunk)
-    reference[:, :chunk] = torch.where(
-        human[..., None], batch["actions"], reference[:, :chunk]
-    )
-    return {**batch["curr_obs"], "ref_chunk": reference}
-
-
-def masked_behavior_loss(predicted: torch.Tensor, batch: dict) -> torch.Tensor:
-    """Imitate human actions where labeled; otherwise imitate frozen references."""
-    chunk = batch["actions"].shape[1]
-    prediction = predicted.reshape_as(batch["actions"])
-    target = torch.where(
-        batch["human"][..., None],
-        batch["actions"],
-        batch["curr_obs"]["ref_chunk"][:, :chunk],
-    )
-    mask = action_mask(batch["valid_steps"], chunk)
-    return ((prediction - target).square().mean(-1) * mask).sum() / mask.sum()
 
 
 def offline_warmup_passed(

@@ -86,6 +86,132 @@ class Keys:
         return event
 
 
+def test_piper_online_commits_after_undo_window_and_stamps_policy_version(tmp_path):
+    policy = Policy()
+    policy.version = 32
+    accepted = []
+
+    def accept(directory, result):
+        assert (directory / "trace.jsonl").exists()
+        assert json.loads((directory / "result.json").read_text())["accepted"]
+        accepted.append(result.copy())
+
+    summary = evaluate_piper(
+        policy,
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys(
+            [
+                [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                [["left"], ["right"], ["b"], [], ["right"], ["f"], ["right"], ["s"]],
+                [["right"]],
+            ]
+        ),
+        on_accept=accept,
+    )
+    assert summary["discarded_episodes"] == 1
+    assert len(accepted) == 1 and accepted[0]["directory"] == "episode_002"
+    assert accepted[0]["policy_version"] == 32
+    assert accepted[0]["critical_phases"][0]["outcome"] == "failure"
+    assert accepted[0]["outcome"] == "success"
+
+
+def test_piper_online_failed_update_is_accepted_and_cannot_be_undone_on_resume(
+    tmp_path,
+):
+    policy = Policy()
+    policy.version = 0
+
+    def fail_update(directory, result):
+        raise RuntimeError("learner unavailable")
+
+    with pytest.raises(RuntimeError, match="learner unavailable"):
+        evaluate_piper(
+            policy,
+            Session(),
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=100,
+            keys=Keys(
+                [
+                    [["right"], ["b"], [], ["right"], ["s"], ["right"], ["s"]],
+                    [["right"]],
+                ]
+            ),
+            on_accept=fail_update,
+        )
+    result = json.loads((tmp_path / "episode_001/result.json").read_text())
+    assert result["accepted"] and result["outcome"] == "success"
+    summary = evaluate_piper(
+        policy,
+        Session(),
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=100,
+        keys=Keys([[["left"], ["right"]]]),
+        on_accept=fail_update,
+        resume=True,
+    )
+    assert summary["completed_episodes"] == 1
+    assert summary["discarded_episodes"] == 0
+
+
+def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
+    import sys
+
+    from toolkits.piper.run_policy import parse_args
+
+    repo = Path(__file__).resolve().parents[2]
+    wrapper = repo / "toolkits/piper/train_online.sh"
+    capture = tmp_path / "capture-argv"
+    capture.write_text(
+        f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+    )
+    capture.chmod(0o755)
+    command = subprocess.run(
+        ["bash", str(wrapper), "--num-episodes", "5", "--teleop", "piper_leader"],
+        env={**os.environ, "PIPER_PYTHON": str(capture)},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    original = parse_args(json.loads(command)[2:])
+    assert (
+        original.online_config
+        == repo / "examples/embodiment/config/piper_rlt_online.yaml"
+    )
+    assert original.actor_mode == "manual-critical" and original.allow_offline_actor
+    assert original.record_dataset and original.interactive and original.steps == 7200
+    assert original.num_episodes == 5 and original.teleop == "piper_leader"
+    (tmp_path / "run.json").write_text(
+        json.dumps(
+            {k: str(v) if isinstance(v, Path) else v for k, v in vars(original).items()}
+        )
+    )
+    (tmp_path / "hardware.yaml").write_text("{}\n")
+    command = subprocess.run(
+        ["bash", str(wrapper), "--resume", str(tmp_path), "--num-episodes", "100"],
+        env={**os.environ, "PIPER_PYTHON": str(capture)},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "--checkpoint" not in command and "--online-config" not in command
+    resumed = parse_args(json.loads(command)[2:])
+    assert (
+        resumed.online_config == original.online_config and resumed.num_episodes == 100
+    )
+    with pytest.raises(SystemExit):
+        parse_args(
+            ["rollout", "--resume", str(tmp_path), "--online-config", "another.yaml"]
+        )
+
+
 def test_manual_critical_routing_drops_queues_and_records_actual_source(tmp_path):
     class ManualPolicy(Policy):
         manual_critical = True

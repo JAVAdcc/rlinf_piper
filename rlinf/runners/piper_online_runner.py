@@ -187,6 +187,19 @@ class PiperOnlinePolicy:
             0
         ]
 
+    def infer_with_reference(
+        self,
+        observation: dict,
+        task: str,
+        *,
+        actor_enabled: bool,
+    ) -> tuple[np.ndarray, dict]:
+        """Carry paired reference diagnostics across the worker boundary."""
+        actions, diagnostics = self.worker.infer_with_reference(
+            observation, task, actor_enabled=actor_enabled
+        ).wait()[0]
+        return actions, {**diagnostics, "policy_version": self.version}
+
 
 class PiperOnlineRunner:
     """Own two native workers and atomically commit accepted episode updates.

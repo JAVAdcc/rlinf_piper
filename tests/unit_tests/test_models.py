@@ -1861,22 +1861,27 @@ def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
     features = {
         "z_rl": torch.zeros(1, 8),
         "proprio": torch.zeros(1, 7),
-        "ref_chunk": torch.zeros(1, 2, 7),
+        "ref_chunk": torch.arange(350).reshape(1, 50, 7).float() / 350,
     }
 
     class FeatureModel:
+        calls = 0
+        action_chunk = 50
+
         def extract_rlt_obs(self, obs):
+            self.calls += 1
             assert obs["extra_view_images"].shape == (1, 2, 8, 9, 3)
             return features
 
     policy = PiperRLTPolicy.__new__(PiperRLTPolicy)
     policy.feature_model = FeatureModel()
     policy.actor = RLTMLPPolicy(
-        z_dim=8, proprio_dim=7, action_dim=7, num_action_chunks=2
+        z_dim=8, proprio_dim=7, action_dim=7, num_action_chunks=10
     )
     policy.actor.eval()
     policy.codec = codec
-    policy.action_horizon = 2
+    policy.action_horizon = 50
+    policy.actor_horizon = 10
     sample = {"observation.state": np.zeros(7)}
     for name in ("front", "front_2", "wrist"):
         sample[f"observation.images.{name}"] = np.zeros((8, 9, 3), np.uint8)
@@ -1884,9 +1889,67 @@ def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
     np.testing.assert_allclose(
         policy.infer(sample, "insert USB"), codec.decode(expected[0].numpy()), atol=1e-5
     )
+    assert policy.feature_model.calls == 1
+    for mode in ("eval", "train"):
+        torch.manual_seed(17)
+        plain = policy.infer(sample, "insert USB", mode=mode)
+        torch.manual_seed(17)
+        calls = policy.feature_model.calls
+        paired, diagnostics = policy.infer_with_reference(
+            sample, "insert USB", mode=mode
+        )
+        assert policy.feature_model.calls == calls + 1
+        np.testing.assert_array_equal(paired, plain)
+        np.testing.assert_allclose(
+            diagnostics["reference_actions"],
+            codec.decode(features["ref_chunk"][0].numpy()),
+        )
+        assert diagnostics["reference_horizon"] == 50
+        assert diagnostics["observation_state"] == [0] * 7
+        assert diagnostics["action_units"] == ["deg"] * 6 + ["mm"]
+        assert diagnostics["mode"] == mode
+    reference, diagnostics = policy.infer_with_reference(
+        sample, "insert USB", actor_enabled=False
+    )
+    np.testing.assert_allclose(reference, diagnostics["reference_actions"])
+    # Exercise the real worker method through the controller's RPC boundary.
+    from rlinf.runners.piper_online_runner import PiperOnlinePolicy
+    from rlinf.workers.rollout.piper_rlt_worker import PiperRLTRollout
+
+    worker = object.__new__(PiperRLTRollout)
+    worker.policy = policy
+
+    class RemoteWorker:
+        def infer_with_reference(self, *args, **kwargs):
+            result = worker.infer_with_reference(*args, **kwargs)
+            return SimpleNamespace(wait=lambda: [result])
+
+    remote = PiperOnlinePolicy(
+        RemoteWorker(),
+        {
+            "manifest": {},
+            "fps": 30,
+            "action_horizon": 50,
+            "actor_horizon": 10,
+        },
+    )
+    remote.version = 64
+    torch.manual_seed(29)
+    plain = worker.infer(sample, "insert USB", actor_enabled=True)
+    torch.manual_seed(29)
+    calls = policy.feature_model.calls
+    paired, diagnostics = remote.infer_with_reference(
+        sample, "insert USB", actor_enabled=True
+    )
+    np.testing.assert_array_equal(paired, plain)
+    assert policy.feature_model.calls == calls + 1
+    assert diagnostics["policy_version"] == 64 and diagnostics["mode"] == "train"
+    assert len(diagnostics["reference_actions"]) == 50
     policy.actor = None
     np.testing.assert_allclose(
-        policy.infer(sample, "insert USB"), codec.decode(np.zeros((2, 7))), atol=1e-5
+        policy.infer(sample, "insert USB"),
+        codec.decode(features["ref_chunk"][0].numpy()),
+        atol=1e-5,
     )
 
 

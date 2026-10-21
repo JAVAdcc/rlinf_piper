@@ -143,6 +143,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Targets to execute before replanning; defaults to the policy's full horizon",
     )
     parser.add_argument(
+        "--save-rlt-reference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log the full same-pass VLA reference alongside each rollout prediction",
+    )
+    parser.add_argument(
         "--save-observations",
         action="store_true",
         help="Save each prediction's RGB/state/task as an NPZ for offline diagnosis",
@@ -187,6 +193,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--speech-language",
             "--streaming-video",
             "--no-streaming-video",
+            "--save-rlt-reference",
+            "--no-save-rlt-reference",
         }
         supplied = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
         if supplied - allowed:
@@ -293,6 +301,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("infer requires --dataset.")
     if args.command == "infer" and args.no_action_limits:
         parser.error("--no-action-limits only applies to rollout.")
+    if args.save_rlt_reference and (args.backend != "rlt" or args.command != "rollout"):
+        parser.error("--save-rlt-reference requires rollout with the RLT backend.")
     if args.command == "infer" and args.save_observations:
         parser.error(
             "infer already saves its observation; --save-observations is for rollout."
@@ -521,6 +531,7 @@ def _run_with_resources(
                         keys=keys,
                         replan_steps=args.replan_steps,
                         save_observations=args.save_observations,
+                        save_rlt_reference=args.save_rlt_reference,
                         record_dataset=args.record_dataset,
                         streaming_video=args.streaming_video,
                         phase_definition=args.phase_definition,
@@ -565,6 +576,7 @@ def _run_with_resources(
                     steps=args.steps,
                     replan_steps=args.replan_steps,
                     log=log,
+                    save_rlt_reference=args.save_rlt_reference,
                     observation_dir=output / "observations"
                     if args.save_observations
                     else None,

@@ -66,10 +66,26 @@ class _PolicyRequest:
     horizon: int
     execute_steps: int
 
-    def infer(self, policy: ChunkPolicy, observation: dict, task: str) -> np.ndarray:
-        if self.actor_enabled is None:
-            return policy.infer(observation, task)
-        return policy.infer(observation, task, actor_enabled=self.actor_enabled)
+    def infer(
+        self,
+        policy: ChunkPolicy,
+        observation: dict,
+        task: str,
+        save_rlt_reference: bool,
+    ) -> tuple[np.ndarray, dict]:
+        kwargs = (
+            {} if self.actor_enabled is None else {"actor_enabled": self.actor_enabled}
+        )
+        if save_rlt_reference:
+            started = time.monotonic()
+            actions, diagnostics = policy.infer_with_reference(
+                observation, task, **kwargs
+            )
+            return actions, {
+                **diagnostics,
+                "inference_call_s": time.monotonic() - started,
+            }
+        return policy.infer(observation, task, **kwargs), {}
 
 
 def _policy_request(
@@ -418,6 +434,7 @@ def rollout_piper(
     log: TextIO,
     replan_steps: int | None = None,
     observation_dir: Path | None = None,
+    save_rlt_reference: bool = False,
     stop_requested: Callable[[int], bool] | None = None,
     record_step: Callable[..., None] | None = None,
     manage_session: bool = True,
@@ -450,6 +467,10 @@ def rollout_piper(
         raise ValueError("Specify the task used for policy training.")
     if not np.isclose(session.config.fps, policy.fps):
         raise ValueError("Execution fps must match the policy's training data.")
+    if save_rlt_reference and not callable(
+        getattr(policy, "infer_with_reference", None)
+    ):
+        raise ValueError("Reference logging requires an RLT policy.")
     completed = 0
     period = 1 / session.config.fps
     if observation_dir is not None:
@@ -468,6 +489,7 @@ def rollout_piper(
                 log=log,
                 replan_steps=replan_steps,
                 observation_dir=observation_dir,
+                save_rlt_reference=save_rlt_reference,
                 stop_requested=stop_requested,
                 record_step=record_step,
                 policy_source=policy_source,
@@ -492,7 +514,10 @@ def rollout_piper(
                 request = _policy_request(
                     policy, policy_selection, policy_source, replan_steps
                 )
-                actions = np.asarray(request.infer(policy, observation, task))
+                actions, diagnostics = request.infer(
+                    policy, observation, task, save_rlt_reference
+                )
+                actions = np.asarray(actions)
                 if (
                     actions.shape != (request.horizon, 7)
                     or not np.isfinite(actions).all()
@@ -506,6 +531,7 @@ def rollout_piper(
                     "replan_steps": request.execute_steps,
                     "action_source": request.source,
                     "route_generation": request.generation,
+                    **({"rlt_reference": diagnostics} if save_rlt_reference else {}),
                 }
                 if observation_dir is not None:
                     name = f"step_{completed:06d}"
@@ -592,6 +618,7 @@ def _rollout_with_intervention(
     log: TextIO,
     replan_steps: int,
     observation_dir: Path | None,
+    save_rlt_reference: bool,
     stop_requested: Callable[[int], bool] | None,
     record_step: Callable[..., None] | None,
     policy_source: str,
@@ -631,7 +658,8 @@ def _rollout_with_intervention(
                 actions, index = np.empty((0, 7)), 0
                 route_generation = policy_selection.generation
             if future is not None and future.done():
-                prediction = np.asarray(future.result())
+                prediction, diagnostics = future.result()
+                prediction = np.asarray(prediction)
                 future = None
                 if (
                     prediction.shape != (request.horizon, 7)
@@ -659,6 +687,11 @@ def _rollout_with_intervention(
                             "replan_steps": request.execute_steps,
                             "action_source": request.source,
                             "route_generation": request.generation,
+                            **(
+                                {"rlt_reference": diagnostics}
+                                if save_rlt_reference
+                                else {}
+                            ),
                         }
                     )
                     + "\n"
@@ -681,7 +714,9 @@ def _rollout_with_intervention(
                         **snapshot,
                         task=np.asarray(task),
                     )
-                future = executor.submit(request.infer, policy, snapshot, task)
+                future = executor.submit(
+                    request.infer, policy, snapshot, task, save_rlt_reference
+                )
             # An input arriving during observation/result handling still wins.
             if stop_requested is not None and stop_requested(completed):
                 break

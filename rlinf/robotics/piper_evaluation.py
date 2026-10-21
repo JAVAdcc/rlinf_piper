@@ -131,6 +131,7 @@ def evaluate_piper(
     keys: EvaluationKeys,
     replan_steps: int | None = None,
     save_observations: bool = False,
+    save_rlt_reference: bool = False,
     record_dataset: bool = False,
     streaming_video: bool = True,
     phase_definition: str = SEGMENT_PHASE_DEFINITION,
@@ -787,6 +788,7 @@ def evaluate_piper(
                             steps=steps,
                             log=log,
                             replan_steps=replan_steps,
+                            save_rlt_reference=save_rlt_reference,
                             observation_dir=episode_dir / "observations"
                             if save_observations
                             else None,

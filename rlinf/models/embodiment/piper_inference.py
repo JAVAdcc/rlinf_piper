@@ -320,7 +320,6 @@ class PiperRLTPolicy:
                 },
             )
 
-    @torch.inference_mode()
     def infer(
         self,
         observation: dict[str, Any],
@@ -330,6 +329,29 @@ class PiperRLTPolicy:
         mode: str = "eval",
     ) -> np.ndarray:
         """Predict in normalized RLT action space, then decode for the executor."""
+        actions, _ = self._infer(observation, task, actor_enabled, mode, False)
+        return actions
+
+    def infer_with_reference(
+        self,
+        observation: dict[str, Any],
+        task: str,
+        *,
+        actor_enabled: bool | None = None,
+        mode: str = "eval",
+    ) -> tuple[np.ndarray, dict]:
+        """Return the same forward pass's full reference in degrees and mm."""
+        return self._infer(observation, task, actor_enabled, mode, True)
+
+    @torch.inference_mode()
+    def _infer(
+        self,
+        observation: dict,
+        task: str,
+        actor_enabled: bool | None,
+        mode: str,
+        save_reference: bool,
+    ) -> tuple[np.ndarray, dict]:
         from rlinf.algorithms.rlt import predict_rlt_actions
         from rlinf.algorithms.rlt.route import RealworldRLTRoute
 
@@ -346,7 +368,7 @@ class PiperRLTPolicy:
         if not use_actor:
             actions = self.feature_model.extract_rlt_obs(env_obs)["ref_chunk"]
         else:
-            actions, _ = predict_rlt_actions(
+            actions, result = predict_rlt_actions(
                 policy_model=self.actor,
                 feature_model=self.feature_model,
                 rlt_route=RealworldRLTRoute(),
@@ -363,4 +385,21 @@ class PiperRLTPolicy:
         )
         if actions.shape != (1, expected, 7):
             raise ValueError(f"Unexpected RLT action shape: {actions.shape}.")
-        return self.codec.decode(actions[0])
+        decoded = self.codec.decode(actions[0])
+        diagnostics = {}
+        if save_reference:
+            reference = (
+                result["forward_inputs"]["ref_chunk"].detach().float().cpu().numpy()[0]
+                if use_actor
+                else actions[0]
+            )
+            diagnostics = {
+                "reference_actions": self.codec.decode(reference).tolist(),
+                "reference_horizon": len(reference),
+                "observation_state": np.asarray(
+                    observation["observation.state"]
+                ).tolist(),
+                "action_units": ["deg"] * 6 + ["mm"],
+                "mode": mode,
+            }
+        return decoded, diagnostics

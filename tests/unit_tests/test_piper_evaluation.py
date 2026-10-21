@@ -311,6 +311,78 @@ def test_manual_critical_switch_during_sync_inference_discards_result(tmp_path):
     assert all(Path(path).is_file() for path in paths)
 
 
+@pytest.mark.parametrize("hil", [False, True])
+@pytest.mark.parametrize("save_reference", [False, True])
+def test_reference_diagnostics_follow_the_requested_prediction(hil, save_reference):
+    from rlinf.robotics.piper_runtime import PiperPolicySelection
+
+    class ManualPolicy(Policy):
+        manual_critical = True
+        actor_horizon = 10
+
+        def infer(self, obs, task, *, actor_enabled):
+            assert not save_reference
+            return np.full((10, 7), 2)
+
+        def infer_with_reference(self, obs, task, *, actor_enabled):
+            assert save_reference and actor_enabled
+            return np.full((10, 7), 2), {
+                "reference_actions": np.full((50, 7), 3).tolist(),
+                "observation_state": obs["observation.state"].tolist(),
+            }
+
+    class Follower(Session):
+        def observe(self):
+            return {"observation.state": np.full(7, len(self.targets))}
+
+        def execute(self, target):
+            self.last_command = target.copy()
+            return super().execute(target)
+
+    class Control:
+        generation = 0
+        mode = "policy"
+
+        def choose(self, target, state, *, source):
+            return (target, source) if target is not None else (state, "hold")
+
+        def executed(self, command, source):
+            pass
+
+        def stop(self):
+            pass
+
+    session = Follower()
+    if hil:
+        session.intervention = Control()
+    selection = PiperPolicySelection()
+    selection.set_critical(True)
+    log = io.StringIO()
+    rollout_piper(
+        ManualPolicy(),
+        session,
+        "USB",
+        steps=25,
+        log=log,
+        policy_selection=selection,
+        save_rlt_reference=save_reference,
+    )
+    predictions = [
+        json.loads(line)
+        for line in log.getvalue().splitlines()
+        if json.loads(line)["event"] == "prediction"
+    ]
+    assert len(predictions) >= 2
+    for prediction in predictions:
+        assert np.asarray(prediction["actions"]).shape == (10, 7)
+        if save_reference:
+            data = prediction["rlt_reference"]
+            assert data["reference_actions"] == [[3] * 7] * 50
+            assert data["observation_state"] == [prediction["step"]] * 7
+        else:
+            assert "rlt_reference" not in prediction
+
+
 def test_manual_route_change_after_result_acceptance_keeps_human_release():
     from robot_mocks import mocked_sdks
 
@@ -2041,6 +2113,8 @@ def test_resume_cli_restores_settings_and_wrapper_preserves_overrides(tmp_path):
         k: str(v) if isinstance(v, Path) else v for k, v in vars(original).items()
     }
     values.pop("streaming_video")  # Runs collected before streaming support.
+    values.pop("save_rlt_reference")  # Historical runs have no reference diagnostics.
+    assert not original.save_rlt_reference
     run_path = tmp_path / "run.json"
     run_path.write_text(json.dumps(values))
     original_bytes = run_path.read_bytes()
@@ -2050,6 +2124,7 @@ def test_resume_cli_restores_settings_and_wrapper_preserves_overrides(tmp_path):
     assert resumed.num_episodes == 80 and resumed.record_dataset and resumed.interactive
     assert resumed.teleop == "piper_leader" and resumed.steps == 7200
     assert resumed.streaming_video and resumed.no_action_limits
+    assert not resumed.save_rlt_reference
     assert (
         resumed.checkpoint == original.checkpoint
         and resumed.reset_after_episode == "initial"
@@ -2064,11 +2139,13 @@ def test_resume_cli_restores_settings_and_wrapper_preserves_overrides(tmp_path):
         "--speech-language",
         "zh",
         "--no-streaming-video",
+        "--save-rlt-reference",
     ]
     resumed = parse_args(["rollout", "--resume", str(tmp_path), *overrides])
     assert resumed.num_episodes == 100 and resumed.device == "cpu"
     assert not resumed.play_sounds and not resumed.streaming_video
     assert resumed.speech_language == "zh"
+    assert resumed.save_rlt_reference
     assert run_path.read_bytes() == original_bytes
     repo = Path(__file__).resolve().parents[2]
     for resume_option in (["--resume", str(tmp_path)], [f"--resume={tmp_path}"]):

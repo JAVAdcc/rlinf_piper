@@ -368,3 +368,42 @@ bash toolkits/piper/train_online.sh --resume "$piper_online_dir" --num-episodes 
 每条 `result.json` 记录实际使用的 `policy_version`；`online_update.json` 记录 loss、训练耗时和执行端收到的新权重版本及摘要。最新 checkpoint 由 `online/latest.json` 指向，`online/checkpoint_XXXXXX/actor` 同时提供完整续训状态和可供 `eval_shared.sh` 加载的完整小网络权重。默认保留最近 3 份 checkpoint，续训进程正在读取的旧 checkpoint 也会保留。原始录像与 replay 文件持续保留。
 
 已验证录制图像 → 真实 Stage1 特征 → 原生 replay → actor/critic 更新 → 原生权重广播 → 新版本推理，并验证恢复及重复提交保护。GPU 检查使用合成段标签验证程序闭环，不代表任务成功率；真机 online 效果需运行上述命令验收。完整流程和无硬件复测命令见 `docs/piper_online_training.rst`。
+
+## 11. 记录 C10 对应的完整 H50 reference
+
+排查关键段内不松手时，在 `train_online.sh` 或 `eval_shared.sh rollout` 的命令后加 `--save-rlt-reference`。默认关闭；开启后，每次预测将**同一次 VLA 前向生成、实际提供给 actor 的完整 H50 reference**写入该条 `episode_XXX/trace.jsonl`，不会另做一次随机采样。关键段外也记录 reference，便于比较切换前后。
+
+以下命令使用固定的共享 warmup actor 做诊断，episode 之间不训练。`b`、`s/f`、`→`、`←` 和人工接管按键沿用第 10 节的规则：
+
+```bash
+cd /home/descfly/code/rlinf_piper
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_shared_prejoint/actor"
+piper_reference_dir="/media/descfly/新加卷/value/data_inference/rlinf_reference_$(date +%Y%m%d_%H%M%S)"
+
+bash toolkits/piper/eval_shared.sh rollout \
+  --teleop piper_leader --num-episodes 2 --steps 7200 \
+  --no-action-limits --reset-after-episode initial \
+  --save-rlt-reference \
+  --output-dir "$piper_reference_dir"
+```
+
+若要观察 online 更新后的 actor，把第 10 节的新开训练命令加上 `--save-rlt-reference` 即可。也允许续训时单独启用：
+
+```bash
+bash toolkits/piper/train_online.sh \
+  --resume "$piper_online_dir" --num-episodes 100 --save-rlt-reference
+```
+
+`--no-save-rlt-reference` 可在续训时关闭记录；已经采完的旧 episode 无法补出当时的随机 reference。开关只增加诊断数据传输和 JSON 写入，不改变 H50/C10 执行方式、actor 采样或训练行为。
+
+每个 `event="prediction"` 日志内：
+
+- `actions`：实际推理的 actor C10（关键段内）或 reference H50（关键段外）。
+- `rlt_reference.reference_actions`：与上述预测配对的完整 H50，每行按 J1–J6、夹爪排列，单位为度、毫米；不是已执行轨迹。当前 actor 只读取它的前 10 步。
+- `rlt_reference.observation_state`：该次推理输入的关节角和夹爪反馈。`mode` 区分固定 actor 的 `eval` 和 online 探索的 `train`；online 还记录 `policy_version`。
+- `step`：输入观测对应的执行步号。遥操模式下 `accepted_at_step` 是结果开始可用的步号，`discarded=true` 表示预测已因接管或路由变化作废，不代表执行过。
+- `rlt_reference.inference_call_s`：推理调用本身耗时（online 包含 worker 通信与诊断数据返回）；原 `inference_s` 在遥操模式下还包含控制循环发现结果的等待时间。
+
+同文件内 `event="action"` 的 `target`、`command`、`state` 分别表示请求目标、实际发送目标和反馈。先比较 reference 前 10 步与后 40 步的夹爪目标，再对照 actor C10 和实际反馈，才能区分延后松手、actor 输出偏差和执行问题。录像通过数据集帧号与 `step` 对齐；如需保留精确的推理输入 RGB，可另加 `--save-observations`，但会增加磁盘占用。

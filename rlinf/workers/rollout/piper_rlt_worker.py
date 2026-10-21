@@ -61,6 +61,18 @@ class PiperRLTRollout(Worker):
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
 
+    def infer_with_reference(
+        self,
+        observation: dict,
+        task: str,
+        *,
+        actor_enabled: bool,
+    ) -> tuple[np.ndarray, dict]:
+        """Return the sampled C10 and its original H50 without another forward."""
+        return self.policy.infer_with_reference(
+            observation, task, actor_enabled=actor_enabled, mode="train"
+        )
+
     def prepare_episode(self, directory: str, result: dict) -> Trajectory | None:
         """Build a CPU trajectory after collection has closed the undo window."""
         return cache_accepted_episode(

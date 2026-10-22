@@ -433,3 +433,39 @@ bash toolkits/piper/eval_stage1.sh rollout \
 对照纯 VLA C50 时，新建一个输出目录，把 `--replan-steps 10` 改为 `--replan-steps 50`，其余参数保持一致。C10/C50 应分别重复几条、尽量保持初始场景一致；全程 C10 可能改变到达孔口时的状态，不能把一次前后对比视为相同初始条件。
 
 当前 warmup 的 BC 目标：非人工接管步模仿 cached reference 的前 10 步；人工接管步模仿记录的人工动作。启用联合或 online actor 更新后，还叠加 Q 目标。因此纯 VLA C10 能检验 teacher 在这种执行节奏下是否本身就会停滞，也能帮助区分 actor 的模仿误差。
+
+## 13. 共享 C50 actor：BC5000 执行对照
+
+云端新包 `piper_shared_c50_bc5000_20261022` 已下载到本地 `checkpoints/`，包内 SHA256 清单全部通过。它仍使用同一份 Stage1 H50，但 actor 现在读取完整 H50 reference，输出 50×7；本地现有代码按 metadata 加载，无需回退代码。新 actor 已做 5,000 次 BC，critic 与联合更新均为 0，**只用于 `eval_shared.sh` 执行对照，不用于 `train_online.sh`、Q 评估或联合训练**。
+
+云端部署说明和训练收据保存在 `/home/descfly/deploy/piper_20261022/c50_bc5000/`；权重包内 `README.md`、`EXPERIMENT.md` 和检查 JSON 也保留原样。`readiness.json=false` 表示完整 actor/critic warmup 门槛尚未满足，实验入口仍显式使用 `--allow-offline-actor`。
+
+```bash
+cd /home/descfly/code/rlinf_piper
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_shared_c50_bc5000_20261022/actor"
+piper_c50_dir="/media/descfly/新加卷/value/data_inference/rlinf_shared_c50_bc5000_$(date +%Y%m%d_%H%M%S)"
+
+bash toolkits/piper/eval_shared.sh rollout \
+  --teleop piper_leader \
+  --num-episodes 2 --steps 7200 --replan-steps 50 \
+  --record-dataset --save-rlt-reference \
+  --reset-after-episode initial \
+  --output-dir "$piper_c50_dir"
+```
+
+普通阶段执行 VLA H50；`b` 开始关键段并切换共享 C50 actor，`s/f` 结束并评分该段、丢弃未执行的 actor 队列并恢复 VLA。`→` 停止整条后另行 `s/f` 评分；`←` 丢弃，`i` 人工接管。C50 也可中途被按键或接管打断，不需要等完整 50 步走完。
+
+保持 `--replan-steps 50`，否则会再次截短 actor 输出。日志中的关键段 `prediction.actions` 应为 50×7，`rlt_reference.reference_actions` 同样为 50×7，`replan_steps=50`。本次 actor 固定不更新，便于对比新 C50 是否能够推进微调和松手阶段。
+
+这份权重尚未通过全部动作检查。云端收据记录过某个实录输入的首目标 J4 与观测相差 8.761°，超过当前 5° 步幅门限；长动作尾部的人工监督误差也较大。以上命令保留当前动作检查，未附加历史命令中的 `--no-action-limits`。若触发检查，保留该条 trace 和报错用于定位，不能把“模型能加载、输出50步”当作动作验收或任务成功率已通过。
+
+只读取录像的加载检查可用以下命令，不连接机械臂：
+
+```bash
+export PIPER_DATA_PATH="/media/descfly/新加卷/value/data_inference/rlinf_reference_20261022_105124/episode_001/dataset"
+bash toolkits/piper/eval_shared.sh infer-actor --frame 2350
+```
+
+本地已通过上述入口完成第 2350 帧的真实 GPU 推理：输出 `(50,7)`、全为有限值，Stage1 ID、norm 与小网络权重 SHA256 全部匹配。该次 C50 actor 在第 34 步给出超过 20 mm 的张开目标，最大 41.73 mm；首目标最大关节偏差为 3.91°。这只说明该录制观测下的输出与契约，不代表整条轨迹或全部动作检查已通过。收据位于 `outputs/piper/c50_bc5000_infer_20261022/local_validation.json`，没有连接机械臂。

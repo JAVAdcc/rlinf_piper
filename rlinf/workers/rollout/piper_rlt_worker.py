@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.data.datasets.piper_online import cache_accepted_episode
+from rlinf.data.datasets.piper_online import cache_accepted_episode, save_replay_anchor
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models.embodiment.piper_inference import PiperRLTPolicy
@@ -39,7 +39,7 @@ class PiperRLTRollout(Worker):
         self.weight_syncer = WeightSyncer.create(cfg.weight_syncer)
 
     def init_worker(self) -> dict:
-        """Load the Stage 1 H50 model and its bound C10 actor exactly once."""
+        """Load the Stage 1 H50 model and its bound actor exactly once."""
         torch.manual_seed(self.cfg.actor.seed)
         self.policy = PiperRLTPolicy(
             self.cfg.piper.stage1,
@@ -68,15 +68,46 @@ class PiperRLTRollout(Worker):
         *,
         actor_enabled: bool,
     ) -> tuple[np.ndarray, dict]:
-        """Return the sampled C10 and its original H50 without another forward."""
+        """Return the sampled actor chunk and original H50 without another forward."""
         return self.policy.infer_with_reference(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
 
+    def infer_for_replay(
+        self,
+        observation: dict,
+        task: str,
+        *,
+        actor_enabled: bool,
+        directory: str,
+        frame: int,
+    ) -> tuple[np.ndarray, dict]:
+        """Save normalized features at the observation's control tick, not arrival time."""
+        actions, diagnostics = self.policy.infer_with_features(
+            observation, task, actor_enabled=actor_enabled, mode="train"
+        )
+        save_replay_anchor(
+            Path(directory),
+            frame,
+            self.policy.manifest,
+            task,
+            {
+                **diagnostics.pop("replay_features"),
+                "raw_state": observation["observation.state"],
+            },
+        )
+        return actions, diagnostics
+
     def prepare_episode(self, directory: str, result: dict) -> Trajectory | None:
         """Build a CPU trajectory after collection has closed the undo window."""
         return cache_accepted_episode(
-            self.policy, Path(directory), result, self.cfg.piper.task
+            self.policy,
+            Path(directory),
+            result,
+            self.cfg.piper.task,
+            stride=self.cfg.piper.get("replay_stride", self.policy.actor_horizon),
+            tail_policy=self.cfg.piper.get("replay_tail_policy", "pad"),
+            feature_batch_size=self.cfg.piper.get("replay_feature_batch_size", 1),
         )
 
     async def sync_model_from_actor(self) -> dict:

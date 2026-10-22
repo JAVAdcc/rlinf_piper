@@ -219,6 +219,174 @@ def test_piper_online_demo_pool_excludes_validation(piper_local_warmup_cache):
         worker.demo_buffer.close()
 
 
+@pytest.mark.parametrize("chunk", [10, 50])
+def test_piper_dense_replay_uses_overlapping_executed_actions_and_one_terminal(chunk):
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+
+    actions = np.arange((chunk + 30) * 7, dtype=np.float32).reshape(-1, 7)
+    human = np.zeros(len(actions), dtype=bool)
+    human[5:9] = True
+    data = episode_transitions(
+        actions,
+        phases=[
+            {"start": 1, "end": chunk + 8, "outcome": "success"},
+            {"start": chunk + 12, "end": chunk + 15, "outcome": "failure"},
+        ],
+        terminal=len(actions) - 1,
+        chunk_length=chunk,
+        stride=2,
+        success=False,
+        human=human,
+        reward_scope="critical_segment",
+        tail_policy="align",
+    )
+    starts = data["frames"][data["current"]]
+    assert starts.tolist() == [1, 3, 5, 7, 8, chunk + 12]
+    assert data["valid_steps"].tolist() == [chunk] * 5 + [3]
+    assert data["terminated"].tolist() == [False] * 4 + [True, True]
+    assert data["rewards"].tolist() == [0] * 4 + [1, 0]
+    for row, (first, length) in enumerate(
+        zip(starts, data["valid_steps"], strict=True)
+    ):
+        np.testing.assert_array_equal(
+            data["actions"][row, :length], actions[first : first + length]
+        )
+        np.testing.assert_array_equal(
+            data["human"][row, :length], human[first : first + length]
+        )
+        assert data["frames"][data["next"][row]] == first + length
+
+
+def test_piper_replay_backfill_reuses_aligned_anchors_and_preserves_rng(tmp_path):
+    from rlinf.data.datasets.piper_online import (
+        backfill_replay_features,
+        save_replay_anchor,
+    )
+
+    class FeatureProvider:
+        manifest = {"checkpoint_id": "stage1", "norm_stats_sha256": "norm"}
+        feature_model = torch.nn.Linear(1, 1)
+
+        def __init__(self):
+            self.calls = []
+
+        def extract_features_batch(self, observations, task):
+            self.calls.append(
+                [int(obs["observation.state"][0]) for obs in observations]
+            )
+            return [
+                {
+                    "z_rl": torch.rand(2048).numpy(),
+                    "proprio": obs["observation.state"],
+                    "ref_chunk": np.full((50, 7), obs["observation.state"][0]),
+                    "raw_state": obs["observation.state"],
+                }
+                for obs in observations
+            ]
+
+    provider = FeatureProvider()
+
+    def sample(frame):
+        return {"observation.state": np.full(7, frame, dtype=np.float32), "task": "USB"}
+
+    saved = {
+        "z_rl": np.ones(2048),
+        "proprio": np.zeros(7),
+        "ref_chunk": np.ones((50, 7)),
+        "raw_state": np.zeros(7),
+    }
+    save_replay_anchor(tmp_path, 0, provider.manifest, "USB", saved)
+    rng = torch.get_rng_state()
+    values, stats = backfill_replay_features(
+        provider,
+        np.array([0, 2, 4, 6]),
+        sample,
+        directory=tmp_path,
+        task="USB",
+        fingerprint="fixed",
+        batch_size=2,
+    )
+    assert stats["reused_anchors"] == 1 and stats["backfilled_anchors"] == 3
+    assert provider.calls == [[2, 4], [6]]
+    torch.testing.assert_close(torch.get_rng_state(), rng)
+    np.testing.assert_array_equal(values[0]["ref_chunk"], saved["ref_chunk"])
+    assert (values[2]["ref_chunk"] == 2).all()
+    repeated, _ = backfill_replay_features(
+        provider,
+        np.array([0, 2, 4, 6]),
+        sample,
+        directory=tmp_path,
+        task="USB",
+        fingerprint="fixed",
+        batch_size=2,
+    )
+    np.testing.assert_array_equal(values[2]["z_rl"], repeated[2]["z_rl"])
+    saved["raw_state"] = np.ones(7)
+    save_replay_anchor(tmp_path, 0, provider.manifest, "USB", saved)
+    with pytest.raises(ValueError, match="aligned"):
+        backfill_replay_features(
+            provider,
+            np.array([0]),
+            sample,
+            directory=tmp_path,
+            task="USB",
+            fingerprint="fixed",
+            batch_size=2,
+        )
+    terminal_features, terminal_stats = backfill_replay_features(
+        provider,
+        np.array([0]),
+        lambda frame: {**sample(frame), "complementary_info.action_valid": False},
+        directory=tmp_path,
+        task="USB",
+        fingerprint="fixed",
+        batch_size=2,
+    )
+    assert terminal_stats["reused_anchors"] == 0
+    assert (terminal_features[0]["raw_state"] == 0).all()
+
+
+def test_piper_mixed_replay_keeps_full_batch_and_all_offline_episodes(tmp_path):
+    from rlinf.data.schema.embodied_types import Trajectory
+    from rlinf.data.storage.replay import TrajectoryReplayBuffer
+    from rlinf.data.storage.replay.dataset import ReplayBufferDataset
+
+    def trajectory(version):
+        return Trajectory(
+            max_episode_length=1,
+            model_weights_id=str(version),
+            rewards=torch.ones(1, 1, 1),
+            actions=torch.full((1, 1, 7), float(version)),
+        )
+
+    demo = TrajectoryReplayBuffer(
+        full_batch=True,
+        sample_window_size=0,
+        cache_size=1,
+        auto_save=True,
+        auto_save_path=str(tmp_path / "demo"),
+    )
+    online = TrajectoryReplayBuffer(full_batch=True, sample_window_size=200)
+    try:
+        demo.add_trajectories([trajectory(i) for i in range(205)])
+        demo.flush()
+        online.add_trajectories([trajectory(-1)])
+        dataset = ReplayBufferDataset(
+            online,
+            demo,
+            batch_size=64,
+            min_replay_buffer_size=1,
+            min_demo_buffer_size=1,
+        )
+        batch = next(iter(dataset))
+        assert batch["actions"].shape == (64, 7)
+        assert (batch["actions"][:, 0] == -1).sum() == 32
+        assert demo.sample(5000)["actions"][:, 0].min() == 0
+    finally:
+        online.close()
+        demo.close()
+
+
 class TestD4RLDataset:
     """Tests for loading D4RL transition datasets."""
 

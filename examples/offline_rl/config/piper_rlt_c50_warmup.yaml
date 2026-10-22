@@ -1,0 +1,28 @@
+# New C50 data only. Override annotations with an explicitly prepared v3 manifest.
+stage1: checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor
+annotations: outputs/piper/c50/episodes.json
+cache: outputs/piper/c50/rlt_cache
+output: outputs/piper/c50/rlt_warmup
+hardware: examples/embodiment/config/piper_usb_hardware.yaml
+device: cuda:0
+seed: 1234
+threads: 4
+video_backend: torchcodec
+chunk_length: 50
+stride: 2
+tail_policy: align
+phase_filter: null
+critic_action_projection: driver_limits
+training:
+  bc_steps: 5000
+  critic_steps: 10000
+  joint_steps: 5000
+  actor_every: 2
+  batch_size: 64
+  eval_every: 1000
+  save_every: 1000
+validation:
+  consecutive_passes: 3
+  min_train_per_outcome: 20
+  min_validation_per_outcome: 10
+  min_train_transitions: 600

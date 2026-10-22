@@ -106,6 +106,7 @@ def main() -> None:
             cfg.cache,
             chunk_length=cfg.chunk_length,
             stride=cfg.stride,
+            tail_policy=cfg.tail_policy,
             seed=cfg.seed,
             device=cfg.device,
             video_backend=cfg.video_backend,

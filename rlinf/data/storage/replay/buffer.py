@@ -241,6 +241,7 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        full_batch: bool = False,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -251,10 +252,12 @@ class TrajectoryReplayBuffer:
             enable_cache: Whether to enable trajectory caching
             cache_size: Maximum number of trajectories to cache in memory
             trajectory_format: Storage format ("pt", "pkl")
+            full_batch: Keep requested batch size when sampling with replacement
             sample_window_size: Number of trajectories to sample from for window cache
             auto_save: Whether to automatically save trajectories to disk
         """
         self.trajectory_format = trajectory_format
+        self.full_batch = full_batch
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
         self.auto_save = auto_save
@@ -613,7 +616,7 @@ class TrajectoryReplayBuffer:
         if window_total_samples == 0:
             return {}
 
-        if num_chunks > window_total_samples:
+        if not self.full_batch and num_chunks > window_total_samples:
             num_chunks = window_total_samples
 
         # Sample chunk indices directly from total samples

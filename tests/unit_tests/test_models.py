@@ -1753,8 +1753,9 @@ def test_piper_rlt_actor_metadata_binds_the_exact_stage1(tmp_path):
     assert metadata["model"]["model_type"] == "rlt_mlp_policy"
 
 
+@pytest.mark.parametrize("horizon", [10, 50])
 def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, horizon
 ):
     import json
 
@@ -1771,7 +1772,7 @@ def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
         "z_dim": 8,
         "proprio_dim": 7,
         "action_dim": 7,
-        "num_action_chunks": 10,
+        "num_action_chunks": horizon,
         "ref_num_action_chunks": 50,
         "add_q_head": True,
     }
@@ -1808,12 +1809,19 @@ def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
         manual_critical=True,
         allow_offline_actor=True,
     )
-    assert policy.action_horizon == 50 and policy.actor_horizon == 10
+    assert policy.action_horizon == 50 and policy.actor_horizon == horizon
     sample = {"observation.state": np.zeros(7)}
     for camera in ("front", "front_2", "wrist"):
         sample[f"observation.images.{camera}"] = np.zeros((8, 9, 3), np.uint8)
     assert policy.infer(sample, "USB", actor_enabled=False).shape == (50, 7)
-    assert policy.infer(sample, "USB", actor_enabled=True).shape == (10, 7)
+    assert policy.infer(sample, "USB", actor_enabled=True).shape == (horizon, 7)
+    paired, diagnostics = policy.infer_with_features(
+        sample, "USB", actor_enabled=True, mode="eval"
+    )
+    np.testing.assert_array_equal(
+        paired, policy.infer(sample, "USB", actor_enabled=True)
+    )
+    assert diagnostics["replay_features"]["ref_chunk"].shape == (50, 7)
     with pytest.raises(ValueError, match="explicit actor_enabled"):
         policy.infer(sample, "USB")
     original_manifest = policy.manifest
@@ -1834,7 +1842,7 @@ def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
         PiperRLTPolicy(root, actor=actor_root, device="cpu")
     online = PiperRLTPolicy(root, actor=actor_root, device="cpu", manual_critical=True)
     assert online.infer(sample, "USB", actor_enabled=True, mode="train").shape == (
-        10,
+        horizon,
         7,
     )
     with pytest.raises(ValueError, match="mode must"):
@@ -1849,6 +1857,84 @@ def test_piper_shared_local_loader_requires_manual_opt_in_and_binds_weights(
             manual_critical=True,
             allow_offline_actor=True,
         )
+
+
+def test_piper_online_requires_offline_data_and_trained_critic_for_c50(
+    tmp_path, piper_local_warmup_cache
+):
+    import json
+
+    from omegaconf import OmegaConf
+
+    from rlinf.runners.piper_online_runner import online_config
+
+    stage1 = _piper_test_checkpoint(tmp_path, "pi05_piper_h50_state")
+    asset = stage1 / "piper_inference.json"
+    manifest = json.loads(asset.read_text())
+    manifest["model"]["precision"] = "fp32"
+    manifest["model"]["openpi"]["action_chunk"] = 50
+    asset.write_text(json.dumps(manifest))
+    actor = tmp_path / "heads"
+    (actor / "model_state_dict").mkdir(parents=True)
+    torch.save({}, actor / "model_state_dict/full_weights.pt")
+    metadata = {
+        "format": "rlinf-piper-rlt-offline-local-actor-v1",
+        "stage1_checkpoint_id": manifest["checkpoint_id"],
+        "reward_scope": "critical_segment",
+        "phase_filter": None,
+        "critic_action_projection": "driver_limits",
+        "critic_warmup_steps": 0,
+        "model": {
+            "model_type": "rlt_mlp_policy",
+            "precision": "fp32",
+            "num_action_chunks": 50,
+            "ref_num_action_chunks": 50,
+            "action_dim": 7,
+            "proprio_dim": 7,
+            "z_dim": 2048,
+        },
+    }
+    path = actor / "piper_rlt_actor.json"
+    path.write_text(json.dumps(metadata))
+    kwargs = {
+        "stage1": stage1,
+        "actor": actor,
+        "hardware": {"execution": {"gripper_max_width_m": 0.07}},
+        "task": "TEST ONLY",
+        "output": tmp_path / "online",
+        "allow_offline_actor": True,
+    }
+    profile = (
+        Path(__file__).resolve().parents[2]
+        / "examples/embodiment/config/piper_rlt_online.yaml"
+    )
+    with pytest.raises(ValueError, match="warmed-up critic"):
+        online_config(profile, **kwargs)
+    metadata["critic_warmup_steps"] = 10000
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="offline-cache"):
+        online_config(profile, **kwargs)
+    cache_manifest_path = piper_local_warmup_cache / "manifest.json"
+    cache_manifest = json.loads(cache_manifest_path.read_text())
+    cache_manifest["stage1"] = manifest
+    cache_manifest_path.write_text(json.dumps(cache_manifest))
+    with pytest.raises(ValueError, match="model mismatch"):
+        online_config(profile, **kwargs, offline_cache=piper_local_warmup_cache)
+    # The config layer checks geometry; the cache loader separately verifies shards.
+    cache_manifest["model"]["num_action_chunks"] = 50
+    cache_manifest_path.write_text(json.dumps(cache_manifest))
+    cfg = online_config(profile, **kwargs, offline_cache=piper_local_warmup_cache)
+    assert cfg.actor.model.num_action_chunks == 50
+    assert cfg.algorithm.demo_buffer.sample_window_size == 0
+    assert not cfg.algorithm.demo_buffer.add_interventions
+    assert cfg.algorithm.demo_buffer.full_batch
+    snapshot = tmp_path / "online.yaml"
+    OmegaConf.save(cfg, snapshot)
+    cache_manifest_path.unlink()
+    restored = online_config(snapshot, **kwargs, resume=True)
+    assert OmegaConf.to_container(restored, resolve=True) == OmegaConf.to_container(
+        cfg, resolve=True
+    )
 
 
 def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):

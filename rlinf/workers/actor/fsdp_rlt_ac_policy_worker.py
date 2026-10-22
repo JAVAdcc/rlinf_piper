@@ -695,7 +695,9 @@ class RLTACReplayMixin:
             ]
         self.replay_buffer.add_trajectories(recv_list)
 
-        if self.demo_buffer is not None:
+        if self.demo_buffer is not None and self.cfg.algorithm.demo_buffer.get(
+            "add_interventions", True
+        ):
             intervene_traj_list = []
             for traj in recv_list:
                 assert isinstance(traj, Trajectory)

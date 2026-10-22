@@ -397,6 +397,22 @@ def split_collection_annotations(
     return output
 
 
+def replay_window_starts(
+    start: int, end: int, chunk: int, stride: int, tail_policy: str = "pad"
+) -> list[int]:
+    """Select phase-local windows, optionally aligning the last full chunk."""
+    if not 0 < stride <= chunk or tail_policy not in ("pad", "align"):
+        raise ValueError("Use 0 < stride <= chunk and tail_policy=pad or align.")
+    if tail_policy == "pad":
+        return list(range(start, end, stride))
+    if end - start <= chunk:
+        return [start]
+    starts = list(range(start, end - chunk + 1, stride))
+    if starts[-1] != end - chunk:
+        starts.append(end - chunk)
+    return starts
+
+
 def episode_transitions(
     actions: np.ndarray,
     *,
@@ -407,6 +423,7 @@ def episode_transitions(
     success: bool,
     human: np.ndarray,
     reward_scope: str = "global_episode",
+    tail_policy: str = "pad",
 ) -> dict[str, np.ndarray]:
     """Build phase-local actions and discounted transitions between actor decisions.
 
@@ -433,7 +450,9 @@ def episode_transitions(
         raise ValueError("Recorded actions contain non-finite values.")
     phase_ids, start_rows, length_rows, next_rows, next_lengths = [], [], [], [], []
     for phase_id, (start, end) in enumerate(intervals):
-        for first in range(start, end, stride):
+        for first in replay_window_starts(
+            start, end, chunk_length, stride, tail_policy
+        ):
             length = min(chunk_length, end - first)
             last = first + length
             next_frame, next_length = last, min(chunk_length, end - last)
@@ -539,6 +558,7 @@ def prepare_piper_cache(
     *,
     chunk_length: int = 10,
     stride: int = 10,
+    tail_policy: str = "pad",
     seed: int = 1234,
     device: str = "cuda:0",
     video_backend: str = "torchcodec",
@@ -608,6 +628,7 @@ def prepare_piper_cache(
             ),
             "chunk_length": chunk_length,
             "stride": stride,
+            "tail_policy": tail_policy,
             "seed": seed,
             "preprocessing": f"PiperRLTPolicy.extract_rlt_obs/{video_backend}/float32/paired-phases-v2",
             "runtime_versions": runtime_versions(),
@@ -678,6 +699,7 @@ def prepare_piper_cache(
                 success=record["outcome"] == "success",
                 human=human,
                 reward_scope=annotation_reward_scope(labels),
+                tail_policy=tail_policy,
             )
 
             def extract(frame: int) -> dict[str, np.ndarray]:
@@ -1083,7 +1105,13 @@ class CachedRLTReplay:
             [
                 first
                 for start, end in intervals
-                for first in range(start, end, self.manifest["stride"])
+                for first in replay_window_starts(
+                    start,
+                    end,
+                    chunk,
+                    self.manifest["stride"],
+                    self.manifest.get("tail_policy", "pad"),
+                )
             ],
             dtype=torch.int64,
         )

@@ -343,6 +343,33 @@ class PiperRLTPolicy:
         """Return the same forward pass's full reference in degrees and mm."""
         return self._infer(observation, task, actor_enabled, mode, True)
 
+    def infer_with_features(
+        self, observation: dict, task: str, *, actor_enabled: bool, mode: str = "train"
+    ) -> tuple[np.ndarray, dict]:
+        """Return replay features and reference from the same inference pass."""
+        return self._infer(observation, task, actor_enabled, mode, True, True)
+
+    @torch.inference_mode()
+    def extract_features_batch(self, observations: list[dict], task: str) -> list[dict]:
+        """Backfill frozen replay anchors without changing the actor or executing it."""
+        packed = [piper_env_observation(obs, task) for obs in observations]
+        batch = {
+            key: np.concatenate([item[key] for item in packed])
+            for key in ("states", "main_images", "extra_view_images")
+        }
+        batch["task_descriptions"] = [task] * len(packed)
+        features = {
+            key: value.detach().float().cpu().numpy()
+            for key, value in self.feature_model.extract_rlt_obs(batch).items()
+        }
+        return [
+            {
+                **{key: value[i] for key, value in features.items()},
+                "raw_state": np.asarray(obs["observation.state"], dtype=np.float32),
+            }
+            for i, obs in enumerate(observations)
+        ]
+
     @torch.inference_mode()
     def _infer(
         self,
@@ -351,6 +378,7 @@ class PiperRLTPolicy:
         actor_enabled: bool | None,
         mode: str,
         save_reference: bool,
+        save_features: bool = False,
     ) -> tuple[np.ndarray, dict]:
         from rlinf.algorithms.rlt import predict_rlt_actions
         from rlinf.algorithms.rlt.route import RealworldRLTRoute
@@ -366,7 +394,8 @@ class PiperRLTPolicy:
         if actor_enabled is True and self.actor is None:
             raise ValueError("No actor checkpoint is loaded.")
         if not use_actor:
-            actions = self.feature_model.extract_rlt_obs(env_obs)["ref_chunk"]
+            features = self.feature_model.extract_rlt_obs(env_obs)
+            actions = features["ref_chunk"]
         else:
             actions, result = predict_rlt_actions(
                 policy_model=self.actor,
@@ -377,6 +406,7 @@ class PiperRLTPolicy:
                 mode=mode,
                 rlt_switch_flags=torch.ones(1, dtype=torch.bool),
             )
+            features = result["forward_inputs"]
         actions = actions.detach().float().cpu().numpy()
         expected = (
             getattr(self, "actor_horizon", self.action_horizon)
@@ -387,19 +417,26 @@ class PiperRLTPolicy:
             raise ValueError(f"Unexpected RLT action shape: {actions.shape}.")
         decoded = self.codec.decode(actions[0])
         diagnostics = {}
+        if save_features:
+            diagnostics["replay_features"] = {
+                key: features[key][0].detach().float().cpu().numpy()
+                for key in ("z_rl", "proprio", "ref_chunk")
+            }
         if save_reference:
             reference = (
                 result["forward_inputs"]["ref_chunk"].detach().float().cpu().numpy()[0]
                 if use_actor
                 else actions[0]
             )
-            diagnostics = {
-                "reference_actions": self.codec.decode(reference).tolist(),
-                "reference_horizon": len(reference),
-                "observation_state": np.asarray(
-                    observation["observation.state"]
-                ).tolist(),
-                "action_units": ["deg"] * 6 + ["mm"],
-                "mode": mode,
-            }
+            diagnostics.update(
+                {
+                    "reference_actions": self.codec.decode(reference).tolist(),
+                    "reference_horizon": len(reference),
+                    "observation_state": np.asarray(
+                        observation["observation.state"]
+                    ).tolist(),
+                    "action_units": ["deg"] * 6 + ["mm"],
+                    "mode": mode,
+                }
+            )
         return decoded, diagnostics

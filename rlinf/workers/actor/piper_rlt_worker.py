@@ -60,6 +60,11 @@ class PiperRLTActor(RLTACFSDPPolicy):
         np.random.seed(self.cfg.actor.seed)
         torch.manual_seed(self.cfg.actor.seed)
         super().init_worker()
+        # These heads are already warmed up. Count the first accepted transitions
+        # toward the native update budget instead of subtracting a collection phase.
+        if self.use_rlt_schedule:
+            self._warmup_ready_total_transitions = 0
+            self._warmup_ready_total_episodes = 0
 
     def get_rollout_sync_version(self) -> int:
         """Version each published policy by the actual critic update count."""
@@ -147,6 +152,13 @@ class PiperRLTActor(RLTACFSDPPolicy):
         from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
 
         replay = CachedRLTReplay(path)
+        if (
+            self.cfg.piper.get(
+                "offline_cache_fingerprint", replay.manifest["content_fingerprint"]
+            )
+            != replay.manifest["content_fingerprint"]
+        ):
+            raise ValueError("Offline cache changed since the online run was bound.")
         if replay.manifest["annotations"]["task"] != self.cfg.piper.task:
             raise ValueError("Offline cache task differs from the online task.")
         if replay.reward_scope != "critical_segment" or replay.manifest[
@@ -169,6 +181,8 @@ class PiperRLTActor(RLTACFSDPPolicy):
             self.demo_buffer.add_trajectories(
                 [segment_trajectory(replay.episodes[index], -1)]
             )
+        if self.demo_buffer.total_samples == 0:
+            raise ValueError("Offline cache contains no training transitions.")
         return self.demo_buffer.total_samples
 
     def save_checkpoint(self, save_base_path: str, step: int) -> None:
@@ -180,6 +194,15 @@ class PiperRLTActor(RLTACFSDPPolicy):
         torch.save(
             {
                 "update_step": self.update_step,
+                "ingest_counters": {
+                    key: getattr(self, key)
+                    for key in (
+                        "total_transitions_added",
+                        "total_episodes_added",
+                        "transitions_since_train",
+                        "episodes_since_train",
+                    )
+                },
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state_all(),
                 "numpy_rng": np.random.get_state(),
@@ -208,6 +231,8 @@ class PiperRLTActor(RLTACFSDPPolicy):
             root / "piper_training.pt", map_location="cpu", weights_only=False
         )
         self.update_step = int(state["update_step"])
+        for key, value in state.get("ingest_counters", {}).items():
+            setattr(self, key, int(value))
         if self.demo_buffer is not None:
             self.demo_buffer.load_checkpoint(str(root / "demo_buffer"))
             self.demo_buffer.random_generator.set_state(state["demo_rng"])

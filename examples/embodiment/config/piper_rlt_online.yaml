@@ -31,8 +31,15 @@ algorithm:
   loss_type: rlt_ac
   adv_type: embodied_sac
   loss_agg_func: token-mean
-  update_epoch: 32             # Critic minibatches per accepted episode.
-  critic_actor_ratio: 4        # Eight actor steps per 32 critic steps.
+  update_epoch: 5              # Critic updates earned per new replay transition.
+  critic_actor_ratio: 2        # One actor step per two critic steps.
+  rlt_schedule:
+    enable: true
+    warmup_min_size: 64        # Online transitions, not episode count.
+    warmup_post_collect_updates: 0
+    train_every_transitions: 1
+    train_every_episodes: 0
+    max_updates_per_train_step: 256 # Carry unfinished budget to the next acceptance.
   train_actor_steps: 0         # Warmup heads are already trained.
   gamma: 0.995                 # Per executed 30 Hz tick, as in offline warmup.
   tau: 0.005
@@ -61,6 +68,7 @@ algorithm:
     sample_window_size: 200    # Uniform chunks from the latest 200 episodes.
     min_buffer_size: 1
     auto_save: true
+    full_batch: true           # Sampling with replacement keeps the 32/32 mix exact.
 weight_syncer:
   type: patch
   patch:
@@ -69,5 +77,10 @@ weight_syncer:
     compression: none
     init_sync: {enabled: true, prefixes: null, bucket_size: 134217728}
 piper:
-  offline_cache: null          # Optional warmup cache; only its train split is used.
+  offline_cache: null          # Supply --offline-cache; only train split is used.
+  require_offline_cache: true
+  require_critic_warmup: true
+  replay_stride: 2
+  replay_tail_policy: align
+  replay_feature_batch_size: 2
   keep_checkpoints: 3

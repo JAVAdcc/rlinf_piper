@@ -72,10 +72,21 @@ class _PolicyRequest:
         observation: dict,
         task: str,
         save_rlt_reference: bool,
+        replay_directory: Path | None = None,
+        frame: int = 0,
     ) -> tuple[np.ndarray, dict]:
         kwargs = (
             {} if self.actor_enabled is None else {"actor_enabled": self.actor_enabled}
         )
+        if replay_directory is not None:
+            started = time.monotonic()
+            actions, diagnostics = policy.infer_for_replay(
+                observation, task, **kwargs, directory=replay_directory, frame=frame
+            )
+            return actions, {
+                **diagnostics,
+                "inference_call_s": time.monotonic() - started,
+            }
         if save_rlt_reference:
             started = time.monotonic()
             actions, diagnostics = policy.infer_with_reference(
@@ -515,7 +526,14 @@ def rollout_piper(
                     policy, policy_selection, policy_source, replan_steps
                 )
                 actions, diagnostics = request.infer(
-                    policy, observation, task, save_rlt_reference
+                    policy,
+                    observation,
+                    task,
+                    save_rlt_reference,
+                    Path(log.name).parent
+                    if getattr(policy, "record_replay_features", False)
+                    else None,
+                    completed,
                 )
                 actions = np.asarray(actions)
                 if (
@@ -715,7 +733,15 @@ def _rollout_with_intervention(
                         task=np.asarray(task),
                     )
                 future = executor.submit(
-                    request.infer, policy, snapshot, task, save_rlt_reference
+                    request.infer,
+                    policy,
+                    snapshot,
+                    task,
+                    save_rlt_reference,
+                    Path(log.name).parent
+                    if getattr(policy, "record_replay_features", False)
+                    else None,
+                    completed,
                 )
             # An input arriving during observation/result handling still wins.
             if stop_requested is not None and stop_requested(completed):

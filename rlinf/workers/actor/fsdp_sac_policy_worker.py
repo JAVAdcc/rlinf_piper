@@ -188,6 +188,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         else:
             auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
         self.replay_buffer = TrajectoryReplayBuffer(
+            full_batch=self.cfg.algorithm.replay_buffer.get("full_batch", False),
             seed=seed,
             enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
             cache_size=self.cfg.algorithm.replay_buffer.cache_size,
@@ -209,6 +210,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             else:
                 auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
             self.demo_buffer = TrajectoryReplayBuffer(
+                full_batch=self.cfg.algorithm.demo_buffer.get("full_batch", False),
                 seed=seed,
                 enable_cache=self.cfg.algorithm.demo_buffer.enable_cache,
                 cache_size=self.cfg.algorithm.demo_buffer.cache_size,

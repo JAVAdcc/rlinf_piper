@@ -40,9 +40,13 @@ def online_config(
     task: str,
     output: Path,
     allow_offline_actor: bool,
+    offline_cache: Path | None = None,
+    resume: bool = False,
 ) -> DictConfig:
     """Bind a native learner configuration to explicit deployment contracts."""
     cfg = OmegaConf.load(config)
+    if offline_cache is not None:
+        cfg.piper.offline_cache = str(offline_cache.expanduser().resolve())
     if (
         cfg.actor.fsdp_config.strategy != "fsdp"
         or cfg.actor.fsdp_config.use_orig_params
@@ -79,12 +83,29 @@ def online_config(
     model = metadata["model"]
     if (
         model["model_type"] != "rlt_mlp_policy"
-        or model["num_action_chunks"] != 10
+        or not 1 <= model["num_action_chunks"] <= 50
         or model["ref_num_action_chunks"] != 50
     ):
-        raise ValueError(
-            "This online profile requires the deployed H50/C10 RLT AC heads."
-        )
+        raise ValueError("Online training requires RLT AC heads with 1 <= C <= H50.")
+    if cfg.piper.get("require_critic_warmup", False):
+        critic_steps = metadata.get("critic_warmup_steps", 0)
+        for name in ("readiness.json", "original_readiness.json"):
+            receipt = actor.parent / name
+            if receipt.exists():
+                report = json.loads(receipt.read_text())
+                if report.get("weights_sha256") != file_sha256(
+                    actor / "model_state_dict/full_weights.pt"
+                ):
+                    raise ValueError(
+                        "Critic warmup receipt does not match actor weights."
+                    )
+                critic_steps = report.get("critic_steps", 0)
+                break
+        if critic_steps <= 0 and metadata.get("online_update_step", 0) <= 0:
+            raise ValueError(
+                "Online training requires a warmed-up critic; use eval_shared.sh "
+                "for the C50 BC-only actor."
+            )
     if (
         model_cfg.openpi.action_chunk != 50
         or model_cfg.precision != "fp32"
@@ -97,10 +118,29 @@ def online_config(
         or not cfg.algorithm.replay_buffer.auto_save
     ):
         raise ValueError("Use native RLT AC with durable, already segmented replay.")
-    if cfg.algorithm.get("rlt_schedule", {}).get("enable", False):
+    schedule = cfg.algorithm.get("rlt_schedule", {})
+    if schedule.get("enable", False) and (
+        schedule.get("warmup_post_collect_updates", 0) != 0
+        or schedule.get("train_every_transitions") != 1
+        or schedule.get("train_every_episodes", 0) != 0
+        or schedule.get("max_updates_per_train_step", 0) < 1
+        or schedule.get("warmup_min_size", 0) < 1
+    ):
+        raise ValueError("Use transition-count scheduling without a second warmup.")
+    if cfg.piper.get("require_offline_cache", False) and not cfg.piper.offline_cache:
         raise ValueError(
-            "Online initialization must not rerun the native warmup schedule."
+            "Online training requires --offline-cache with the warmup train split."
         )
+    if (
+        not 0
+        < cfg.piper.get("replay_stride", model["num_action_chunks"])
+        <= model["num_action_chunks"]
+    ):
+        raise ValueError("Replay stride must be in [1, actor horizon].")
+    if cfg.piper.get("replay_feature_batch_size", 1) < 1:
+        raise ValueError("Replay feature batch size must be positive.")
+    if cfg.piper.get("replay_tail_policy", "pad") not in ("pad", "align"):
+        raise ValueError("Replay tail policy must be pad or align.")
     if cfg.algorithm.get("demo_buffer") is not None and not cfg.piper.offline_cache:
         raise ValueError(
             "A demo pool requires an offline cache to avoid waiting on an empty pool."
@@ -158,13 +198,32 @@ def online_config(
         cfg.piper.offline_cache = str(
             Path(cfg.piper.offline_cache).expanduser().resolve()
         )
-        cfg.algorithm.demo_buffer = OmegaConf.merge(
-            cfg.algorithm.replay_buffer,
-            {
-                "auto_save_path": str(output / "demo_replay"),
-                "min_buffer_size": 1,
-            },
-        )
+        if not resume:
+            cfg.algorithm.demo_buffer = OmegaConf.merge(
+                cfg.algorithm.replay_buffer,
+                {
+                    "auto_save_path": str(output / "demo_replay"),
+                    "min_buffer_size": 1,
+                    "sample_window_size": 0,
+                    "add_interventions": False,
+                },
+            )
+            manifest_path = Path(cfg.piper.offline_cache) / "manifest.json"
+            cache_manifest = json.loads(manifest_path.read_text())
+            if (
+                cache_manifest["stage1"] != manifest
+                or cache_manifest["annotations"]["task"] != task
+            ):
+                raise ValueError("Offline cache Stage 1 or task differs from this run.")
+            for key in (
+                "num_action_chunks",
+                "ref_num_action_chunks",
+                "action_dim",
+                "z_dim",
+            ):
+                if cache_manifest["model"][key] != model[key]:
+                    raise ValueError(f"Offline cache model mismatch: {key}.")
+            cfg.piper.offline_cache_fingerprint = cache_manifest["content_fingerprint"]
     return cfg
 
 
@@ -172,6 +231,7 @@ class PiperOnlinePolicy:
     """Local controller API backed by a dedicated native rollout worker."""
 
     manual_critical = True
+    record_replay_features = True
 
     def __init__(self, worker, info: dict) -> None:
         self.worker = worker
@@ -197,6 +257,25 @@ class PiperOnlinePolicy:
         """Carry paired reference diagnostics across the worker boundary."""
         actions, diagnostics = self.worker.infer_with_reference(
             observation, task, actor_enabled=actor_enabled
+        ).wait()[0]
+        return actions, {**diagnostics, "policy_version": self.version}
+
+    def infer_for_replay(
+        self,
+        observation: dict,
+        task: str,
+        *,
+        actor_enabled: bool,
+        directory: Path,
+        frame: int,
+    ) -> tuple[np.ndarray, dict]:
+        """Persist the features of the recorded request frame, even if later cancelled."""
+        actions, diagnostics = self.worker.infer_for_replay(
+            observation,
+            task,
+            actor_enabled=actor_enabled,
+            directory=str(directory),
+            frame=frame,
         ).wait()[0]
         return actions, {**diagnostics, "policy_version": self.version}
 

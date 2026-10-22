@@ -73,6 +73,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--task", help="Training task text; infer defaults to the dataset task"
     )
+    parser.add_argument(
+        "--offline-cache",
+        type=Path,
+        help="Warmup cache for mixed online training; train split only",
+    )
     parser.add_argument("--dataset", type=Path, help="Local LeRobot dataset for infer")
     parser.add_argument(
         "--video-backend",
@@ -226,7 +231,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 if key in vars(args) and key not in ("command", "resume", "output_dir")
             }
             # Historical wrapper runs used the repository as their working directory.
-            for key in ("checkpoint", "actor", "hardware", "dataset", "online_config"):
+            for key in (
+                "checkpoint",
+                "actor",
+                "hardware",
+                "dataset",
+                "online_config",
+                "offline_cache",
+            ):
                 if defaults.get(key) is not None:
                     path = Path(defaults[key]).expanduser()
                     if not path.is_absolute():
@@ -287,8 +299,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         if args.device != "cuda:0":
             parser.error("The current online profile uses the single local GPU cuda:0.")
-        if args.replan_steps is not None and args.replan_steps < 10:
-            parser.error("Online H50/C10 execution requires --replan-steps >= 10.")
+    elif args.offline_cache is not None:
+        parser.error("--offline-cache requires --online-config.")
     if any(
         value is not None
         for value in (args.teleop, args.leader_usb_serial, args.intervention_key)
@@ -424,7 +436,14 @@ def _run_with_resources(
             task=args.task,
             output=output,
             allow_offline_actor=args.allow_offline_actor,
+            offline_cache=args.offline_cache,
+            resume=args.resume is not None,
         )
+        if (
+            args.replan_steps is not None
+            and args.replan_steps < cfg.actor.model.num_action_chunks
+        ):
+            raise ValueError("Online execution must not truncate the actor horizon.")
         OmegaConf.save(cfg, metadata_output / "online.yaml")
         online = stack.enter_context(
             PiperOnlineRunner(cfg, output, resume=args.resume is not None)

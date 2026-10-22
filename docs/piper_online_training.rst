@@ -1,37 +1,57 @@
 Piper 的同步 online 训练
 ========================
 
-``toolkits/piper/train_online.sh`` 让当前 Piper 数采流程直接驱动原生 RLT 训练。Stage1 为冻结的 H50 FP32 VLA，共享 actor 执行 C10；``b`` 进入关键段，``s/f`` 给该段局部结果并恢复 reference。人工接管、流式视频、立即丢弃和复位继续由本地 controller 管理。现场启动和续训命令集中在仓库根目录 ``order.md`` 第 10 节。
+``toolkits/piper/train_online.sh`` 让 Piper 数采流程驱动原生 RLT 训练。Stage1 为冻结的 H50 FP32 VLA，actor 的执行长度 C 从权重 metadata 读取，支持 C10 和 C50。``b`` 进入关键段，``s/f`` 给该段局部结果并恢复 reference。现场启动和续训命令集中在 ``order.md`` 第 10 节；当前 C50 BC5000 的固定权重测试使用第 13 节 ``eval_c50.sh``，它的 critic 未训练，不能直接用于 online。
 
 确认保留后再训练
 ----------------
 
-整条 episode 停止、评分、保存和复位后，操作员仍可用 ``Left`` 撤销。只有 ``Right`` 确认保留时，才提交 replay、执行 learner 更新、保存 checkpoint 并广播新权重；这些步骤完成后下一条才开始。最后一条同样需要 ``Right`` 确认。确认后不能再撤销已经用于训练的数据，``q`` 退出前尚未确认的数据则继续留在待确认状态。
+整条 episode 停止、评分、保存和复位后，操作员仍可用 ``Left`` 撤销。只有 ``Right`` 确认保留时，才提交 replay、执行 learner 更新、保存 checkpoint 并广播新权重；完成后下一条才开始。最后一条同样需要确认。确认后不能撤销已经用于训练的数据，``q`` 退出前未确认的数据继续留在待确认状态。
 
-训练发生在两条 episode 之间。终端和 CAN 操作留在主进程，``PiperRLTRollout`` worker 持有一个冻结 VLA 和一个 actor，``PiperRLTActor`` 继承原生 ``RLTACFSDPPolicy``。replay ingestion、DataLoader、optimizer 更新、target 更新、checkpoint 和权重广播复用原生组件；``PiperOnlineRunner`` 负责操作员确认边界与提交事务，不另写优化器循环。当前配置支持单机单 GPU，尚未提供边执行边学习的异步模式。
+训练发生在两条 episode 之间。终端和 CAN 留在主进程，``PiperRLTRollout`` 持有冻结 VLA 和 actor，``PiperRLTActor`` 继承 ``RLTACFSDPPolicy``。replay、DataLoader、optimizer、target、checkpoint 和权重广播复用原生组件；``PiperOnlineRunner`` 管理确认和提交事务。当前支持单机单 GPU，不在机械臂执行过程中更新权重。
 
-局部奖励和数据池
-----------------
+执行长度与 replay 窗口
+----------------------
 
-每个关键段独立终止。成功段的最后一个有效 tick 给 1，失败段给 0，``gamma=0.995`` 按实际执行 tick 折扣；整条任务的 success/failure 只用于整体统计。局部终止既不跨到下一个关键段 bootstrap，也不触发机械臂复位。不到 C10 的末尾 chunk 保留真实长度，补齐部分不进入 BC 或 Q 输入。人类监督使用记录中实际发送的动作；actor 的 Q 输入按驱动行程投影，BC 仍针对原始 actor 输出。
+机器人执行 C 步后重规划，replay 则独立使用 ``piper.replay_stride=2``：例如 C50 的窗口为 ``[0:50]、[2:52]、[4:54]``。窗口内是逐 tick 实际发送的动作，可以跨过多次推理的边界，包括 hold 和人工接管。下一状态位于窗口结束的真实帧，不是下一个采样起点；折扣仍按实际 tick 数计算。增密 replay 不会缩短 C50 的实际执行 chunk。
 
-确认后复用 rollout worker 已加载的 VLA，为关键段每 10 帧及边界提取一次特征，保存为该 episode 的 ``online_features.npz``。这与离线 warmup 共用 transition 和损失语义；同一确认数据重试时复用已校验的 shard。无需预先计算新轨迹的 cache，代价是长关键段在回合之间会有提取等待。GPU smoke 中仅有两个短测试段，耗时不能外推到完整任务。
+每段独立终止，窗口不能跨 critical phase、reset 或未执行动作。默认 ``replay_tail_policy=align`` 保留完整 C 步窗口，并补一个对齐段末的窗口；整段短于 C 时只保留一个带有效长度 mask 的短窗口。成功段最后有效 tick 奖励为 1，失败为 0，``gamma=0.995`` 按 tick 折扣。整条 episode 的评分不覆盖分段奖励。人工帧的 BC target 使用实际人工动作，其他帧使用当前状态的 VLA reference；target Q 在段末不 bootstrap。
 
-默认 online 池保存所有确认的有效段，均匀采样最近 200 个 episode 中的 chunk。可设置 ``piper.offline_cache`` 接入已有 warmup cache：只导入 train split，使用原生 demo 池，online 和 demo 各采样半个 batch，人工接管 chunk 也加入 demo 池。validation 不参与更新，cache 必须绑定相同 Stage1、任务、归一化及 H50/C10。未提供 cache 时不自动拉取旧数据，云端小网络导出本身不含 replay。
+warmup 的 cache 命令也支持独立 ``chunk_length``、``stride`` 和 ``tail_policy``。为新 C50 数据创建 cache 时可使用 ``chunk_length=50 stride=2 tail_policy=align``，输出到新目录。旧 C10 transition 不能 reshape 成 C50；本次 C50 测试不读取 C10 rollout 旧数据。
 
-训练参数与恢复
+新 C50 数据使用 ``examples/offline_rl/config/piper_rlt_c50_warmup.yaml``，它将标签、cache 和训练输出隔离在 ``outputs/piper/c50/`` 下。该配置不自动读取旧 C10 collection，也不修改现有部署包；正式训练仍需要准备符合训练/验证划分要求的 v3 分段标签。
+
+特征复用与补算
 --------------
 
-``examples/embodiment/config/piper_rlt_online.yaml`` 默认每个确认 episode 更新 critic 32 次、actor 8 次，batch 上限 64，actor 和 critic 的 Adam 学习率均为 ``3e-4``。前 1,000 次 critic 更新逐渐把 Q 权重从 0 提至 0.1，并把 BC 权重从 5 降至 2。在线不重跑 BC／critic warmup。actor 使用导出网络的固定标准差采样，reference dropout 首测设为 0。配置并不保证任务成功率会提高。
+online 推理使用同一前向结果，把 normalized ``z_rl``、``proprio``、H50 ``ref_chunk`` 和 raw state 写入 episode 的 ``replay_anchors/``。锚点绑定发起请求的观察帧，而不是异步预测返回的帧。即使动作随后被人工接管打断，这个已录制观察帧的冻结特征仍可复用；未执行就取消的终止帧请求不作为 terminal observation 的缓存。
 
-新建运行从 warmup actor 和 critic 初始化，target 从当前模型初始化，optimizer 从头建立。``--resume`` 则恢复整个 online 状态：模型、target、optimizer、学习率、replay、demo 池、更新计数和各随机数状态。训练配置和硬件配置由运行目录的快照恢复。``online/latest.json`` 仅在完整 checkpoint 写好之后发布；确认过但没有提交成功的 episode 会重试，已经提交的目录不会重复入池或重复更新。
+确认后选择所有窗口的起点和下一状态，去重并校验锚点。对缺失状态按 ``piper.replay_feature_batch_size=2`` 补算，使用该状态自身的图像生成 reference，不平移前一个状态的 reference。补算在独立 RNG 上下文中运行，不消耗 rollout 的探索随机数。完成后原子保存 ``online_features.npz``，并在 ``online_features.json`` 中记录输入摘要、复用数量、补算数量、batch 数和耗时。重试会复用已校验的 shard。
 
-``episode_*/result.json`` 保存采集时的 policy 版本，``online_update.json`` 给出实际更新后的 rollout 版本、权重摘要、loss 与耗时。完整状态位于 ``online/checkpoint_XXXXXX/actor``，其中 ``model_state_dict/full_weights.pt`` 和 ``piper_rlt_actor.json`` 可交给共享 actor 评测入口，仍需手动 critical routing。默认保留最近 3 份 checkpoint，加上续训进程仍在读取的一份旧 checkpoint；replay 和原始数据持续保留。
+离线与在线两个数据池
+--------------------
+
+新运行必须通过 ``--offline-cache``、``PIPER_OFFLINE_CACHE`` 或配置 ``piper.offline_cache`` 指定 warmup cache。只导入 train split；validation 留作评估。cache 必须匹配 Stage1、任务、归一化和 actor/reference 的 horizon。只加载小网络权重不会自动加载数据。
+
+online 池均匀、有放回采样最近 200 条有效 episode 的 chunk；demo 池保存全部离线训练数据，``sample_window_size=0`` 不设置最近窗口。人工接管 chunk 保留在在线池，并携带逐 tick human mask，不重复加入离线池。两个池分别采样 32 个 transition，组成固定 batch 64；池较小时仍通过有放回采样维持比例。磁盘 replay 和原始数据持续保留，不随 200 条采样窗口自动删除。
+
+训练预算与恢复
+--------------
+
+``examples/embodiment/config/piper_rlt_online.yaml`` 启用原生 transition 计数调度。至少积累 64 个在线 transition 才开始更新；导入的离线样本不产生 online 更新预算。每个新增 transition 产生 5 次 critic 更新预算，每次确认最多执行 256 次，未完成预算保留到后续确认。每 2 次 critic 更新一次 actor。这个入口的 UTD 分母明确为新增 replay transition，不是原始帧或 batch 样本曝光次数。
+
+例如第一条生成 100 个 transition，产生 500 次预算，本次执行 256 critic / 128 actor 更新，还剩 244 次；第二条再生成 20 个 transition，则累计剩余预算为 344，本次继续执行最多 256 次。预算、实际执行量和两个池大小写入 ``online_update.json``；若没有新的确认，剩余预算不会在机械臂执行期间自行消耗。
+
+actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005``。前 1,000 次 critic 更新逐渐把 Q 权重由接近 0 提至 0.1，把 BC 权重从 5 降至 2。actor 使用导出网络的固定标准差采样。初始化要求 critic 已 warmup，当前 BC-only C50 包会在模型和硬件启动前被拒绝；测试 actor 的命令不受影响。
+
+新建运行从 warmup heads 初始化 target，并建立新的 optimizer。``--resume`` 恢复模型、target、optimizer、学习率、两个 replay 池、累计新增 transition、更新计数及随机数状态。离线池已经包含在 checkpoint 内，续训不再需要原离线 cache 路径。配置与权重绑定由运行快照恢复，新 C50 数据使用新目录；不在旧 run 中更换 stride 或模型。
+
+``online/latest.json`` 只在完整 checkpoint 发布后更新。确认但未提交成功的 episode 重试，已提交的目录不会重复入池。默认保留最近 3 份 checkpoint，以及续训进程正在读取的一份旧 checkpoint；旧 checkpoint 清理不删除在线原始数据。产出的 ``actor/model_state_dict/full_weights.pt`` 可用于独立评测。
 
 不用机械臂检查完整链路
 ----------------------
 
-以下检查需要本机 GPU、真实 Stage1／warmup 权重和一条至少包含 10 个有效动作的现有录制 episode。它读取录像并使用合成的成功／失败短段标签，仅验证程序和恢复，不连接机械臂、不更改原采集目录，也不测任务成功率。测试产物不能作为正式训练权重或人工标注使用。
+以下 GPU 集成测试默认生成新合成观察、控制 tick 和离线 cache，不读取旧 C10 rollout，也不连接相机或机械臂。它单独关闭测试配置的 critic warmup 检查，用于验证 C50 网络的更新与恢复，测试输出不能用于真实训练或任务成功率评估。
 
 .. code-block:: bash
 
@@ -39,12 +59,11 @@ Piper 的同步 online 训练
    export USE_TF=0 JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 PYTHONPATH="$PWD"
    piper_test_args=(
      --stage1 checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor
-     --actor checkpoints/piper_shared_prejoint/actor
-     --source-episode /path/to/recorded/episode_001
-     --output /tmp/piper-online-smoke
+     --actor checkpoints/piper_shared_c50_bc5000_20261022/actor
+     --output /tmp/piper-c50-online-smoke
    )
    .venv-piper/bin/python tests/e2e_tests/embodied/piper_online.py "${piper_test_args[@]}"
    .venv-piper/bin/python tests/e2e_tests/embodied/piper_online.py "${piper_test_args[@]}" --resume
    .venv-piper/bin/python tests/e2e_tests/embodied/piper_online.py "${piper_test_args[@]}" --resume
 
-第一遍检查 H50/C10 推理、录制数据提特征、入池、真实 actor／critic 参数变化和新权重广播。后两遍核对 checkpoint 恢复、重复提交保护，并从相同状态继续更新，比较后续权重摘要。没有上述权重、数据或 GPU 的 CI 只运行 CPU 单元测试，不执行此脚本。
+第一遍检查 H50/C50 推理、锚点复用、批量提取、离线池导入、入池、真实 actor/critic 梯度更新和权重广播。后两遍从相同 checkpoint 继续消耗预算，比较得到的新权重摘要，覆盖 replay、optimizer、RNG 与计数恢复。CPU 单元测试另外覆盖段末对齐、短段 mask、人工动作混合、固定 batch、离线池保留及 C50 的中途切换和 HIL。

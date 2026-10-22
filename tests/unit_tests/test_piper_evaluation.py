@@ -161,6 +161,52 @@ def test_piper_online_failed_update_is_accepted_and_cannot_be_undone_on_resume(
     assert summary["discarded_episodes"] == 0
 
 
+def test_piper_c50_cli_preserves_horizon_and_ignores_stale_actor_env(tmp_path):
+    import sys
+
+    from toolkits.piper.run_policy import parse_args
+
+    repo = Path(__file__).resolve().parents[2]
+    capture = tmp_path / "capture-python"
+    capture.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        "if sys.argv[1] == '-':\n"
+        "    sys.argv = sys.argv[1:]\n"
+        "    exec(sys.stdin.read())\n"
+        "else:\n"
+        "    print(json.dumps(sys.argv[1:]))\n"
+    )
+    capture.chmod(0o755)
+    metadata = tmp_path / "piper_rlt_actor.json"
+    metadata.write_text(
+        json.dumps({"model": {"num_action_chunks": 50, "ref_num_action_chunks": 50}})
+    )
+    command = [
+        "bash",
+        str(repo / "toolkits/piper/eval_c50.sh"),
+        "rollout",
+        "--replan-steps",
+        "10",
+    ]
+    env = {
+        **os.environ,
+        "PIPER_PYTHON": str(capture),
+        "PIPER_ACTOR_PATH": str(tmp_path / "stale_c10"),
+        "PIPER_C50_ACTOR_PATH": str(tmp_path),
+    }
+    result = subprocess.run(
+        command, env=env, capture_output=True, text=True, check=True
+    )
+    args = parse_args(json.loads(result.stdout)[2:])
+    assert args.actor == tmp_path and args.replan_steps == 50
+    assert args.online_config is None and args.record_dataset
+    metadata.write_text(
+        json.dumps({"model": {"num_action_chunks": 10, "ref_num_action_chunks": 50}})
+    )
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode != 0 and "requires actor C50" in result.stderr
+
+
 def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     import sys
 
@@ -175,7 +221,12 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     capture.chmod(0o755)
     command = subprocess.run(
         ["bash", str(wrapper), "--num-episodes", "5", "--teleop", "piper_leader"],
-        env={**os.environ, "PIPER_PYTHON": str(capture)},
+        env={
+            **os.environ,
+            "PIPER_PYTHON": str(capture),
+            "PIPER_ACTOR_PATH": str(tmp_path / "trained_actor"),
+            "PIPER_OFFLINE_CACHE": str(tmp_path / "offline_cache"),
+        },
         capture_output=True,
         text=True,
         check=True,
@@ -186,6 +237,7 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
         == repo / "examples/embodiment/config/piper_rlt_online.yaml"
     )
     assert original.actor_mode == "manual-critical" and original.allow_offline_actor
+    assert original.offline_cache == tmp_path / "offline_cache"
     assert original.record_dataset and original.interactive and original.steps == 7200
     assert original.num_episodes == 5 and original.teleop == "piper_leader"
     (tmp_path / "run.json").write_text(
@@ -206,19 +258,25 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     assert (
         resumed.online_config == original.online_config and resumed.num_episodes == 100
     )
+    assert resumed.offline_cache == original.offline_cache
     with pytest.raises(SystemExit):
         parse_args(
             ["rollout", "--resume", str(tmp_path), "--online-config", "another.yaml"]
         )
 
 
-def test_manual_critical_routing_drops_queues_and_records_actual_source(tmp_path):
+@pytest.mark.parametrize("horizon", [10, 50])
+def test_manual_critical_routing_drops_queues_and_records_actual_source(
+    tmp_path, horizon
+):
     class ManualPolicy(Policy):
         manual_critical = True
-        actor_horizon = 10
+        actor_horizon = horizon
 
         def infer(self, obs, task, *, actor_enabled):
-            return np.full((10 if actor_enabled else 50, 7), 2 if actor_enabled else 1)
+            return np.full(
+                (horizon if actor_enabled else 50, 7), 2 if actor_enabled else 1
+            )
 
     session = Session()
 
@@ -269,7 +327,7 @@ def test_manual_critical_routing_drops_queues_and_records_actual_source(tmp_path
     ] * 2 + ["actor"] * 2 + ["reference"] * 2
     assert [r["replan_steps"] for r in trace if r["event"] == "prediction"] == [
         50,
-        10,
+        horizon,
         50,
     ]
 
@@ -449,7 +507,8 @@ def test_manual_route_change_after_result_acceptance_keeps_human_release():
             control.close()
 
 
-def test_manual_critical_hil_rejects_pending_result_and_routes_after_release():
+@pytest.mark.parametrize("horizon", [10, 50])
+def test_manual_critical_hil_rejects_pending_result_and_routes_after_release(horizon):
     from threading import Event
 
     from robot_mocks import mocked_sdks
@@ -466,7 +525,7 @@ def test_manual_critical_hil_rejects_pending_result_and_routes_after_release():
 
     class ManualPolicy(Policy):
         manual_critical = True
-        actor_horizon = 10
+        actor_horizon = horizon
         calls = 0
 
         def infer(self, obs, task, *, actor_enabled):
@@ -475,7 +534,9 @@ def test_manual_critical_hil_rejects_pending_result_and_routes_after_release():
                 started.set()
                 assert finish.wait(3)
                 return np.full((50, 7), 77)
-            return np.full((10 if actor_enabled else 50, 7), 2 if actor_enabled else 1)
+            return np.full(
+                (horizon if actor_enabled else 50, 7), 2 if actor_enabled else 1
+            )
 
     class Follower(Session):
         def execute(self, target):

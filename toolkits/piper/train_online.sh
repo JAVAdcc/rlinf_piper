@@ -14,12 +14,17 @@ for piper_arg in "$@"; do
     exec "$piper_python" -m toolkits.piper.run_policy rollout "$@"
   fi
 done
+: "${PIPER_ACTOR_PATH:?Set PIPER_ACTOR_PATH to an actor with a warmed-up critic}"
+piper_replay_args=()
+if [[ -n "${PIPER_OFFLINE_CACHE:-}" ]]; then
+  piper_replay_args+=(--offline-cache "$PIPER_OFFLINE_CACHE")
+fi
 exec "$piper_python" -m toolkits.piper.run_policy rollout \
   --online-config "$piper_repo/examples/embodiment/config/piper_rlt_online.yaml" \
   --checkpoint "${PIPER_STAGE1_PATH:-$piper_repo/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor}" \
-  --actor "${PIPER_ACTOR_PATH:-$piper_repo/checkpoints/piper_shared_prejoint/actor}" \
+  --actor "$PIPER_ACTOR_PATH" \
   --actor-mode manual-critical --allow-offline-actor \
   --hardware "$piper_repo/examples/embodiment/config/piper_usb_hardware.yaml" \
   --task 'pick up the two USB cables and insert them into the USB port on the outlet.' \
   --interactive --record-dataset --num-episodes 100 --steps 7200 --replan-steps 50 \
-  --reset-after-episode initial "$@"
+  --reset-after-episode initial "${piper_replay_args[@]}" "$@"

@@ -15,6 +15,8 @@
 """Convert accepted Piper segments to native RLT replay trajectories."""
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -79,8 +81,112 @@ def segment_trajectory(arrays: dict[str, torch.Tensor], version: int) -> Traject
     )
 
 
+def save_replay_anchor(
+    directory: Path, frame: int, manifest: dict, task: str, features: dict
+) -> None:
+    """Persist the frozen features of a rollout observation in normalized units."""
+    root = directory / "replay_anchors"
+    root.mkdir(exist_ok=True)
+    path = root / f"frame_{frame:06d}.npz"
+    binding = json_fingerprint(
+        [manifest["checkpoint_id"], manifest["norm_stats_sha256"], task, frame]
+    )
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("wb") as stream:
+        np.savez(
+            stream,
+            binding=np.asarray(binding),
+            **{
+                key: np.asarray(features[key], dtype=np.float32)
+                for key in ("z_rl", "proprio", "ref_chunk", "raw_state")
+            },
+        )
+    temporary.replace(path)
+
+
+def backfill_replay_features(
+    policy: "PiperRLTPolicy",
+    frames: np.ndarray,
+    sample_at: Callable[[int], dict],
+    *,
+    directory: Path,
+    task: str,
+    fingerprint: str,
+    batch_size: int,
+) -> tuple[dict, dict]:
+    """Reuse rollout anchors; batch only missing states and preserve rollout RNG."""
+    if batch_size < 1:
+        raise ValueError("Replay feature batch size must be positive.")
+    started = time.monotonic()
+    features = {}
+    for frame in map(int, frames):
+        path = directory / "replay_anchors" / f"frame_{frame:06d}.npz"
+        if not path.exists():
+            continue
+        sample = sample_at(frame)
+        # A request cancelled before execute/record may share the terminal frame
+        # index. Its observation is not the recorder's later terminal observation.
+        if not np.asarray(sample.get("complementary_info.action_valid", True)).all():
+            continue
+        with np.load(path, allow_pickle=False) as saved:
+            binding = json_fingerprint(
+                [
+                    policy.manifest["checkpoint_id"],
+                    policy.manifest["norm_stats_sha256"],
+                    task,
+                    frame,
+                ]
+            )
+            if str(saved["binding"]) != binding:
+                raise ValueError(
+                    "Rollout feature anchor belongs to another data contract."
+                )
+            values = {
+                key: saved[key].copy()
+                for key in ("z_rl", "proprio", "ref_chunk", "raw_state")
+            }
+        if not np.allclose(
+            values["raw_state"],
+            sample["observation.state"],
+            atol=1e-5,
+            rtol=0,
+        ):
+            raise ValueError(
+                "Rollout feature anchor is not aligned to the recorded frame."
+            )
+        features[frame] = values
+    reused = len(features)
+    missing = [int(frame) for frame in frames if int(frame) not in features]
+    device = next(policy.feature_model.parameters()).device
+    for start in range(0, len(missing), batch_size):
+        batch_frames = missing[start : start + batch_size]
+        samples = [sample_at(frame) for frame in batch_frames]
+        if any(sample["task"] != task for sample in samples):
+            raise ValueError("Recorded task text changed.")
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(
+                int(json_fingerprint([fingerprint, batch_frames])[:15], 16)
+            )
+            values = policy.extract_features_batch(samples, task)
+        for frame, value in zip(batch_frames, values, strict=True):
+            features[frame] = value
+    return features, {
+        "reused_anchors": reused,
+        "backfilled_anchors": len(missing),
+        "feature_batches": (len(missing) + batch_size - 1) // batch_size,
+        "feature_seconds": time.monotonic() - started,
+    }
+
+
 def cache_accepted_episode(
-    policy: "PiperRLTPolicy", directory: Path, result: dict, task: str
+    policy: "PiperRLTPolicy",
+    directory: Path,
+    result: dict,
+    task: str,
+    *,
+    stride: int | None = None,
+    tail_policy: str = "pad",
+    feature_batch_size: int = 1,
 ) -> Trajectory | None:
     """Extract frozen features once, only after the operator commits an episode.
 
@@ -97,7 +203,6 @@ def cache_accepted_episode(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch
-    from rlinf.models.embodiment.piper_inference import piper_env_observation
 
     root = directory / "dataset"
     binding = {
@@ -108,6 +213,13 @@ def cache_accepted_episode(
         "phases": result["critical_phases"],
         "terminal": result["recording"]["terminal_frame"],
         "chunk": policy.actor_horizon,
+        "stride": policy.actor_horizon if stride is None else stride,
+        "tail_policy": tail_policy,
+        "feature_batch_size": feature_batch_size,
+        "anchors": {
+            path.name: file_sha256(path)
+            for path in sorted((directory / "replay_anchors").glob("*.npz"))
+        },
         "sources": {
             str(path.relative_to(root)): file_sha256(path)
             for name in ("meta", "data", "videos")
@@ -144,7 +256,8 @@ def cache_accepted_episode(
             phases=result["critical_phases"],
             terminal=terminal,
             chunk_length=policy.actor_horizon,
-            stride=policy.actor_horizon,
+            stride=binding["stride"],
+            tail_policy=tail_policy,
             success=result["outcome"] == "success",
             human=np.asarray(rows["complementary_info.is_intervention"])
             .reshape(-1)
@@ -152,30 +265,24 @@ def cache_accepted_episode(
             reward_scope="critical_segment",
         )
 
-        @torch.inference_mode()
-        def extract(frame: int) -> dict[str, np.ndarray]:
-            sample = dataset[frame]
-            if sample["task"] != task:
-                raise ValueError("Recorded task text changed.")
-            device = next(policy.feature_model.parameters()).device
-            with torch.random.fork_rng(
-                devices=[device] if device.type == "cuda" else []
-            ):
-                torch.manual_seed(int(json_fingerprint([fingerprint, frame])[:15], 16))
-                features = policy.feature_model.extract_rlt_obs(
-                    piper_env_observation(sample, task)
-                )
-            return {
-                **{
-                    key: value[0].detach().float().cpu().numpy()
-                    for key, value in features.items()
-                },
-                "raw_state": np.asarray(sample["observation.state"], dtype=np.float32),
-            }
-
-        digest = cache_episode(shard, transitions, extract)
+        features, feature_stats = backfill_replay_features(
+            policy,
+            transitions["frames"],
+            dataset.__getitem__,
+            directory=directory,
+            task=task,
+            fingerprint=fingerprint,
+            batch_size=feature_batch_size,
+        )
+        digest = cache_episode(shard, transitions, features.__getitem__)
         write_json(
-            manifest, {"binding": binding, "fingerprint": fingerprint, "sha256": digest}
+            manifest,
+            {
+                "binding": binding,
+                "fingerprint": fingerprint,
+                "sha256": digest,
+                "feature_stats": feature_stats,
+            },
         )
     with np.load(shard, allow_pickle=False) as saved:
         arrays = {key: torch.from_numpy(saved[key].copy()) for key in saved.files}

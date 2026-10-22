@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPU integration check using recorded images; never opens hardware.
+"""GPU integration check using synthetic or recorded images; never opens hardware.
 
 Synthetic local outcomes exercise success/failure terminals and partial chunks.
 These labels and trained test weights are not task-performance measurements.
@@ -23,17 +23,145 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
 from rlinf.runners.piper_online_runner import PiperOnlineRunner, online_config
 
 
+def synthetic_episode(directory: Path, task: str, chunk: int) -> None:
+    """Create fresh control-tick data without using any previous robot rollout."""
+    from rlinf.data.storage.lerobot.piper import PiperEpisodeRecorder
+
+    directory.mkdir()
+    observation = {
+        "observation.state": np.array([0, 30, -40, 0, 10, 0, 35], dtype=np.float32)
+    }
+    for camera in ("front", "front_2", "wrist"):
+        observation[f"observation.images.{camera}"] = np.zeros((240, 320, 3), np.uint8)
+    recorder = PiperEpisodeRecorder(directory / "dataset", fps=30, task=task)
+    try:
+        for step in range(chunk + 14):
+            recorder.add_step(
+                observation,
+                observation["observation.state"],
+                requested=observation["observation.state"],
+                measured=observation["observation.state"],
+                critical=True,
+                wall_time=step / 30,
+                is_intervention=step % 3 == 0,
+                action_source="human" if step % 3 == 0 else "actor",
+            )
+        recording = recorder.finish(observation, critical=False, outcome="success")
+    finally:
+        recorder.close()
+    (directory / "result.json").write_text(
+        json.dumps({"recording": recording, "outcome": "success"})
+    )
+
+
+def synthetic_cache(path: Path, task: str, stage1: Path, actor: Path) -> None:
+    """Use a small labelled cache to exercise mixing and validation exclusion."""
+    from rlinf.data.datasets.rlt_warmup import (
+        cache_episode,
+        episode_transitions,
+        json_fingerprint,
+        write_json,
+    )
+    from rlinf.models.embodiment.piper_inference import load_piper_inference_config
+
+    cfg, manifest = load_piper_inference_config(stage1)
+    metadata = json.loads((actor / "piper_rlt_actor.json").read_text())
+    chunk = metadata["model"]["num_action_chunks"]
+    path.mkdir()
+    (path / "norm_stats.json").write_bytes(
+        Path(cfg.openpi_data.norm_stats_path).read_bytes()
+    )
+    labels = {
+        "format": "piper-rlt-episodes-v3",
+        "reward_scope": "critical_segment",
+        "scoring_protocol": "critical-segment-v1",
+        "task": task,
+        "datasets": {"synthetic": "test-only"},
+        "episodes": [],
+    }
+    entries = []
+    for index in range(4):
+        record = {
+            "dataset": "synthetic",
+            "episode": index,
+            "critical_phases": [
+                {
+                    "start": 0,
+                    "end": chunk + 5,
+                    "outcome": "success" if index % 2 == 0 else "failure",
+                }
+            ],
+            "terminal_frame": chunk + 5,
+            "outcome": "success" if index % 2 == 0 else "failure",
+            "behavior": "human",
+            "split": "train" if index < 2 else "validation",
+            "session": None,
+        }
+        labels["episodes"].append(record)
+        transitions = episode_transitions(
+            np.zeros((chunk + 6, 7), np.float32),
+            phases=record["critical_phases"],
+            terminal=chunk + 5,
+            chunk_length=chunk,
+            stride=2,
+            success=index % 2 == 0,
+            human=np.ones(chunk + 6, bool),
+            reward_scope="critical_segment",
+            tail_policy="align",
+        )
+        shard = path / f"episode_{index:06d}.npz"
+        digest = cache_episode(
+            shard,
+            transitions,
+            lambda frame: {
+                "z_rl": np.zeros(2048, np.float32),
+                "proprio": np.zeros(7, np.float32),
+                "ref_chunk": np.zeros((50, 7), np.float32),
+                "raw_state": np.array([0, 30, -40, 0, 10, 0, 35], np.float32),
+            },
+        )
+        entries.append(
+            {
+                **record,
+                "file": shard.name,
+                "sha256": digest,
+                "transitions": len(transitions["current"]),
+                "states": len(transitions["frames"]),
+            }
+        )
+    content = {
+        "format": "piper-rlt-cache-v3",
+        "annotations": labels,
+        "stage1": manifest,
+        "model": metadata["model"],
+        "chunk_length": chunk,
+        "stride": 2,
+        "tail_policy": "align",
+        "episodes": entries,
+    }
+    write_json(
+        path / "manifest.json",
+        {**content, "content_fingerprint": json_fingerprint(content)},
+    )
+    from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
+
+    CachedRLTReplay(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1", type=Path, required=True)
     parser.add_argument("--actor", type=Path, required=True)
-    parser.add_argument("--source-episode", type=Path, required=True)
+    parser.add_argument(
+        "--source-episode", type=Path, help="Omit to generate synthetic observations"
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -41,8 +169,18 @@ def main() -> None:
     output = args.output.resolve()
     output.mkdir(exist_ok=args.resume, parents=True)
     task = "pick up the two USB cables and insert them into the USB port on the outlet."
+    profile = OmegaConf.load(repo / "examples/embodiment/config/piper_rlt_online.yaml")
+    # This is an isolated optimizer/shape test, never a deployable training run.
+    profile.piper.require_critic_warmup = False
+    profile.algorithm.rlt_schedule.warmup_min_size = 1
+    profile.algorithm.rlt_schedule.max_updates_per_train_step = 4
+    profile_path = output / "test_profile.yaml"
+    OmegaConf.save(profile, profile_path)
+    cache = output / "synthetic_cache"
+    if not args.resume:
+        synthetic_cache(cache, task, args.stage1, args.actor)
     cfg = online_config(
-        repo / "examples/embodiment/config/piper_rlt_online.yaml",
+        output / "online.yaml" if args.resume else profile_path,
         stage1=args.stage1,
         actor=args.actor,
         hardware=OmegaConf.to_container(
@@ -51,6 +189,8 @@ def main() -> None:
         task=task,
         output=output,
         allow_offline_actor=True,
+        offline_cache=cache,
+        resume=args.resume,
     )
     cfg.algorithm.update_epoch = 4
     cfg.actor.micro_batch_size = cfg.actor.global_batch_size = 4
@@ -88,7 +228,14 @@ def main() -> None:
 
         from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch
 
-        source = args.source_episode.resolve()
+        chunk = int(cfg.actor.model.num_action_chunks)
+        source = (
+            args.source_episode.resolve()
+            if args.source_episode
+            else output / "synthetic_episode"
+        )
+        if args.source_episode is None:
+            synthetic_episode(source, task, chunk)
         dataset = LeRobotDataset(
             "piper-smoke",
             root=source / "dataset",
@@ -98,10 +245,13 @@ def main() -> None:
         dataset.hf_dataset.set_transform(decode_image_struct_batch)
         sample = dataset[0]
         assert runner.policy.infer(sample, task, actor_enabled=False).shape == (50, 7)
-        assert runner.policy.infer(sample, task, actor_enabled=True).shape == (10, 7)
+        assert runner.policy.infer(sample, task, actor_enabled=True).shape == (chunk, 7)
         episode = output / "episode_001"
         episode.mkdir()
         (episode / "dataset").symlink_to(source / "dataset", target_is_directory=True)
+        runner.policy.infer_for_replay(
+            sample, task, actor_enabled=True, directory=episode, frame=0
+        )
         result = json.loads((source / "result.json").read_text())
         result.update(
             accepted=True,
@@ -109,12 +259,24 @@ def main() -> None:
             directory=episode.name,
             test_only=True,
             critical_phases=[
-                {"start": 0, "end": 3, "outcome": "success"},
-                {"start": 5, "end": 9, "outcome": "failure"},
+                {"start": 0, "end": chunk + 5, "outcome": "success"},
+                {"start": chunk + 7, "end": chunk + 11, "outcome": "failure"},
             ],
         )
         (episode / "result.json").write_text(json.dumps(result))
         runner.accept_episode(episode, result)
+        cache_stats = json.loads((episode / "online_features.json").read_text())[
+            "feature_stats"
+        ]
+        assert cache_stats["reused_anchors"] == 1
+        assert cache_stats["backfilled_anchors"] > 0
+        metrics = json.loads((episode / "online_update.json").read_text())
+        assert (
+            metrics["rlt/critic_updates_run"] == 4
+            and metrics["rlt/actor_updates_run"] == 2
+        )
+        assert metrics["rlt/pending_update_budget"] > 0
+        assert metrics["demo_buffer/total_samples"] == 8
         final = runner.rollout.status().wait()[0]
         assert (
             final["version"] == 4

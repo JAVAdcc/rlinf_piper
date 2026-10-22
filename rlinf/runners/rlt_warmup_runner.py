@@ -104,6 +104,7 @@ class WarmupConfig:
     threads: int = 4
     chunk_length: int = 10
     stride: int = 10
+    tail_policy: str = "pad"
     video_backend: str = "torchcodec"
     phase_filter: int | None = None
     critic_action_projection: str = "none"
@@ -137,6 +138,8 @@ def load_warmup_config(path: str | Path, overrides: list[str] = ()) -> WarmupCon
         )
     if cfg.threads <= 0 or cfg.seed < 0 or not 0 < cfg.stride <= cfg.chunk_length:
         raise ValueError("Invalid threads, seed or cache stride/chunk length.")
+    if cfg.tail_policy not in ("pad", "align"):
+        raise ValueError("tail_policy must be pad or align.")
     if cfg.video_backend not in ("torchcodec", "pyav"):
         raise ValueError("video_backend must be torchcodec or pyav.")
     if cfg.phase_filter is not None and (
@@ -842,6 +845,7 @@ class RLTWarmupRunner:
                 "reward_scope": self.replay.reward_scope,
                 "phase_filter": self.cfg.phase_filter,
                 "critic_action_projection": self.cfg.critic_action_projection,
+                "critic_warmup_steps": self.critic_steps,
             },
         )
         passed = offline_warmup_passed(

@@ -407,3 +407,29 @@ bash toolkits/piper/train_online.sh \
 - `rlt_reference.inference_call_s`：推理调用本身耗时（online 包含 worker 通信与诊断数据返回）；原 `inference_s` 在遥操模式下还包含控制循环发现结果的等待时间。
 
 同文件内 `event="action"` 的 `target`、`command`、`state` 分别表示请求目标、实际发送目标和反馈。先比较 reference 前 10 步与后 40 步的夹爪目标，再对照 actor C10 和实际反馈，才能区分延后松手、actor 输出偏差和执行问题。录像通过数据集帧号与 `step` 对齐；如需保留精确的推理输入 RGB，可另加 `--save-observations`，但会增加磁盘占用。
+
+## 12. 纯 VLA：H50 规划、C10 执行对照
+
+这组对照直接使用 Stage1 每次生成的 H50 reference，只执行前 10 步就重新观测、推理。全程不加载 RLT actor、不训练；保留同样的 RLT feature 提取、遥操和控制循环，以便比较短片段执行本身的影响。已有 `PIPER_ACTOR_PATH` 环境变量不会被 `eval_stage1.sh` 自动加载。
+
+```bash
+cd /home/descfly/code/rlinf_piper
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+piper_vla_c10_dir="/media/descfly/新加卷/value/data_inference/rlinf_vla_c10_$(date +%Y%m%d_%H%M%S)"
+
+bash toolkits/piper/eval_stage1.sh rollout \
+  --teleop piper_leader \
+  --num-episodes 2 --steps 7200 --replan-steps 10 \
+  --record-dataset --save-rlt-reference \
+  --no-action-limits --reset-after-episode initial \
+  --output-dir "$piper_vla_c10_dir"
+```
+
+这条命令从抓取到插入、松手都是 C10。`b` 开始关键段标注，`s/f` 结束并评分该段；这些按键不会切换 actor，也不会恢复 C50。`→` 停止整条后再 `s/f` 评分，`←` 丢弃，`i` 遥操接管，`q` 退出。为比较自主动作，使用遥操或用手帮助插入的时刻应注明。
+
+每次 `prediction.actions` 和 `rlt_reference.reference_actions` 都保留完整 H50，`replan_steps=10` 表示实际计划执行前 10 步；真实发送情况以同文件 `action` 事件为准。中途停止或接管时可能少于 10 步。这样既能检查后半段是否规划松手，也能确认 C10 重规划时松手是否持续留在未来。
+
+对照纯 VLA C50 时，新建一个输出目录，把 `--replan-steps 10` 改为 `--replan-steps 50`，其余参数保持一致。C10/C50 应分别重复几条、尽量保持初始场景一致；全程 C10 可能改变到达孔口时的状态，不能把一次前后对比视为相同初始条件。
+
+当前 warmup 的 BC 目标：非人工接管步模仿 cached reference 的前 10 步；人工接管步模仿记录的人工动作。启用联合或 online actor 更新后，还叠加 Q 目标。因此纯 VLA C10 能检验 teacher 在这种执行节奏下是否本身就会停滞，也能帮助区分 actor 的模仿误差。

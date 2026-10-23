@@ -2,7 +2,7 @@
 
 更新日期：2026-10-23。适用本机 `/home/descfly/code/rlinf_piper`，代码分支 `piper/warmup-shared-20261021`，已包含 C50、replay 修正与训练/推理异步执行。新运行默认启用异步；旧目录 resume 沿用其保存的配置。
 
-2026-10-23 新增的 C30/C50 dropout 权重与成套命令见 [order.md 的 reference dropout 小节](order.md#2026-10-23-reference-dropoutc30--c50-新权重)。本页的权重路径仍为原版对照；新建 online run 默认 actor 训练 dropout=0.5，旧目录 resume 恢复原值。
+2026-10-23 新增的 C30/C50 dropout 权重与成套命令见 [order.md 常用命令](order.md)。本页的权重路径仍为原版对照；新建 online run 默认 actor 训练 dropout=0.5，旧目录 resume 恢复原值。
 
 ## 1. 本次使用的权重与数据
 

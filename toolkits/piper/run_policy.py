@@ -205,6 +205,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--no-streaming-video",
             "--save-rlt-reference",
             "--no-save-rlt-reference",
+            "--no-action-limits",
         }
         supplied = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
         if supplied - allowed:
@@ -215,6 +216,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         try:
             output = args.resume.expanduser().resolve()
             saved = read_collection_json(output / "run.json")
+            if "--no-action-limits" in supplied and not saved.get(
+                "no_action_limits", False
+            ):
+                raise ValueError(
+                    "--resume can repeat --no-action-limits only when the original run used it."
+                )
             if (
                 args.command != "rollout"
                 or saved.get("command") != "rollout"

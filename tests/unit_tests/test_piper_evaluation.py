@@ -543,6 +543,7 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
             "piper_leader",
             "--reference-dropout",
             "0.5",
+            "--no-action-limits",
         ],
         env={
             **os.environ,
@@ -562,6 +563,7 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     assert original.actor_mode == "manual-critical" and original.allow_offline_actor
     assert original.offline_cache == tmp_path / "offline_cache"
     assert original.reference_dropout == 0.5
+    assert original.no_action_limits
     assert original.record_dataset and original.interactive and original.steps == 7200
     assert original.num_episodes == 5 and original.teleop == "piper_leader"
     (tmp_path / "run.json").write_text(
@@ -571,7 +573,15 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     )
     (tmp_path / "hardware.yaml").write_text("{}\n")
     command = subprocess.run(
-        ["bash", str(wrapper), "--resume", str(tmp_path), "--num-episodes", "100"],
+        [
+            "bash",
+            str(wrapper),
+            "--resume",
+            str(tmp_path),
+            "--num-episodes",
+            "100",
+            "--no-action-limits",
+        ],
         env={**os.environ, "PIPER_PYTHON": str(capture)},
         capture_output=True,
         text=True,
@@ -584,12 +594,19 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     )
     assert resumed.offline_cache == original.offline_cache
     assert resumed.reference_dropout == original.reference_dropout
+    assert resumed.no_action_limits
+    assert parse_args(["rollout", "--resume", str(tmp_path)]).no_action_limits
     with pytest.raises(SystemExit):
         parse_args(["rollout", "--resume", str(tmp_path), "--reference-dropout", "0"])
     with pytest.raises(SystemExit):
         parse_args(
             ["rollout", "--resume", str(tmp_path), "--online-config", "another.yaml"]
         )
+    saved = json.loads((tmp_path / "run.json").read_text())
+    saved["no_action_limits"] = False
+    (tmp_path / "run.json").write_text(json.dumps(saved))
+    with pytest.raises(SystemExit):
+        parse_args(["rollout", "--resume", str(tmp_path), "--no-action-limits"])
 
 
 @pytest.mark.parametrize("horizon", [10, 50])

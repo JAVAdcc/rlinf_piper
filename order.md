@@ -483,3 +483,26 @@ bash toolkits/piper/eval_c50.sh infer-actor --frame 0
 ```
 
 此前部署验收曾完成第 2350 帧的真实 GPU 推理：输出 `(50,7)`、全为有限值，Stage1 ID、norm 与小网络权重 SHA256 全部匹配。该次 C50 actor 在第 34 步给出超过 20 mm 的张开目标，最大 41.73 mm；首目标最大关节偏差为 3.91°。这只说明该录制观测下的输出与契约，不代表整条轨迹或全部动作检查已通过。收据位于 `outputs/piper/c50_bc5000_infer_20261022/local_validation.json`，没有连接机械臂。
+
+## 2026-10-23 实验备份与清理
+
+最近的 RLinf C10/C50 对照、SFT/遥操数据、online 训练记录与震荡分析已备份至阿里云。压缩包为 1,320,592,012 bytes（1.32 GB），包含 3.28 GB 原始文件；云端已核验整个压缩包的 SHA256，以及包内 2,445 个文件或链接的内容/目标。备份目录：
+
+```text
+/home/yiming/workspace/code/rlinf_piper_warmup_20261019/deployment/local_backups/rlinf_local_20261023_162042
+```
+
+本地已清理 2.92 GB 旧实验、重复 checkpoint 和旧合成验证的训练状态。保留 `rlinf_online_c50_20261023_145843` 的录像、动作、replay、日志和 `online/checkpoint_000075`；部署权重、C50 离线 cache、分析结果也保留。新实验继续按本文命令使用新目录。该历史运行最新 actor 的震荡问题尚未解决，保留 checkpoint 用于诊断和恢复，不代表推荐从它开始新实验。
+
+本地清单、云端校验结果和具体删除记录位于 `/home/descfly/code/rlinf_piper/outputs/backups/rlinf_local_20261023_162042/` 下的 `manifest.json`、`VERIFIED.json`、`cleanup_receipt.json`。本地临时备份包和上传分片已移除，云端保留完整压缩包。以下命令在云端校验并解压到独立目录：
+
+```bash
+ssh yiming-aliserver
+cd /home/yiming/workspace/code/rlinf_piper_warmup_20261019/deployment/local_backups/rlinf_local_20261023_162042
+sha256sum -c SHA256SUMS
+piper_restore_dir="$HOME/piper_restore_20261023"
+mkdir -p "$piper_restore_dir"
+zstd -dc --long=29 piper_local_experiments.tar.zst | tar -xf - -C "$piper_restore_dir"
+```
+
+解压后的 `data_inference/` 对应本地 `/media/descfly/新加卷/value/data_inference/`，`workspace_outputs/piper/` 对应 `/home/descfly/code/rlinf_piper/outputs/piper/`。每个文件的原始绝对路径在 `manifest.json` 中。

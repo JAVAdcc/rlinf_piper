@@ -500,46 +500,72 @@ class PiperOnlineRunner:
         )
 
     def _update_async(self, item) -> bool:
-        started = time.monotonic()
-        metrics = {"transitions": 0, "segments": 0}
+        """Drain one accepted episode's budget; checkpoint only at round end or exit."""
+        round_started = time.monotonic()
+        ingest_metrics = {"transitions": 0, "segments": 0}
         if item is not None:
             directory, result, trajectory = item
             if trajectory is not None:
-                metrics.update(self.actor.ingest(trajectory).wait()[0])
-        learner_started_at = time.time()
-        metrics.update(self.actor.run_training().wait()[0])
-        learner_finished_at = time.time()
-        if any(not np.isfinite(value) for value in metrics.values()):
-            raise RuntimeError(
-                "Non-finite background training metrics; no policy published."
+                ingest_metrics.update(self.actor.ingest(trajectory).wait()[0])
+        critic_updates = actor_updates = 0
+        first_cycle = True
+        while True:
+            started = time.monotonic()
+            learner_started_at = time.time()
+            metrics = self.actor.run_training().wait()[0]
+            learner_finished_at = time.time()
+            if any(not np.isfinite(value) for value in metrics.values()):
+                raise RuntimeError(
+                    "Non-finite background training metrics; no policy published."
+                )
+            updates = int(metrics["rlt/critic_updates_run"])
+            if item is None and first_cycle and updates == 0:
+                return False
+            critic_updates += updates
+            actor_updates += int(metrics["rlt/actor_updates_run"])
+            version = int(self.actor.get_rollout_sync_version().wait()[0])
+            pending = int(metrics["rlt/pending_update_budget"])
+            stopping = self.background is not None and self.background.stopped.is_set()
+            round_complete = updates == 0 or pending == 0 or stopping
+            metrics.update(
+                ingest_metrics if first_cycle else {"transitions": 0, "segments": 0}
             )
-        updates = int(metrics["rlt/critic_updates_run"])
-        if item is None and updates == 0:
-            return False
-        version = int(self.actor.get_rollout_sync_version().wait()[0])
-        if item is not None:
-            self.committed.append(directory.name)
-            metrics["episode"] = directory.name
-        metrics.update(
-            version=version,
-            training_s=time.monotonic() - started,
-            learner_started_at=learner_started_at,
-            learner_finished_at=learner_finished_at,
-        )
-        self._checkpoint(metrics, version=version)
-        metrics["elapsed_s"] = time.monotonic() - started
-        metrics["last_inferred_version"] = self.policy.version
-        with (self.root / "async_metrics.jsonl").open("a") as stream:
-            stream.write(json.dumps(metrics) + "\n")
-        write_json(self.root / "async_status.json", metrics)
-        if item is not None:
-            write_json(directory / "online_update.json", metrics)
-        logger.info(
-            "Background update published: version %d, pending budget %d.",
-            version,
-            int(metrics["rlt/pending_update_budget"]),
-        )
-        return updates > 0 and metrics["rlt/pending_update_budget"] > 0
+            if item is not None and first_cycle:
+                metrics["episode"] = directory.name
+            metrics.update(
+                version=version,
+                training_s=time.monotonic() - started,
+                learner_started_at=learner_started_at,
+                learner_finished_at=learner_finished_at,
+                round_critic_updates_run=critic_updates,
+                round_actor_updates_run=actor_updates,
+                checkpoint_published=round_complete,
+            )
+            if round_complete:
+                if item is not None:
+                    self.committed.append(directory.name)
+                self._checkpoint(metrics, version=version)
+            metrics["elapsed_s"] = time.monotonic() - started
+            metrics["round_elapsed_s"] = time.monotonic() - round_started
+            metrics["last_inferred_version"] = self.policy.version
+            with (self.root / "async_metrics.jsonl").open("a") as stream:
+                stream.write(json.dumps(metrics) + "\n")
+            write_json(self.root / "async_status.json", metrics)
+            if round_complete:
+                if item is not None:
+                    write_json(
+                        directory / "online_update.json",
+                        {**metrics, **ingest_metrics, "episode": directory.name},
+                    )
+                logger.info(
+                    "Background round saved: version %d, critic %d, actor %d, pending %d.",
+                    version,
+                    critic_updates,
+                    actor_updates,
+                    pending,
+                )
+                return updates > 0 and pending > 0
+            first_cycle = False
 
     def _checkpoint(self, metrics: dict, *, version: int | None = None) -> None:
         version = self.policy.version if version is None else version

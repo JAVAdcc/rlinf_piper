@@ -39,7 +39,7 @@ algorithm:
     warmup_post_collect_updates: 0
     train_every_transitions: 1
     train_every_episodes: 0
-    max_updates_per_train_step: 32 # Publish after each bounded background cycle.
+    max_updates_per_train_step: 32 # Poll shutdown between batches; save after the full round.
   train_actor_steps: 0         # Warmup heads are already trained.
   gamma: 0.995                 # Per executed 30 Hz tick, as in offline warmup.
   tau: 0.005

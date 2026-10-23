@@ -157,6 +157,86 @@ def test_piper_background_pipeline_accepts_without_waiting_and_drains_budget(tmp
         pipeline.close()
 
 
+@pytest.mark.parametrize("stop_after_batch", [False, True])
+def test_piper_training_round_checkpoints_once_and_keeps_shutdown_budget(
+    tmp_path, stop_after_batch
+):
+    from threading import Event
+    from types import SimpleNamespace
+
+    from rlinf.runners.piper_async import PiperAsyncPipeline
+    from rlinf.runners.piper_online_runner import PiperOnlineRunner
+
+    runner = object.__new__(PiperOnlineRunner)
+    runner.root = tmp_path
+    runner.committed = []
+    runner.policy = SimpleNamespace(version=0)
+    version, pending = 0, 0
+    checkpoints = []
+    saved = Event()
+
+    def reply(value):
+        return SimpleNamespace(wait=lambda: [value])
+
+    def ingest(trajectory):
+        nonlocal pending
+        assert trajectory == "accepted data"
+        pending += 70
+        return reply({"transitions": 14, "segments": 1})
+
+    def train():
+        nonlocal version, pending
+        updates = min(pending, 32)
+        version += updates
+        pending -= updates
+        if stop_after_batch and updates:
+            runner.background.stopped.set()
+        return reply(
+            {
+                "rlt/critic_updates_run": updates,
+                "rlt/actor_updates_run": updates // 2,
+                "rlt/pending_update_budget": pending,
+            }
+        )
+
+    def save(metrics, *, version):
+        checkpoints.append((version, pending, runner.committed.copy()))
+        saved.set()
+
+    runner.actor = SimpleNamespace(
+        ingest=ingest,
+        run_training=train,
+        get_rollout_sync_version=lambda: reply(version),
+    )
+    runner._checkpoint = save
+    runner.background = PiperAsyncPipeline(
+        lambda directory, result: "accepted data", runner._update_async
+    )
+    episode = tmp_path / "episode_001"
+    episode.mkdir()
+    runner.accept_episode(episode, {"accepted": True, "outcome": "success"})
+    runner.background.start()
+    try:
+        if stop_after_batch:
+            assert saved.wait(5)
+        else:
+            runner.background.wait_idle(5)
+    finally:
+        runner.background.close()
+    expected = (32, 38) if stop_after_batch else (70, 0)
+    assert checkpoints == [(*expected, ["episode_001"])]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "async_metrics.jsonl").read_text().splitlines()
+    ]
+    assert sum(x["checkpoint_published"] for x in records) == 1
+    assert sum(x["rlt/critic_updates_run"] for x in records) == version
+    assert records[-1]["round_critic_updates_run"] == version
+    summary = json.loads((episode / "online_update.json").read_text())
+    assert summary["transitions"] == 14 and summary["segments"] == 1
+    assert summary["round_critic_updates_run"] == version
+
+
 def test_piper_background_fault_is_reported_and_shutdown_keeps_pending_data(tmp_path):
     import threading
 

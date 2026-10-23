@@ -363,7 +363,7 @@ bash toolkits/piper/train_online.sh \
 | batch | 固定 64：32 online + 32 offline；少量数据通过有放回采样保持比例 |
 | 人工接管 | 实际执行动作和逐帧 human mask 进入在线池，BC 对应帧模仿人工动作 |
 | 开始更新 | 至少 64 个在线 transition；按 transition 数判断，不按 episode 条数 |
-| 训练预算 | 每个新增在线 transition 产生 5 次 critic 更新预算；后台每轮最多执行 32 次，有预算则继续；退出时余量随 checkpoint 恢复 |
+| 训练预算 | 每个新增在线 transition 产生 5 次 critic 更新预算；每轮完成全部预算后保存一次；每 32 次检查退出，正常退出时保存进度与余量 |
 | actor 频率 | 每 2 次 critic 更新一次；version 仍是累计 critic 更新数 |
 | 学习率 / target | actor、critic 均为 3e-4；每步软更新 target Q，tau=0.005 |
 
@@ -381,7 +381,7 @@ bash toolkits/piper/train_online.sh --resume "$piper_online_dir" --num-episodes 
 
 `--num-episodes` 是累计目标。续训使用运行目录内的 `online.yaml` 和硬件快照，不替换模型或采样配置；新的 C50 运行应使用新目录。离线数据已包含在 learner checkpoint 中，续训不再依赖原离线 cache 目录。确认后中断会从最后完整 checkpoint 重做；已提交的数据不会重复入池。
 
-`online_update.json` 记录实际 `rlt/critic_updates_run`、`rlt/actor_updates_run`、剩余预算、两个池大小和新权重版本。`online/latest.json` 指向完整 checkpoint；默认保留最近 3 份，及续训进程正在使用的旧 checkpoint。原始录像和 replay 文件持续保留。无硬件 GPU 复测说明见 `docs/piper_online_training.rst`。
+`online_update.json` 的 `round_critic_updates_run`、`round_actor_updates_run` 记录这轮累计更新数，`rlt/critic_updates_run`、`rlt/actor_updates_run` 仅表示最后一个小批次；另有剩余预算、两个池大小和新权重版本。`online/latest.json` 指向完整 checkpoint；默认保留最近 3 份，及续训进程正在使用的旧 checkpoint。原始录像和 replay 文件持续保留。无硬件 GPU 复测说明见 `docs/piper_online_training.rst`。
 
 ## 11. 记录 C10 对应的完整 H50 reference
 

@@ -225,13 +225,19 @@ def asynchronous_check(cfg, args, output, task):
             )
             assert actions.shape == (50, 7) and np.isfinite(actions).all()
             latest = json.loads((output / "online/latest.json").read_text())
-            if not args.resume and runner.policy.version > 0:
-                break
+            progress = output / "online/async_status.json"
+            if not args.resume and progress.exists():
+                live = json.loads(progress.read_text())
+                if live["version"] > 0:
+                    # Training progresses without writing intermediate checkpoints.
+                    assert latest["version"] == 0 and latest["generation"] == 1
+                    break
             if args.resume and latest["metrics"].get("rlt/pending_update_budget") == 0:
                 runner.background.wait_idle()
                 break
             assert time.monotonic() < deadline, "Async learner did not progress"
-        assert runner.committed == ["episode_001"]
+        if args.resume:
+            assert runner.committed == ["episode_001"]
     latest = json.loads((output / "online/latest.json").read_text())
     metrics = [
         json.loads(line)
@@ -247,6 +253,7 @@ def asynchronous_check(cfg, args, output, task):
     assert overlaps > 0, "No inference request overlapped a learner update RPC"
     assert latest["committed"] == ["episode_001"]
     assert latest["metrics"]["demo_buffer/total_samples"] == 8
+    assert latest["generation"] == (3 if args.resume else 2), latest
     if args.resume:
         assert latest["version"] == 200, latest
         assert latest["metrics"]["rlt/pending_update_budget"] == 0

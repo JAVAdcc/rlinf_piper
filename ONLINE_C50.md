@@ -82,7 +82,8 @@ bash toolkits/piper/train_online.sh \
 | 离线池 | 保留全部 3,399 个训练 transition；validation 不入池 |
 | 开始更新 | 累计至少 64 个在线 transition；导入离线数据本身不触发更新 |
 | 更新预算 | 每个新增在线 transition 产生 5 次 critic 更新预算 |
-| 后台每轮 | 最多 32 次 critic 更新并发布 checkpoint；有预算则自动继续下一轮 |
+| 后台一轮 | 完成当前已接受数据的全部更新预算，再保存一次完整 checkpoint |
+| 退出响应 | 每最多 32 次 critic 更新检查退出；正常退出时保存当前进度与余量 |
 | actor 频率 | 每 2 次 critic 更新一次 actor |
 | 学习率 | actor / critic 均为 `3e-4` |
 | target / 折扣 | 每步软更新，`tau=0.005`；`gamma=0.995` 按实际控制 tick 计算 |
@@ -92,7 +93,7 @@ bash toolkits/piper/train_online.sh \
 
 本机仍只有一份冻结 VLA。特征补算每个小 batch 之间让等待中的推理优先，但无法抢占正在执行的 GPU forward；训练与推理也共享单卡算力，因此异步不等于推理零延迟或严格 30 Hz。`trace.jsonl` 保留推理耗时、补算等待和实际动作版本，便于现场评估。
 
-例如新入池 100 个 transition，对应 500 次 critic 更新预算；后台以每轮最多 32 次连续消耗这 500 次预算，不需要等待下一次确认。`version` 记录本轮累计 critic 更新数，不是 episode 数，也不含离线 warmup 的 10,000 步。
+例如新入池 100 个 transition，对应 500 次 critic 更新预算；后台分成最多 32 步的小批次，连续消耗这 500 次预算；完成后只保存一次，不需要等待下一次确认。`version` 记录本轮累计 critic 更新数，不是 episode 数，也不含离线 warmup 的 10,000 步。
 
 ## 5. 退出后继续同一轮训练
 
@@ -120,9 +121,9 @@ bash toolkits/piper/train_online.sh \
 | `episode_XXX/result.json` | 分段 / 整条评分、是否 accepted |
 | `episode_XXX/trace.jsonl` | 请求目标、实际命令、反馈和 H50 reference |
 | `episode_XXX/online_features.json` | 特征复用 / 补算数量与耗时 |
-| `episode_XXX/online_update.json` | 该条入池的第一轮更新结果；后续预算消耗查 async_metrics |
+| `episode_XXX/online_update.json` | 该条训练一轮结束或退出时的结果；round_critic_updates_run / round_actor_updates_run 为本轮累计更新数 |
 | `online/latest.json` | 最后完整发布的 checkpoint；learner version 可能领先当前 rollout |
-| `online/async_metrics.jsonl` / `async_status.json` | 每轮后台更新 / 最新一轮的计数、预算、耗时和最后推理版本 |
+| `online/async_metrics.jsonl` / `async_status.json` | 每个训练小批次 / 最新进度；checkpoint_published 标识该批次是否保存了完整 checkpoint |
 | `native_logs/` | 原生 actor / rollout worker 日志 |
 
 沿用当前终端的 `piper_online_dir`，可查看最后一次提交：
@@ -163,4 +164,6 @@ Stage1 checkpoint ID：`b1f2800f7b294b4c95834ad60e0ff23d`。复用现有 Stage1�
 
 2026-10-23 后续修正：权重安装从“每次 C50 推理前”改为“整条 episode 开始前”，使用显式 begin_episode 调用；训练和特征准备仍异步。此前运行的 trace 可能包含多个版本，修改不会重写历史数据。resume 也从下一条开始采用固定版本规则，运行中的旧进程需退出并重新启动才能生效。
 
-checkpoint 仍按每轮最多 32 次 critic 更新保存完整训练状态；总预算仍为新增 transition 数乘 5。默认保留最近 3 代，恢复进程另外保留正在引用的加载代。该频率影响恢复粒度和磁盘写入，不再决定执行中换权重的频率。
+完整 checkpoint 在初始化、每轮全部更新预算结束，以及正常退出时保存；32 次只用于检查退出和记录进度，不再每批保存。总预算仍为新增 transition 数乘 5。默认保留最近 3 代，恢复进程另外保留正在引用的加载代。该频率影响恢复粒度和磁盘写入，不再决定执行中换权重的频率。
+
+训练一轮过程中，live learner version 可以领先 online/latest.json；后者只表示已持久保存的版本。下一条 episode 仍固定使用开始前最近一次完整保存的版本。一轮训练期间新确认的数据先排队，待本轮保存后再入池。若进程被强杀或断电，未保存的一轮从上一份完整 checkpoint 恢复，已确认数据会重新处理；正常 q 退出则保存已完成的小批次及剩余预算。

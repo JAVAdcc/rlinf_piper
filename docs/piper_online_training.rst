@@ -38,15 +38,15 @@ online 池均匀、有放回采样最近 200 条有效 episode 的 chunk；demo 
 训练预算与恢复
 --------------
 
-``examples/embodiment/config/piper_rlt_online.yaml`` 启用原生 transition 计数调度。至少积累 64 个在线 transition 才开始更新；导入的离线样本不产生 online 更新预算。每个新增 transition 产生 5 次 critic 更新预算，后台每轮最多执行 32 次并发布快照，有剩余预算就继续，不等待下一次确认。每 2 次 critic 更新一次 actor。这个入口的 UTD 分母明确为新增 replay transition，不是原始帧或 batch 样本曝光次数。
+``examples/embodiment/config/piper_rlt_online.yaml`` 启用原生 transition 计数调度。至少积累 64 个在线 transition 才开始更新；导入的离线样本不产生 online 更新预算。每个新增 transition 产生 5 次 critic 更新预算，每条已接受数据构成一轮训练，后台用最多 32 次更新的小批次完成本轮全部预算，结束后只保存并发布一次完整 checkpoint。小批次之间检查退出，不等待下一次确认。每 2 次 critic 更新一次 actor。这个入口的 UTD 分母明确为新增 replay transition，不是原始帧或 batch 样本曝光次数。
 
-例如第一条生成 100 个 transition，产生 500 次预算，后台分轮执行直至预算耗尽或程序退出。每轮实际更新量和预算写入 ``online/async_metrics.jsonl``，最新一轮写入 ``async_status.json``。episode 的 ``online_update.json`` 仅记录其入池轮次，不代表随后全部预算。最终 episode 确认后等待后台排空，期间 q 允许保存余量并退出。
+例如第一条生成 100 个 transition，产生 500 次预算，后台分批执行直至预算耗尽或程序退出。每个小批次实际更新量和预算写入 ``online/async_metrics.jsonl``，最新进度写入 ``async_status.json``。episode 的 ``online_update.json`` 在本轮保存时写入，round_critic_updates_run 和 round_actor_updates_run 记录本轮累计更新。最终 episode 确认后等待后台排空，期间 q 允许保存余量并退出。
 
 actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005``。前 1,000 次 critic 更新逐渐把 Q 权重由接近 0 提至 0.1，把 BC 权重从 5 降至 2。actor 使用导出网络的固定标准差采样。初始化要求 critic 已 warmup，当前 BC-only C50 包会在模型和硬件启动前被拒绝；测试 actor 的命令不受影响。
 
 新建运行从 warmup heads 初始化 target，并建立新的 optimizer。``--resume`` 恢复模型、target、optimizer、学习率、两个 replay 池、累计新增 transition、更新计数及随机数状态。离线池已经包含在 checkpoint 内，续训不再需要原离线 cache 路径。配置与权重绑定由运行快照恢复，新 C50 数据使用新目录；不在旧 run 中更换 stride 或模型。
 
-``online/latest.json`` 只在完整 checkpoint 发布后更新。确认但未提交成功的 episode 重试，已提交的目录不会重复入池。异步退出会完成当前更新小轮并保存；未完成特征补算的已接受 episode 依靠 result.json 恢复。恢复不重复入池，也不丢失已保存的训练预算；并发时序与真实轨迹不保证逐位复现。旧运行未配置 async_training 时继续同步执行。默认保留最近 3 份 checkpoint，以及续训进程正在读取的一份旧 checkpoint；旧 checkpoint 清理不删除在线原始数据。产出的 ``actor/model_state_dict/full_weights.pt`` 可用于独立评测。
+``online/latest.json`` 只在完整 checkpoint 发布后更新。确认但未提交成功的 episode 重试，已提交的目录不会重复入池。正常异步退出会完成当前最多 32 步的小批次并保存；强杀或断电会回到上一份完整 checkpoint，并重新处理其后尚未持久提交的已确认数据。训练中新增的确认数据先排队，在当前一轮保存后入池；未完成特征补算的已接受 episode 依靠 result.json 恢复。恢复不重复入池，也不丢失已保存的训练预算；并发时序与真实轨迹不保证逐位复现。旧运行未配置 async_training 时继续同步执行。默认保留最近 3 份 checkpoint，以及续训进程正在读取的一份旧 checkpoint；旧 checkpoint 清理不删除在线原始数据。产出的 ``actor/model_state_dict/full_weights.pt`` 可用于独立评测。
 
 异步快照与推理优先
 ------------------

@@ -64,8 +64,9 @@ class PiperAsyncPipeline:
 
     Accepted recordings are the durable input journal. ``update`` publishes a
     complete checkpoint before returning whether more update budget remains.
-    Closing finishes the current learner cycle, leaving unprocessed inputs and
-    remaining budget for resume. Background failures propagate to the operator.
+    Closing asks the active round to checkpoint after its bounded update batch,
+    leaving unprocessed inputs and remaining budget for resume. Background failures
+    propagate to the operator.
     """
 
     def __init__(self, prepare: Callable, update: Callable):

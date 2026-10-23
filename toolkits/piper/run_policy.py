@@ -80,6 +80,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset", type=Path, help="Local LeRobot dataset for infer")
     parser.add_argument(
+        "--reference-dropout",
+        type=float,
+        help="Online actor training reference dropout probability in [0, 1]; inference keeps the reference",
+    )
+    parser.add_argument(
         "--video-backend",
         default="torchcodec",
         choices=("pyav", "torchcodec"),
@@ -301,6 +306,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("The current online profile uses the single local GPU cuda:0.")
     elif args.offline_cache is not None:
         parser.error("--offline-cache requires --online-config.")
+    if args.reference_dropout is not None:
+        if args.online_config is None or not 0 <= args.reference_dropout <= 1:
+            parser.error(
+                "--reference-dropout requires --online-config and a finite probability in [0, 1]."
+            )
     if any(
         value is not None
         for value in (args.teleop, args.leader_usb_serial, args.intervention_key)
@@ -437,6 +447,7 @@ def _run_with_resources(
             output=output,
             allow_offline_actor=args.allow_offline_actor,
             offline_cache=args.offline_cache,
+            reference_dropout=args.reference_dropout,
             resume=args.resume is not None,
         )
         if (

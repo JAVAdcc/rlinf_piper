@@ -51,7 +51,8 @@ from rlinf.utils.env_helpers.delay_sampler import (
 )
 
 
-def test_piper_online_native_losses_match_masked_segment_warmup():
+@pytest.mark.parametrize("reference_dropout", [0.0, 0.5, 1.0])
+def test_piper_online_native_losses_match_masked_segment_warmup(reference_dropout):
     import copy
 
     from rlinf.algorithms.rlt.segment import (
@@ -73,7 +74,7 @@ def test_piper_online_native_losses_match_masked_segment_warmup():
                 "gamma": 0.995,
                 "bc_weight": 2.0,
                 "q_weight": 0.1,
-                "reference_dropout_prob": 0.0,
+                "reference_dropout_prob": reference_dropout,
             },
             "piper": {"driver_action_bounds": [[-0.2] * 7, [0.2] * 7]},
         }
@@ -140,7 +141,11 @@ def test_piper_online_native_losses_match_masked_segment_warmup():
     assert any(p.grad is not None for p in worker.model.q_head.parameters())
     worker.model.zero_grad()
     torch.manual_seed(456)
-    predicted, _, _ = worker.model.sac_forward(conditioned)
+    predicted, _, _ = worker.model.sac_forward(
+        conditioned,
+        apply_reference_dropout=True,
+        reference_dropout_prob=reference_dropout,
+    )
     masked = (
         predicted.reshape(3, 10, 7).clamp(-0.2, 0.2)
         * action_mask(data["valid_steps"], 10)[..., None]
@@ -150,13 +155,40 @@ def test_piper_online_native_losses_match_masked_segment_warmup():
         - 0.1 * worker.model.sac_q_forward(obs, masked)[:, 0].mean()
     )
     torch.manual_seed(456)
-    actual_actor, _, _ = worker.forward_actor(batch)
+    actual_actor, _, metrics = worker.forward_actor(batch)
     torch.testing.assert_close(actual_actor, expected_actor)
+    assert metrics["reference_dropout_prob"] == reference_dropout
+    torch.testing.assert_close(obs["ref_chunk"], original_ref)
     actual_actor.backward()
     assert all(
         p.grad is not None and torch.isfinite(p.grad).all()
         for p in worker.model.backbone.parameters()
     )
+
+
+@pytest.mark.parametrize("chunk", [30, 50])
+def test_piper_reference_dropout_masks_whole_input_without_scaling_or_mutation(chunk):
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+
+    model = RLTMLPPolicy(8, 7, 7, chunk, ref_num_action_chunks=50)
+    obs = {
+        "ref_chunk": torch.ones(128, 50, 7),
+        "z_rl": torch.randn(128, 8),
+        "proprio": torch.randn(128, 7),
+    }
+    original = model._actor_state(obs)
+    torch.manual_seed(1234)
+    dropped = model._actor_state(
+        obs, apply_reference_dropout=True, reference_dropout_prob=0.5
+    )
+    reference = dropped[:, : chunk * 7]
+    keep = (reference == 1).all(dim=1)
+    zero = (reference == 0).all(dim=1)
+    assert (keep | zero).all() and keep.any() and zero.any()
+    torch.testing.assert_close(dropped[:, chunk * 7 :], original[:, chunk * 7 :])
+    torch.testing.assert_close(obs["ref_chunk"], torch.ones(128, 50, 7))
+    # Normal inference still uses the complete reference after training forwards.
+    torch.testing.assert_close(model._actor_state(obs), original)
 
 
 @pytest.mark.parametrize("parameter_dtype", [torch.float32, torch.bfloat16])

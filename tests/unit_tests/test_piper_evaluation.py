@@ -471,6 +471,56 @@ def test_piper_c50_cli_preserves_horizon_and_ignores_stale_actor_env(tmp_path):
     assert result.returncode != 0 and "requires actor C50" in result.stderr
 
 
+@pytest.mark.parametrize("probability", ["-0.1", "1.1", "nan", "inf"])
+def test_piper_online_rejects_invalid_reference_dropout(probability, tmp_path):
+    from rlinf.runners.piper_online_runner import online_config
+    from toolkits.piper.run_policy import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "rollout",
+                "--checkpoint",
+                "unused",
+                "--actor",
+                "unused",
+                "--actor-mode",
+                "manual-critical",
+                "--interactive",
+                "--record-dataset",
+                "--online-config",
+                "unused",
+                "--reference-dropout",
+                probability,
+            ]
+        )
+    profile = tmp_path / "online.yaml"
+    profile.write_text("algorithm:\n  reference_dropout_prob: 0.0\n")
+    with pytest.raises(ValueError, match="probability"):
+        online_config(
+            profile,
+            stage1=tmp_path,
+            actor=tmp_path,
+            hardware={},
+            task="unused",
+            output=tmp_path,
+            allow_offline_actor=True,
+            reference_dropout=float(probability),
+        )
+    with pytest.raises(ValueError, match="Resume must preserve"):
+        online_config(
+            profile,
+            stage1=tmp_path,
+            actor=tmp_path,
+            hardware={},
+            task="unused",
+            output=tmp_path,
+            allow_offline_actor=True,
+            reference_dropout=0.5,
+            resume=True,
+        )
+
+
 def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     import sys
 
@@ -484,7 +534,16 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     )
     capture.chmod(0o755)
     command = subprocess.run(
-        ["bash", str(wrapper), "--num-episodes", "5", "--teleop", "piper_leader"],
+        [
+            "bash",
+            str(wrapper),
+            "--num-episodes",
+            "5",
+            "--teleop",
+            "piper_leader",
+            "--reference-dropout",
+            "0.5",
+        ],
         env={
             **os.environ,
             "PIPER_PYTHON": str(capture),
@@ -502,6 +561,7 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
     )
     assert original.actor_mode == "manual-critical" and original.allow_offline_actor
     assert original.offline_cache == tmp_path / "offline_cache"
+    assert original.reference_dropout == 0.5
     assert original.record_dataset and original.interactive and original.steps == 7200
     assert original.num_episodes == 5 and original.teleop == "piper_leader"
     (tmp_path / "run.json").write_text(
@@ -523,6 +583,9 @@ def test_piper_online_cli_wrapper_and_resume_restore_training_profile(tmp_path):
         resumed.online_config == original.online_config and resumed.num_episodes == 100
     )
     assert resumed.offline_cache == original.offline_cache
+    assert resumed.reference_dropout == original.reference_dropout
+    with pytest.raises(SystemExit):
+        parse_args(["rollout", "--resume", str(tmp_path), "--reference-dropout", "0"])
     with pytest.raises(SystemExit):
         parse_args(
             ["rollout", "--resume", str(tmp_path), "--online-config", "another.yaml"]

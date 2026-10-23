@@ -1,5 +1,7 @@
 **RLinf critical phase 数据采集、离线 warmup 与共享 actor 评测（2026-10-21）**
 
+**最新 C30/C50 dropout 权重：使用本文末尾的 [reference dropout 启动命令](#2026-10-23-reference-dropoutc30--c50-新权重)，包含固定权重评测、online 训练及续训。**
+
 **C50 actor + critic 的完整 online 启动与续训命令见 [ONLINE_C50.md](ONLINE_C50.md)。** 2026-10-23 已拉取 `piper_shared_c50_prejoint_20261022`（BC5000 + critic10000）及匹配的 C50 离线 cache。
 
 沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、用 `s/f` 结束并评分当前关键段，整条 episode 停下后另行评分。新标注为 v3，warmup 已接通局部终止训练。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。共享 RLT actor 的本机路径、评测和续采命令见第 9 节，原部署流程见 [共享网络部署说明](docs/piper_shared_deployment.rst)。
@@ -506,3 +508,55 @@ zstd -dc --long=29 piper_local_experiments.tar.zst | tar -xf - -C "$piper_restor
 ```
 
 解压后的 `data_inference/` 对应本地 `/media/descfly/新加卷/value/data_inference/`，`workspace_outputs/piper/` 对应 `/home/descfly/code/rlinf_piper/outputs/piper/`。每个文件的原始绝对路径在 `manifest.json` 中。
+
+## 2026-10-23 reference dropout：C30 / C50 新权重
+
+这一组用于比较 reference dropout 后的 actor，并可继续做 online 更新。两版均完成 BC5000 + critic TD10000，联合更新为 0，部署包 SHA256 已与云端核对，包内校验清单全部通过。原权重保留，新包位于 `checkpoints/piper_reference_dropout_c30_c50_20261023/`。
+
+[RL Token 论文附录 B](https://arxiv.org/html/2604.23073v1#A2) 明确规定：训练时遮挡 50% reference，推理始终提供 reference。[openpi-RLT 的 actor 更新](https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/trainer.py#L162) 和 [遮挡函数](https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/networks.py#L193) 采用按样本独立抽样、整 chunk 置零、保留样本不缩放的实现；这是第三方复现。BC 监督目标仍保留，critic bootstrap 使用完整 reference。
+
+本地新建 online run 默认 `reference_dropout_prob=0.5`，从第一次 actor 更新开始，对 online/offline 混合 batch 同样生效。只遮 actor 的 reference 输入；RL token、proprio、监督目标、valid mask、replay/cache 原数据均保留。人工 tick 先按现有逻辑替换训练 reference 和 BC 目标，再遮 actor 输入。实际 rollout、固定权重评测和 critic 下一状态估值不做遮挡；actor 的 Gaussian 探索采样是另一项机制。
+
+选择 C50 或 C30 后，执行以下公共设置。两者普通阶段均执行 VLA H50；关键段分别执行 actor C50 或 C30，保持 `--replan-steps 50`。C30 actor 读取 H50 的前 30 步，C50 读取全部 50 步。两套离线 cache 各有 3,399 个训练 transition 和 518 个验证 transition，已校验全部 shard；只将 train split 入池。
+
+```bash
+cd /home/descfly/code/rlinf_piper
+piper_variant=c50  # 测 C30 时改为 c30
+export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
+export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_reference_dropout_c30_c50_20261023/$piper_variant/actor"
+case "$piper_variant" in
+  c30) export PIPER_OFFLINE_CACHE="$PWD/outputs/piper/offline_cache/cache_local_segments_c30_s10_20261023" ;;
+  c50) export PIPER_OFFLINE_CACHE="$PWD/outputs/piper/offline_cache/cache_local_segments_c50_s10_20261022" ;;
+esac
+```
+
+仅评测离线权重，用以下命令；该进程不更新网络：
+
+```bash
+piper_eval_dir="/media/descfly/新加卷/value/data_inference/rlinf_${piper_variant}_refdrop_eval_$(date +%Y%m%d_%H%M%S)"
+bash toolkits/piper/eval_shared.sh rollout \
+  --teleop piper_leader --num-episodes 5 \
+  --steps 7200 --replan-steps 50 \
+  --record-dataset --save-rlt-reference \
+  --reset-after-episode initial --output-dir "$piper_eval_dir"
+```
+
+要边采集边训练，退出评测进程后，用新目录启动：
+
+```bash
+piper_online_dir="/media/descfly/新加卷/value/data_inference/rlinf_${piper_variant}_refdrop_online_$(date +%Y%m%d_%H%M%S)"
+bash toolkits/piper/train_online.sh \
+  --teleop piper_leader --num-episodes 5 \
+  --steps 7200 --replan-steps 50 --reference-dropout 0.5 \
+  --record-dataset --save-rlt-reference \
+  --reset-after-episode initial --output-dir "$piper_online_dir"
+```
+
+使用 `--reference-dropout 0` 可做关闭 online 遮挡的对照；它不改变所加载权重的离线训练历史。参数仅接受有限的 `[0, 1]` 概率，仅适用于 online 训练。`online.yaml` 保存实际配置，训练指标 `actor/reference_dropout_prob` 记录生效概率。`--resume` 沿用原配置，不允许用该参数更改已有运行；历史 dropout=0 的 run 仍为 0。每条 episode 固定一个 checkpoint，后台每轮完成全部预算后保存的规则继续生效。
+
+```bash
+bash toolkits/piper/train_online.sh --resume "$piper_online_dir" --num-episodes 100
+```
+
+云端结果说明位于包内 `REFERENCE_DROPOUT_C30_C50.md`。dropout 明显改善了缺失 reference 的离线表现，但完整 reference 下的验证 RMSE 没有改善，尚不能判断真机效果更好。包内 readiness 仍未通过全部门槛；本地已完成 C30/C50 的 GPU 推理与更新、dropout 随机状态恢复和 C50 异步续训验证，尚未执行真机任务；收据见 `outputs/piper/refdrop_deployment_20261023/validation.json`。动作约束按现有配置执行。离线训练补丁无需应用即可加载这些权重；本次启用的是本地已有的 online actor 遮挡路径。

@@ -43,10 +43,20 @@ def online_config(
     output: Path,
     allow_offline_actor: bool,
     offline_cache: Path | None = None,
+    reference_dropout: float | None = None,
     resume: bool = False,
 ) -> DictConfig:
     """Bind a native learner configuration to explicit deployment contracts."""
     cfg = OmegaConf.load(config)
+    saved_dropout = float(cfg.algorithm.get("reference_dropout_prob", 0.0))
+    if reference_dropout is not None:
+        if resume and reference_dropout != saved_dropout:
+            raise ValueError(
+                "Resume must preserve the saved reference dropout probability."
+            )
+        cfg.algorithm.reference_dropout_prob = reference_dropout
+    if not 0 <= float(cfg.algorithm.get("reference_dropout_prob", 0.0)) <= 1:
+        raise ValueError("Reference dropout probability must be finite and in [0, 1].")
     if offline_cache is not None:
         cfg.piper.offline_cache = str(offline_cache.expanduser().resolve())
     if (

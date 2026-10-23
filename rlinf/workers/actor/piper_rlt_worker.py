@@ -133,6 +133,9 @@ class PiperRLTActor(RLTACFSDPPolicy):
             -log_pi.mean(),
             {
                 **metrics,
+                "reference_dropout_prob": float(
+                    self.cfg.algorithm.reference_dropout_prob
+                ),
                 "bc_loss": bc.item(),
                 "q_pi": q1.item(),
                 "weighted_bc": (bc_weight * bc).item(),

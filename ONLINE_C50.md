@@ -2,6 +2,8 @@
 
 更新日期：2026-10-23。适用本机 `/home/descfly/code/rlinf_piper`，代码分支 `piper/warmup-shared-20261021`，已包含 C50、replay 修正与训练/推理异步执行。新运行默认启用异步；旧目录 resume 沿用其保存的配置。
 
+2026-10-23 新增的 C30/C50 dropout 权重与成套命令见 [order.md 的 reference dropout 小节](order.md#2026-10-23-reference-dropoutc30--c50-新权重)。本页的权重路径仍为原版对照；新建 online run 默认 actor 训练 dropout=0.5，旧目录 resume 恢复原值。
+
 ## 1. 本次使用的权重与数据
 
 云端新包已经下载并校验，启动时使用 **`piper_shared_c50_prejoint_20261022`**：actor 完成 BC5000，critic 完成 TD10000，离线联合更新为 0。两个网络都在 `actor/model_state_dict/full_weights.pt` 中，不需要单独指定 critic 路径。actor 与旧 C50 BC5000 包逐张量相同；新增训练只改变 critic。
@@ -85,6 +87,7 @@ bash toolkits/piper/train_online.sh \
 | 后台一轮 | 完成当前已接受数据的全部更新预算，再保存一次完整 checkpoint |
 | 退出响应 | 每最多 32 次 critic 更新检查退出；正常退出时保存当前进度与余量 |
 | actor 频率 | 每 2 次 critic 更新一次 actor |
+| reference dropout | 新建运行默认 0.5，仅 actor 训练；可用 `--reference-dropout 0` 做对照，执行和 TD bootstrap 保留 reference |
 | 学习率 | actor / critic 均为 `3e-4` |
 | target / 折扣 | 每步软更新，`tau=0.005`；`gamma=0.995` 按实际控制 tick 计算 |
 | actor 目标 | 前 1,000 次 critic 更新中，BC 权重 5→2，Q 权重由接近 0→0.1 |

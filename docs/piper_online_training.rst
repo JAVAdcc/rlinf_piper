@@ -42,6 +42,8 @@ online 池均匀、有放回采样最近 200 条有效 episode 的 chunk；demo 
 
 例如第一条生成 100 个 transition，产生 500 次预算，后台分批执行直至预算耗尽或程序退出。每个小批次实际更新量和预算写入 ``online/async_metrics.jsonl``，最新进度写入 ``async_status.json``。episode 的 ``online_update.json`` 在本轮保存时写入，round_critic_updates_run 和 round_actor_updates_run 记录本轮累计更新。最终 episode 确认后等待后台排空，期间 q 允许保存余量并退出。
 
+新建运行默认 ``reference_dropout_prob=0.5``，可用 ``--reference-dropout`` 显式覆盖。actor 更新时按样本将整段 reference 输入置零，保留样本不缩放；BC 目标、人工监督和 replay 内容不改变。执行推理与 critic bootstrap 使用完整 reference。``actor/reference_dropout_prob`` 记录概率，``online.yaml`` 保存配置；resume 继续使用原值，禁止覆盖。
+
 actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005``。前 1,000 次 critic 更新逐渐把 Q 权重由接近 0 提至 0.1，把 BC 权重从 5 降至 2。actor 使用导出网络的固定标准差采样。初始化要求 critic 已 warmup，当前 BC-only C50 包会在模型和硬件启动前被拒绝；测试 actor 的命令不受影响。
 
 新建运行从 warmup heads 初始化 target，并建立新的 optimizer。``--resume`` 恢复模型、target、optimizer、学习率、两个 replay 池、累计新增 transition、更新计数及随机数状态。离线池已经包含在 checkpoint 内，续训不再需要原离线 cache 路径。配置与权重绑定由运行快照恢复，新 C50 数据使用新目录；不在旧 run 中更换 stride 或模型。

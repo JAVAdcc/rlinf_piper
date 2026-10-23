@@ -1,5 +1,7 @@
 **RLinf critical phase 数据采集、离线 warmup 与共享 actor 评测（2026-10-21）**
 
+**C50 actor + critic 的完整 online 启动与续训命令见 [ONLINE_C50.md](ONLINE_C50.md)。** 2026-10-23 已拉取 `piper_shared_c50_prejoint_20261022`（BC5000 + critic10000）及匹配的 C50 离线 cache。
+
 沿用前面的 SFT 验收流程：global_step_50000 模型自动执行，人工按 `b` 标记关键阶段、用 `s/f` 结束并评分当前关键段，整条 episode 停下后另行评分。新标注为 v3，warmup 已接通局部终止训练。critical phase 指轨迹中的关键动作区间。第 1 节是纯 SFT 验收；需要主臂人工接管时，使用第 5 节的命令，入口和标注方式相同。中断后继续采集或增加目标条数，使用第 8 节的 `--resume`。共享 RLT actor 的本机路径、评测和续采命令见第 9 节，原部署流程见 [共享网络部署说明](docs/piper_shared_deployment.rst)。
 
 **1. 启动采集**

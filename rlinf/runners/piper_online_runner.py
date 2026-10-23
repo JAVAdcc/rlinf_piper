@@ -248,6 +248,12 @@ class PiperOnlinePolicy:
         self.gate = InferenceGate()
         self.cancel_backfill = lambda: False
 
+    def begin_episode(self) -> int:
+        """Fix the actor version for all chunks until the next episode starts."""
+        with self.gate.request():
+            self.version = int(self.worker.begin_episode().wait()[0]["version"])
+        return self.version
+
     def infer(self, observation: dict, task: str, *, actor_enabled: bool) -> np.ndarray:
         """Return actions and track the version actually used by the rollout worker."""
         return self.infer_with_reference(
@@ -313,7 +319,7 @@ class PiperOnlineRunner:
     """Own two native workers and atomically commit accepted episode updates.
 
     Right closes the undo window. Async mode prepares and learns in background,
-    publishing complete checkpoints for rollout installation at chunk boundaries.
+    publishing complete checkpoints for installation before the next episode.
     Resume replays accepted but uncommitted episodes exactly once relative to the
     last complete learner checkpoint. Older run snapshots retain synchronous mode.
     """

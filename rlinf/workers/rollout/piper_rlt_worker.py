@@ -60,7 +60,6 @@ class PiperRLTRollout(Worker):
 
     def infer(self, observation: dict, task: str, *, actor_enabled: bool) -> np.ndarray:
         """Sample actor exploration only in explicitly selected segments."""
-        self._refresh_snapshot()
         return self.policy.infer(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
@@ -73,7 +72,6 @@ class PiperRLTRollout(Worker):
         actor_enabled: bool,
     ) -> tuple[np.ndarray, dict]:
         """Return the sampled actor chunk and original H50 without another forward."""
-        self._refresh_snapshot()
         actions, diagnostics = self.policy.infer_with_reference(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
@@ -89,7 +87,6 @@ class PiperRLTRollout(Worker):
         frame: int,
     ) -> tuple[np.ndarray, dict]:
         """Save normalized features at the observation's control tick, not arrival time."""
-        self._refresh_snapshot()
         actions, diagnostics = self.policy.infer_with_features(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
@@ -116,10 +113,15 @@ class PiperRLTRollout(Worker):
         self.snapshot_root = Path(root).resolve()
         self.snapshot_binding = binding
 
+    def begin_episode(self) -> dict:
+        """Install the newest complete actor once, before any episode actions."""
+        self._refresh_snapshot()
+        return {"version": self.version}
+
     def _refresh_snapshot(self) -> None:
         if self.snapshot_root is None:
             return
-        # No await: installation and forward execute in the same rollout RPC.
+        # Called only at the episode boundary; inference never refreshes weights.
         # A retained checkpoint can disappear after reading its pointer; retry the
         # newest pointer without ever installing a partial or unverified model.
         for _ in range(3):

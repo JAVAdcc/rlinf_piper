@@ -88,7 +88,7 @@ bash toolkits/piper/train_online.sh \
 | target / 折扣 | 每步软更新，`tau=0.005`；`gamma=0.995` 按实际控制 tick 计算 |
 | actor 目标 | 前 1,000 次 critic 更新中，BC 权重 5→2，Q 权重由接近 0→0.1 |
 
-确认后后台先复用已记录特征，按 batch=2 补算缺失状态，写入 `online_features.npz`，再送入独立 learner。learner 可与下一条推理同时运行；完整 checkpoint 发布后，rollout 在下一个推理请求加载新版本，不改变已经排队的动作 chunk。
+确认后后台先复用已记录特征，按 batch=2 补算缺失状态，写入 `online_features.npz`，再送入独立 learner。learner 可与下一条推理同时运行；完整 checkpoint 发布后，rollout 只在下一条 episode 开始前加载最新版本；整条 episode 的所有 C50、critical phase 切换和人工交还都固定使用该版本。若上一条尚未补算/训练完成，本条会沿用此前版本，执行途中不会追赶新版本。
 
 本机仍只有一份冻结 VLA。特征补算每个小 batch 之间让等待中的推理优先，但无法抢占正在执行的 GPU forward；训练与推理也共享单卡算力，因此异步不等于推理零延迟或严格 30 Hz。`trace.jsonl` 保留推理耗时、补算等待和实际动作版本，便于现场评估。
 
@@ -131,7 +131,7 @@ bash toolkits/piper/train_online.sh \
 cat "$piper_online_dir/online/latest.json"
 ```
 
-确认是非阻塞的；后台尚未完成、或下一次推理未发生时，rollout version 暂时不变。持续为 0 时检查是否已有 64 个在线 transition，或该条是否有已评分的 critical segment。旧 BC-only 包会报 `warmed-up critic` 错误，应核对 `PIPER_ACTOR_PATH` 是否指向本手册的新包。
+确认是非阻塞的；后台尚未完成、或下一条 episode 尚未开始时，rollout version 保持原值。持续为 0 时检查是否已有 64 个在线 transition，或该条是否有已评分的 critical segment。旧 BC-only 包会报 `warmed-up critic` 错误，应核对 `PIPER_ACTOR_PATH` 是否指向本手册的新包。
 
 动作检查报错时保留 trace 与报错。云端曾记录某输入首目标 J4 偏差 8.761°，超过当前 5° 门限，本手册没有关闭该检查。相机 RGB 节点缺失时依照 `order.md` 的相机恢复说明处理，不手工换成红外节点。
 
@@ -153,10 +153,14 @@ Stage1 checkpoint ID：`b1f2800f7b294b4c95834ad60e0ff23d`。复用现有 Stage1�
 
 本地收据与原始压缩包位于 `outputs/piper/deployment_c50_online_20261023/`。`local_validation.json` 记录权重与全部 cache shard 校验、训练/验证划分及配置兼容性；`native_initialization.json` 记录 GPU 模型初始化、离线池导入和权重同步验证。上述检查均已通过，初始化后保存的全部 40 个 actor/critic 张量与下载源逐位相同，online 更新数为 0。验证没有连接相机或机械臂。
 
-## 8. 异步实现与来源
+## 8. episode 内固定权重与异步实现
 
 参考 [RLToken §5](https://arxiv.org/html/2604.23073v2#S5) 的异步 rollout/learning 以及 [openpi-RLT LearnerService](https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/trainer.py) 和 [推理快照轮询](https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/inference.py)。保留 RLinf 原生训练、replay 与 checkpoint，用发布完整快照的方法解耦 learner 和 rollout；不是直接移植上游的 JAX 服务。
 
 入口命令与之前相同，`piper.async_training: true` 已是默认配置。若需要做同步对照，可复制配置并设为 false，用 `--online-config /path/to/profile.yaml` 新建运行；不要修改已有运行的配置。异步模式保留按 episode 确认入池的撤销窗口，不会在本条尚可撤销时提前训练。
 
 2026-10-23 异步验证记录：在单张 RTX 5090 上使用真实 H50/C50 模型和合成数据，通过首次运行与恢复测试。首次确认提交耗时约 0.6 ms，退出保存 version 8 / 剩余 192 次预算；恢复期间 97 次推理请求中有 48 次与训练 RPC 重叠，最终 learner 到 version 200、预算为 0，episode 只入池一次。恢复期间推理含调度等待的中位数约 207 ms、P95 约 215 ms。测试使用小 batch=4、每轮更新上限 4，不能直接视作正式 batch=64 的性能，且没有连接机械臂。报告保存在 `outputs/piper/async_smoke_20261023/async_first.json` 和 `async_resume.json`。
+
+2026-10-23 后续修正：权重安装从“每次 C50 推理前”改为“整条 episode 开始前”，使用显式 begin_episode 调用；训练和特征准备仍异步。此前运行的 trace 可能包含多个版本，修改不会重写历史数据。resume 也从下一条开始采用固定版本规则，运行中的旧进程需退出并重新启动才能生效。
+
+checkpoint 仍按每轮最多 32 次 critic 更新保存完整训练状态；总预算仍为新增 transition 数乘 5。默认保留最近 3 代，恢复进程另外保留正在引用的加载代。该频率影响恢复粒度和磁盘写入，不再决定执行中换权重的频率。

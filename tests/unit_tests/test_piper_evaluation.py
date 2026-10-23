@@ -255,6 +255,12 @@ def test_piper_online_commits_after_undo_window_and_stamps_policy_version(
     accepted = []
     finished = []
     announcements = []
+    starts = []
+
+    def begin():
+        starts.append(True)
+        policy.version = 32 + len(starts)
+        return policy.version
 
     def finish(poll):
         assert len(accepted) == 1
@@ -281,16 +287,18 @@ def test_piper_online_commits_after_undo_window_and_stamps_policy_version(
             ]
         ),
         on_accept=accept,
+        on_episode_start=begin,
         on_finish=finish,
         async_training=asynchronous,
         announce=lambda event, number: announcements.append(event),
     )
+    assert len(starts) == 2
     assert finished == [True]
     assert ("queued" in announcements) == asynchronous
     assert ("updated" in announcements) != asynchronous
     assert summary["discarded_episodes"] == 1
     assert len(accepted) == 1 and accepted[0]["directory"] == "episode_002"
-    assert accepted[0]["policy_version"] == 32
+    assert accepted[0]["policy_version"] == 34
     assert accepted[0]["critical_phases"][0]["outcome"] == "failure"
     assert accepted[0]["outcome"] == "success"
 

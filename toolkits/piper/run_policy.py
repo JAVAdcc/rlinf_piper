@@ -531,7 +531,7 @@ def _run_with_resources(
                     f"Online policy version: {policy.version}. After recording and reset, "
                     + (
                         "Right accepts and queues the previous episode; training runs in background. "
-                        "New policies are installed at chunk boundaries. "
+                        "Each episode uses one policy version, installed before it starts. "
                         if online.async_training
                         else "Right accepts the previous episode, trains, and installs the next policy. "
                     )
@@ -569,6 +569,9 @@ def _run_with_resources(
                         resume=args.resume is not None,
                         on_accept=online.accept_episode if online is not None else None,
                         on_poll=online.check_health if online is not None else None,
+                        on_episode_start=policy.begin_episode
+                        if online is not None
+                        else None,
                         on_finish=online.finish_training
                         if online is not None
                         else None,

@@ -331,7 +331,7 @@ USE_TF=0 JAX_PLATFORMS=cpu "$PIPER_PYTHON" -m toolkits.piper.run_policy rollout 
 
 ## 10. 原生 RLT online 训练与续训
 
-`train_online.sh` 在每条 episode 确认保留后提交后台，下一条可立即开始；原生 RLT actor/critic 独立更新，rollout 在下一次推理切换完整快照。完整 C50 启动命令和已下载的 critic 权重见 [ONLINE_C50.md](ONLINE_C50.md)。Stage1 保持冻结。新运行必须显式指定已经完成 critic warmup 的 actor，以及与其 Stage1、任务、动作维度和 horizon 一致的离线 cache。新下载的 C50 prejoint 包已完成 critic TD10000；第 13 节旧 BC5000 包仍只用于固定权重评测。以下命令使用已下载的权重和配套离线 cache，不读取 C10 rollout 旧数据：
+`train_online.sh` 在每条 episode 确认保留后提交后台，下一条可立即开始；原生 RLT actor/critic 独立更新，rollout 在下一条 episode 开始前切换完整快照，整条执行期间固定版本。完整 C50 启动命令和已下载的 critic 权重见 [ONLINE_C50.md](ONLINE_C50.md)。Stage1 保持冻结。新运行必须显式指定已经完成 critic warmup 的 actor，以及与其 Stage1、任务、动作维度和 horizon 一致的离线 cache。新下载的 C50 prejoint 包已完成 critic TD10000；第 13 节旧 BC5000 包仍只用于固定权重评测。以下命令使用已下载的权重和配套离线 cache，不读取 C10 rollout 旧数据：
 
 ```bash
 cd /home/descfly/code/rlinf_piper

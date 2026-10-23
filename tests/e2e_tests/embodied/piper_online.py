@@ -203,10 +203,19 @@ def asynchronous_check(cfg, args, output, task):
         deadline = time.monotonic() + 240
         while True:
             runner.check_health()
+            # A new synthetic episode adopts the latest published snapshot.
+            fixed_version = runner.policy.begin_episode()
             began = time.time()
             actions, diagnostics = runner.policy.infer_with_reference(
                 sample, task, actor_enabled=True
             )
+            assert diagnostics["policy_version"] == fixed_version
+            # A subsequent chunk in the same episode must keep its version even
+            # while the learner publishes checkpoints.
+            _, next_diagnostics = runner.policy.infer_with_reference(
+                sample, task, actor_enabled=True
+            )
+            assert next_diagnostics["policy_version"] == fixed_version
             calls.append(
                 {
                     "start": began,

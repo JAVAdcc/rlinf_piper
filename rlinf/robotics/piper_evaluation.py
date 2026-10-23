@@ -144,6 +144,7 @@ def evaluate_piper(
     on_accept: Callable[[Path, dict], None] | None = None,
     on_poll: Callable[[], None] | None = None,
     on_finish: Callable | None = None,
+    on_episode_start: Callable[[], int] | None = None,
     async_training: bool = False,
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
@@ -540,6 +541,9 @@ def evaluate_piper(
                         session.config.fps,
                         abort=lambda: "q" in poll_keys(),
                     )
+                if on_episode_start is not None:
+                    version = on_episode_start()
+                    print(f"Episode policy fixed at version {version}.", flush=True)
                 episode_dir = output / f"episode_{attempt_number:03d}"
                 episode_dir.mkdir(exist_ok=False)
                 result = {

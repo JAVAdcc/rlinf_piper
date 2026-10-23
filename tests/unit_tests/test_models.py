@@ -1971,6 +1971,11 @@ def test_piper_rollout_installs_only_complete_valid_monotonic_snapshots(tmp_path
         "snapshot_sha256": file_sha256(target),
     }
     write_json(tmp_path / "latest.json", pointer)
+    # Publishing a newer checkpoint must not alter the active episode.
+    unchanged, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
+    torch.testing.assert_close(unchanged, original)
+    assert diagnostics["policy_version"] == 0
+    assert worker.begin_episode() == {"version": 2}
     updated, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
     assert diagnostics["policy_version"] == 2 and (updated == 1).all()
 
@@ -1979,20 +1984,21 @@ def test_piper_rollout_installs_only_complete_valid_monotonic_snapshots(tmp_path
     pointer.update(version=3, snapshot_sha256=file_sha256(target))
     write_json(tmp_path / "latest.json", pointer)
     with pytest.raises(ValueError, match="tensor contract"):
-        worker.infer_with_reference({}, "USB", actor_enabled=True)
+        worker.begin_episode()
     assert worker.version == 2 and (actor.weight == 1).all()
     pointer["snapshot_sha256"] = "wrong checksum"
     write_json(tmp_path / "latest.json", pointer)
     with pytest.raises(ValueError, match="checksum"):
-        worker.infer_with_reference({}, "USB", actor_enabled=True)
+        worker.begin_episode()
     pointer["version"] = 1
     write_json(tmp_path / "latest.json", pointer)
     unchanged, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
     assert diagnostics["policy_version"] == 2 and (unchanged == 1).all()
+    assert worker.begin_episode() == {"version": 2}
     pointer["binding"] = "another-run"
     (tmp_path / "latest.json").write_text(json.dumps(pointer))
     with pytest.raises(ValueError, match="another online run"):
-        worker.infer_with_reference({}, "USB", actor_enabled=True)
+        worker.begin_episode()
 
 
 def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):

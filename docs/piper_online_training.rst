@@ -53,7 +53,7 @@ actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005`
 
 参考 `RLToken §5 <https://arxiv.org/html/2604.23073v2#S5>`_ 和 openpi-RLT 提交 ``c1e40ac360185778c98cf20da2820e22d2d415e7`` 的 `LearnerService.run_forever / export_actor_snapshot <https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/trainer.py>`_、`推理端 snapshot poller <https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/inference.py>`_。迁移的是独立更新和不可变快照发布机制，训练仍使用本仓库 PyTorch/RLinf 原生 RLT 链路。
 
-初始和同步模式沿用 WeightSyncer；异步模式 learner 完整保存后原子替换 latest.json。rollout 在下一次推理检查版本、SHA256、张量键/形状/dtype/finite，验证完成才安装，并在同一个串行 RPC 内执行 forward。拒绝回退版本和不同运行的快照。当前排队动作继续使用原预测；trace、parquet 记录每个 tick 实际使用的 policy_version，human/hold 为 -1。跨版本 replay 窗口的版本为 -1，原逐帧数据仍保留版本。
+初始和同步模式沿用 WeightSyncer；异步模式 learner 完整保存后原子替换 latest.json。rollout 只在下一条 episode 开始前通过 begin_episode 检查版本、SHA256、张量键/形状/dtype/finite，验证完成才安装。普通推理 RPC 不刷新权重；一次 episode 的所有 C50、关键段和人工交还都使用同一个 checkpoint。拒绝回退版本和不同运行的快照。后台发布新版本不改变当前 episode；trace、parquet 记录每个 tick 实际使用的 policy_version，human/hold 为 -1。跨版本 replay 窗口的版本为 -1，原逐帧数据仍保留版本。
 
 为适配单张 5090，只保留一份冻结 VLA。InferenceGate 序列化推理与特征补算，补算按 batch=2 分割，等待中的推理优先；无法抢占一个已经开始的 forward。特征补算在 VLA worker 的独立 RNG 上下文中执行。后台 learner 属于另一 worker，可与推理并发，但共享 GPU 仍可能增加推理延迟。trace 的 background_wait_s 可分辨等待特征补算的部分；这不是硬实时保证。
 
@@ -79,4 +79,4 @@ actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005`
 
 第一遍检查 H50/C50 推理、锚点复用、批量提取、离线池导入、入池、真实 actor/critic 梯度更新和权重广播。后两遍从相同 checkpoint 继续消耗预算，比较得到的新权重摘要，覆盖 replay、optimizer、RNG 与计数恢复。CPU 单元测试另外覆盖段末对齐、短段 mask、人工动作混合、固定 batch、离线池保留及 C50 的中途切换和 HIL。
 
-异步 GPU 检查使用同一个脚本加 ``--asynchronous``，输出到新的测试目录，随后运行一次 ``--resume``。它在训练 RPC 期间持续真实 H50/C50 推理，检查快照热更新、退出时未耗尽预算与恢复后总更新数；合成数据只用于验证并发和恢复，不能衡量任务成功率。CPU 测试另覆盖推理优先、后台异常、完整快照校验和逐 chunk 版本归属。
+异步 GPU 检查使用同一个脚本加 ``--asynchronous``，输出到新的测试目录，随后运行一次 ``--resume``。它在训练 RPC 期间持续真实 H50/C50 推理，检查 episode 边界更新、episode 内连续多次推理固定版本、退出时未耗尽预算与恢复后总更新数；合成数据只用于验证并发和恢复，不能衡量任务成功率。CPU 测试另覆盖推理优先、后台异常、完整快照校验和逐 chunk 版本归属。

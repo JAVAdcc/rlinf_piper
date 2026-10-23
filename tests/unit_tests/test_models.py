@@ -1937,6 +1937,64 @@ def test_piper_online_requires_offline_data_and_trained_critic_for_c50(
     )
 
 
+def test_piper_rollout_installs_only_complete_valid_monotonic_snapshots(tmp_path):
+    import json
+
+    from rlinf.data.datasets.rlt_warmup import file_sha256, write_json
+    from rlinf.workers.rollout.piper_rlt_worker import PiperRLTRollout
+
+    actor = torch.nn.Linear(2, 2)
+    worker = object.__new__(PiperRLTRollout)
+    worker.version = 0
+    worker.policy = SimpleNamespace(
+        actor=actor,
+        infer_with_reference=lambda *args, **kwargs: (
+            actor.weight.detach().clone(),
+            {},
+        ),
+    )
+    worker.enable_snapshots(str(tmp_path), "test-binding")
+    write_json(tmp_path / "latest.json", {"binding": "test-binding", "version": 0})
+    original, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
+    assert diagnostics["policy_version"] == 0
+    target = tmp_path / "checkpoint_001/actor/model_state_dict/full_weights.pt"
+    target.parent.mkdir(parents=True)
+    state = {key: torch.ones_like(value) for key, value in actor.state_dict().items()}
+    torch.save(state, target)
+    # Unpublished files cannot change inference.
+    unchanged, _ = worker.infer_with_reference({}, "USB", actor_enabled=True)
+    torch.testing.assert_close(unchanged, original)
+    pointer = {
+        "binding": "test-binding",
+        "version": 2,
+        "checkpoint": "checkpoint_001",
+        "snapshot_sha256": file_sha256(target),
+    }
+    write_json(tmp_path / "latest.json", pointer)
+    updated, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
+    assert diagnostics["policy_version"] == 2 and (updated == 1).all()
+
+    state["weight"][0, 0] = float("nan")
+    torch.save(state, target)
+    pointer.update(version=3, snapshot_sha256=file_sha256(target))
+    write_json(tmp_path / "latest.json", pointer)
+    with pytest.raises(ValueError, match="tensor contract"):
+        worker.infer_with_reference({}, "USB", actor_enabled=True)
+    assert worker.version == 2 and (actor.weight == 1).all()
+    pointer["snapshot_sha256"] = "wrong checksum"
+    write_json(tmp_path / "latest.json", pointer)
+    with pytest.raises(ValueError, match="checksum"):
+        worker.infer_with_reference({}, "USB", actor_enabled=True)
+    pointer["version"] = 1
+    write_json(tmp_path / "latest.json", pointer)
+    unchanged, diagnostics = worker.infer_with_reference({}, "USB", actor_enabled=True)
+    assert diagnostics["policy_version"] == 2 and (unchanged == 1).all()
+    pointer["binding"] = "another-run"
+    (tmp_path / "latest.json").write_text(json.dumps(pointer))
+    with pytest.raises(ValueError, match="another online run"):
+        worker.infer_with_reference({}, "USB", actor_enabled=True)
+
+
 def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.models.embodiment.openpi.policies.piper_policy import PiperActionCodec
@@ -2004,6 +2062,8 @@ def test_piper_rlt_inference_uses_native_actor_route_and_decodes_once(tmp_path):
 
     worker = object.__new__(PiperRLTRollout)
     worker.policy = policy
+    worker.snapshot_root = None
+    worker.version = 64
 
     class RemoteWorker:
         def infer_with_reference(self, *args, **kwargs):

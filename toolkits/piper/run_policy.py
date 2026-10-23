@@ -529,8 +529,13 @@ def _run_with_resources(
             if online is not None:
                 print(
                     f"Online policy version: {policy.version}. After recording and reset, "
-                    "Right accepts the previous episode, trains, and installs the next policy. "
-                    "Accepted episodes cannot be discarded; q leaves an unaccepted episode pending for resume.",
+                    + (
+                        "Right accepts and queues the previous episode; training runs in background. "
+                        "New policies are installed at chunk boundaries. "
+                        if online.async_training
+                        else "Right accepts the previous episode, trains, and installs the next policy. "
+                    )
+                    + "Accepted episodes cannot be discarded; q leaves an unaccepted episode pending for resume.",
                     flush=True,
                 )
             try:
@@ -563,6 +568,13 @@ def _run_with_resources(
                         announce=announcements,
                         resume=args.resume is not None,
                         on_accept=online.accept_episode if online is not None else None,
+                        on_poll=online.check_health if online is not None else None,
+                        on_finish=online.finish_training
+                        if online is not None
+                        else None,
+                        async_training=online.async_training
+                        if online is not None
+                        else False,
                     )
             except KeyboardInterrupt:
                 print(

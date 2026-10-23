@@ -549,6 +549,8 @@ def rollout_piper(
                     "replan_steps": request.execute_steps,
                     "action_source": request.source,
                     "route_generation": request.generation,
+                    "policy_version": diagnostics.get("policy_version", -1),
+                    "background_wait_s": diagnostics.get("background_wait_s", 0.0),
                     **({"rlt_reference": diagnostics} if save_rlt_reference else {}),
                 }
                 if observation_dir is not None:
@@ -606,6 +608,7 @@ def rollout_piper(
                         "prediction_age_s": time.monotonic() - observed_at,
                         "action_source": request.source,
                         "route_generation": request.generation,
+                        "policy_version": diagnostics.get("policy_version", -1),
                     }
                 )
                 + "\n"
@@ -620,6 +623,7 @@ def rollout_piper(
                     wall_time=wall_time,
                     action_source=request.source,
                     policy_action=target,
+                    policy_version=diagnostics.get("policy_version", -1),
                 )
             chunk_index += 1
             completed += 1
@@ -658,6 +662,7 @@ def _rollout_with_intervention(
         policy_selection.generation if policy_selection is not None else 0
     )
     action_source = policy_source
+    chunk_version = -1
     request = _policy_request(policy, policy_selection, policy_source, replan_steps)
     period = 1 / session.config.fps
     try:
@@ -705,6 +710,10 @@ def _rollout_with_intervention(
                             "replan_steps": request.execute_steps,
                             "action_source": request.source,
                             "route_generation": request.generation,
+                            "policy_version": diagnostics.get("policy_version", -1),
+                            "background_wait_s": diagnostics.get(
+                                "background_wait_s", 0.0
+                            ),
                             **(
                                 {"rlt_reference": diagnostics}
                                 if save_rlt_reference
@@ -718,6 +727,7 @@ def _rollout_with_intervention(
                 if accepted:
                     actions, index = prediction[: request.execute_steps], 0
                     action_source = request.source
+                    chunk_version = int(diagnostics.get("policy_version", -1))
                     prediction_time = requested_at
             if future is None and index == len(actions) and control.mode != "human":
                 request_generation = control.generation
@@ -783,6 +793,9 @@ def _rollout_with_intervention(
                         "command": session.last_command.tolist(),
                         "time": time.time(),
                         "action_source": source,
+                        "policy_version": chunk_version
+                        if source in ("reference", "actor")
+                        else -1,
                         "is_intervention": source == "human",
                         "control_generation": control.generation,
                         "route_generation": route_generation,
@@ -803,6 +816,9 @@ def _rollout_with_intervention(
                     wall_time=wall_time,
                     is_intervention=source == "human",
                     action_source=source,
+                    policy_version=chunk_version
+                    if source in ("reference", "actor")
+                    else -1,
                     policy_action=policy_target
                     if source in ("reference", "actor")
                     else None,

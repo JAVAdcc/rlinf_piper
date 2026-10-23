@@ -142,6 +142,9 @@ def evaluate_piper(
     announce: Callable[[str, int], None] | None = None,
     resume: bool = False,
     on_accept: Callable[[Path, dict], None] | None = None,
+    on_poll: Callable[[], None] | None = None,
+    on_finish: Callable | None = None,
+    async_training: bool = False,
 ) -> dict[str, Any]:
     """Keep one session open; only send policy targets in a started episode.
 
@@ -160,6 +163,12 @@ def evaluate_piper(
     one. The callback runs while stopped, after recording/reset and the undo
     window. Accepted trials cannot be discarded, including after resume.
     """
+
+    def poll_keys() -> list[str]:
+        if on_poll is not None:
+            on_poll()
+        return keys.poll()
+
     if num_episodes <= 0 or steps <= 0:
         raise ValueError("Episode count and step limit must be positive.")
     if reset_after_episode not in ("none", "initial", "zero"):
@@ -366,7 +375,7 @@ def evaluate_piper(
                 )
                 keys.clear()
                 while True:
-                    pressed = keys.poll()
+                    pressed = poll_keys()
                     if "left" in pressed:
                         discard_trial(trial)
                     if "q" in pressed:
@@ -418,7 +427,7 @@ def evaluate_piper(
                 )
 
                 def poll_resumed_reset() -> list[str]:
-                    pressed = keys.poll()
+                    pressed = poll_keys()
                     if "left" in pressed:
                         if undoable is not None:
                             discard_trial(last_trial)
@@ -459,7 +468,7 @@ def evaluate_piper(
                 )
                 notify("review" if final_review else "ready", min(number, num_episodes))
                 while True:
-                    pressed = keys.poll()
+                    pressed = poll_keys()
                     if "left" in pressed:
                         if undoable is not None:
                             discard_trial(undoable)
@@ -486,13 +495,16 @@ def evaluate_piper(
                         output / undoable["directory"] / "result.json", undoable
                     )
                     summarize("training")
-                    notify("training")
+                    notify("queued" if async_training else "training")
                     on_accept(output / undoable["directory"], undoable)
-                    notify("updated")
-                    if "q" in keys.poll():
+                    if not async_training:
+                        notify("updated")
+                    if "q" in poll_keys():
                         raise KeyboardInterrupt
                     keys.clear()
                 if final_review:
+                    if on_finish is not None:
+                        on_finish(poll_keys)
                     break
                 undoable = None
                 attempt_number += 1
@@ -526,7 +538,7 @@ def evaluate_piper(
                     control.align(
                         session.clip_reset_target(session.read_state()),
                         session.config.fps,
-                        abort=lambda: "q" in keys.poll(),
+                        abort=lambda: "q" in poll_keys(),
                     )
                 episode_dir = output / f"episode_{attempt_number:03d}"
                 episode_dir.mkdir(exist_ok=False)
@@ -604,7 +616,7 @@ def evaluate_piper(
 
                 def stop(completed: int) -> bool:
                     result["completed_steps"] = completed
-                    pressed = keys.poll()
+                    pressed = poll_keys()
                     if discard_pressed(pressed):
                         return True
                     if "q" in pressed:
@@ -708,7 +720,7 @@ def evaluate_piper(
                             flush=True,
                         )
                         while True:
-                            pressed = keys.poll()
+                            pressed = poll_keys()
                             if discard_pressed(pressed):
                                 return
                             if "q" in pressed:
@@ -742,7 +754,7 @@ def evaluate_piper(
 
                 def poll_after_episode() -> None:
                     nonlocal quit_requested
-                    pressed = post_episode_keys + keys.poll()
+                    pressed = post_episode_keys + poll_keys()
                     post_episode_keys.clear()
                     if "left" in pressed:
                         discard_trial(result)
@@ -800,6 +812,8 @@ def evaluate_piper(
                             policy_selection=selection,
                         )
                     result["action_duration_s"] = time.monotonic() - started
+                    if on_accept is not None:
+                        result["policy_version_end"] = int(policy.version)
                     # Capture before scoring waits or reset can change the scene.
                     terminal_wall_time = time.time()
                     terminal_observation = (

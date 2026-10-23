@@ -61,6 +61,7 @@ _MESSAGES = {
     "failure": ("outcome", "Episode failed.", "整条任务失败。"),
     "saving": ("recording", "Saving.", "保存中。"),
     "saved": ("recording", "Saved.", "已保存。"),
+    "queued": ("training", "Queued.", "已提交。"),
     "training": ("training", "Training.", "训练中。"),
     "updated": ("training", "Updated.", "已更新。"),
     "no_critical": ("annotation", "Unmarked phase.", "未标关键段。"),

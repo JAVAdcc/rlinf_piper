@@ -86,10 +86,180 @@ class Keys:
         return event
 
 
-def test_piper_online_commits_after_undo_window_and_stamps_policy_version(tmp_path):
+def test_piper_inference_has_priority_over_waiting_backfill():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from rlinf.runners.piper_async import InferenceGate
+
+    gate = InferenceGate()
+    inference_waiting, backfill_waiting = threading.Event(), threading.Event()
+    order = []
+
+    def request(background, waiting):
+        def observe_wait():
+            waiting.set()
+            return False
+
+        with gate.request(background=background, cancelled=observe_wait):
+            order.append("backfill" if background else "inference")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        with gate.request(background=True):
+            inference = executor.submit(request, False, inference_waiting)
+            assert inference_waiting.wait(5)
+            backfill = executor.submit(request, True, backfill_waiting)
+            assert backfill_waiting.wait(5)
+        inference.result(timeout=5)
+        backfill.result(timeout=5)
+    assert order == ["inference", "backfill"]
+
+
+def test_piper_background_pipeline_accepts_without_waiting_and_drains_budget(tmp_path):
+    import threading
+
+    from rlinf.runners.piper_async import PiperAsyncPipeline
+
+    preparing, release = threading.Event(), threading.Event()
+    updates = []
+    budget = 0
+
+    def prepare(directory, result):
+        preparing.set()
+        assert release.wait(5)
+        return result["transitions"]
+
+    def update(item):
+        nonlocal budget
+        if item is not None:
+            budget += item[2] * 5
+        if budget:
+            budget -= 1
+            updates.append(budget)
+        return budget > 0
+
+    pipeline = PiperAsyncPipeline(prepare, update)
+    pipeline.start()
+    try:
+        result = {"transitions": 2}
+        pipeline.submit(tmp_path / "episode_001", result)
+        assert preparing.wait(5)
+        # Submission completed while preparation is still blocked; duplicate
+        # confirmations and later caller mutations must not change the budget.
+        pipeline.submit(tmp_path / "episode_001", result)
+        result["transitions"] = 100
+        assert not updates
+        release.set()
+        pipeline.wait_idle(5)
+        assert updates == list(range(9, -1, -1))
+    finally:
+        release.set()
+        pipeline.close()
+
+
+def test_piper_background_fault_is_reported_and_shutdown_keeps_pending_data(tmp_path):
+    import threading
+
+    from rlinf.runners.piper_async import BackgroundStopped, PiperAsyncPipeline
+
+    entered = threading.Event()
+
+    def prepare(directory, result):
+        entered.set()
+        assert pipeline.stopped.wait(5)
+        raise BackgroundStopped()
+
+    pipeline = PiperAsyncPipeline(prepare, lambda item: False)
+    result_path = tmp_path / "episode_001"
+    result_path.mkdir()
+    result = {"accepted": True}
+    (result_path / "result.json").write_text(json.dumps(result))
+    pipeline.start()
+    pipeline.submit(result_path, result)
+    assert entered.wait(5)
+    pipeline.close()
+    assert json.loads((result_path / "result.json").read_text()) == result
+
+    def fail(directory, result):
+        raise ValueError("invalid accepted shard")
+
+    pipeline = PiperAsyncPipeline(fail, lambda item: False)
+    pipeline.start()
+    pipeline.submit(result_path, result)
+    with pytest.raises(RuntimeError, match="background learning failed") as raised:
+        pipeline.wait_idle(5)
+    assert isinstance(raised.value.__cause__, ValueError)
+    with pytest.raises(RuntimeError, match="background learning failed"):
+        pipeline.close()
+
+
+def test_piper_control_poll_surfaces_background_failure(tmp_path):
+    session = Session()
+
+    def failed():
+        raise RuntimeError("background test fault")
+
+    with pytest.raises(RuntimeError, match="background test fault"):
+        evaluate_piper(
+            Policy(),
+            session,
+            "USB",
+            output=tmp_path,
+            num_episodes=1,
+            steps=10,
+            keys=Keys([[["right"]]]),
+            on_poll=failed,
+        )
+    assert not session.targets
+
+
+def test_piper_trace_and_recording_keep_the_version_of_each_executed_chunk(tmp_path):
+    class VersionedPolicy(Policy):
+        action_horizon = 2
+        version = 0
+
+        def infer_with_reference(self, observation, task):
+            self.version += 1
+            return np.zeros((2, 7)), {"policy_version": self.version}
+
+    class RecordingSession(Session):
+        def execute(self, target):
+            self.last_command = target.copy()
+            return super().execute(target)
+
+    versions = []
+    with (tmp_path / "trace.jsonl").open("w+") as stream:
+        rollout_piper(
+            VersionedPolicy(),
+            RecordingSession(),
+            "USB",
+            steps=5,
+            log=stream,
+            save_rlt_reference=True,
+            record_step=lambda *args, **kwargs: versions.append(
+                kwargs["policy_version"]
+            ),
+        )
+        stream.seek(0)
+        events = [json.loads(line) for line in stream]
+    assert versions == [1, 1, 2, 2, 3]
+    assert [e["policy_version"] for e in events if e["event"] == "action"] == versions
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_piper_online_commits_after_undo_window_and_stamps_policy_version(
+    tmp_path, asynchronous
+):
     policy = Policy()
     policy.version = 32
     accepted = []
+    finished = []
+    announcements = []
+
+    def finish(poll):
+        assert len(accepted) == 1
+        poll()
+        finished.append(True)
 
     def accept(directory, result):
         assert (directory / "trace.jsonl").exists()
@@ -111,7 +281,13 @@ def test_piper_online_commits_after_undo_window_and_stamps_policy_version(tmp_pa
             ]
         ),
         on_accept=accept,
+        on_finish=finish,
+        async_training=asynchronous,
+        announce=lambda event, number: announcements.append(event),
     )
+    assert finished == [True]
+    assert ("queued" in announcements) == asynchronous
+    assert ("updated" in announcements) != asynchronous
     assert summary["discarded_episodes"] == 1
     assert len(accepted) == 1 and accepted[0]["directory"] == "episode_002"
     assert accepted[0]["policy_version"] == 32

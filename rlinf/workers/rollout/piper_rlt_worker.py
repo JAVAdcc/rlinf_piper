@@ -15,6 +15,7 @@
 """GPU inference and native weight reception for the local Piper controller."""
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,8 @@ class PiperRLTRollout(Worker):
         self.cfg = cfg
         self.version = 0
         self.policy = None
+        self.snapshot_root = None
+        self.snapshot_binding = None
         self.weight_syncer = WeightSyncer.create(cfg.weight_syncer)
 
     def init_worker(self) -> dict:
@@ -57,6 +60,7 @@ class PiperRLTRollout(Worker):
 
     def infer(self, observation: dict, task: str, *, actor_enabled: bool) -> np.ndarray:
         """Sample actor exploration only in explicitly selected segments."""
+        self._refresh_snapshot()
         return self.policy.infer(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
@@ -69,9 +73,11 @@ class PiperRLTRollout(Worker):
         actor_enabled: bool,
     ) -> tuple[np.ndarray, dict]:
         """Return the sampled actor chunk and original H50 without another forward."""
-        return self.policy.infer_with_reference(
+        self._refresh_snapshot()
+        actions, diagnostics = self.policy.infer_with_reference(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
+        return actions, {**diagnostics, "policy_version": self.version}
 
     def infer_for_replay(
         self,
@@ -83,6 +89,7 @@ class PiperRLTRollout(Worker):
         frame: int,
     ) -> tuple[np.ndarray, dict]:
         """Save normalized features at the observation's control tick, not arrival time."""
+        self._refresh_snapshot()
         actions, diagnostics = self.policy.infer_with_features(
             observation, task, actor_enabled=actor_enabled, mode="train"
         )
@@ -96,7 +103,62 @@ class PiperRLTRollout(Worker):
                 "raw_state": observation["observation.state"],
             },
         )
-        return actions, diagnostics
+        return actions, {**diagnostics, "policy_version": self.version}
+
+    def extract_replay_features(
+        self, observations: list[dict], task: str, seed: int
+    ) -> list[dict]:
+        """Run one bounded, RNG-isolated backfill batch between inference requests."""
+        return self.policy.extract_replay_features(observations, task, seed)
+
+    def enable_snapshots(self, root: str, binding: str) -> None:
+        """Subscribe to this run's atomically published complete checkpoints."""
+        self.snapshot_root = Path(root).resolve()
+        self.snapshot_binding = binding
+
+    def _refresh_snapshot(self) -> None:
+        if self.snapshot_root is None:
+            return
+        # No await: installation and forward execute in the same rollout RPC.
+        # A retained checkpoint can disappear after reading its pointer; retry the
+        # newest pointer without ever installing a partial or unverified model.
+        for _ in range(3):
+            saved = json.loads((self.snapshot_root / "latest.json").read_text())
+            if saved["binding"] != self.snapshot_binding:
+                raise ValueError("Actor snapshot belongs to another online run.")
+            if int(saved["version"]) <= self.version:
+                return
+            path = (
+                self.snapshot_root
+                / saved["checkpoint"]
+                / "actor/model_state_dict/full_weights.pt"
+            ).resolve()
+            if not path.is_relative_to(self.snapshot_root):
+                raise ValueError("Actor snapshot escapes its run directory.")
+            try:
+                # Read once so retention cannot remove the file between hash and load.
+                import io
+
+                payload = path.read_bytes()
+                if hashlib.sha256(payload).hexdigest() != saved["snapshot_sha256"]:
+                    raise ValueError("Actor snapshot checksum mismatch.")
+                state = torch.load(
+                    io.BytesIO(payload), map_location="cpu", weights_only=True
+                )
+            except FileNotFoundError:
+                continue
+            current = self.policy.actor.state_dict()
+            if state.keys() != current.keys() or any(
+                state[key].shape != current[key].shape
+                or state[key].dtype != current[key].dtype
+                or not torch.isfinite(state[key]).all()
+                for key in current
+            ):
+                raise ValueError("Actor snapshot tensor contract mismatch.")
+            self.policy.actor.load_state_dict(state, strict=True)
+            self.version = int(saved["version"])
+            return
+        raise RuntimeError("Actor snapshots changed too quickly to install.")
 
     def prepare_episode(self, directory: str, result: dict) -> Trajectory | None:
         """Build a CPU trajectory after collection has closed the undo window."""

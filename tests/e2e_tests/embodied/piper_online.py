@@ -21,6 +21,7 @@ Run once normally, then twice with --resume to verify deterministic continuation
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -155,6 +156,108 @@ def synthetic_cache(path: Path, task: str, stage1: Path, actor: Path) -> None:
     CachedRLTReplay(path)
 
 
+def asynchronous_check(cfg, args, output, task):
+    """Exercise concurrent real GPU inference/updates and pending-budget recovery."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from rlinf.data.storage.lerobot.decoding import decode_image_struct_batch
+
+    source = output / "synthetic_episode"
+    episode = output / "episode_001"
+    if not args.resume:
+        synthetic_episode(source, task, int(cfg.actor.model.num_action_chunks))
+        episode.mkdir()
+        (episode / "dataset").symlink_to(source / "dataset", target_is_directory=True)
+    dataset = LeRobotDataset(
+        "piper-smoke",
+        root=source / "dataset",
+        download_videos=False,
+        video_backend="torchcodec",
+    )
+    dataset.hf_dataset.set_transform(decode_image_struct_batch)
+    sample = dataset[0]
+    calls = []
+    with PiperOnlineRunner(cfg, output, resume=args.resume) as runner:
+        if not args.resume:
+            runner.policy.infer_for_replay(
+                sample, task, actor_enabled=True, directory=episode, frame=0
+            )
+            chunk = int(cfg.actor.model.num_action_chunks)
+            result = json.loads((source / "result.json").read_text())
+            result.update(
+                accepted=True,
+                policy_version=0,
+                directory=episode.name,
+                test_only=True,
+                critical_phases=[
+                    {"start": 0, "end": chunk + 5, "outcome": "success"},
+                    {"start": chunk + 7, "end": chunk + 11, "outcome": "failure"},
+                ],
+            )
+            (episode / "result.json").write_text(json.dumps(result))
+        result = json.loads((episode / "result.json").read_text())
+        started = time.monotonic()
+        runner.accept_episode(episode, result)
+        acceptance_s = time.monotonic() - started
+        assert acceptance_s < 1.0, acceptance_s
+        deadline = time.monotonic() + 240
+        while True:
+            runner.check_health()
+            began = time.time()
+            actions, diagnostics = runner.policy.infer_with_reference(
+                sample, task, actor_enabled=True
+            )
+            calls.append(
+                {
+                    "start": began,
+                    "end": time.time(),
+                    "version": diagnostics["policy_version"],
+                }
+            )
+            assert actions.shape == (50, 7) and np.isfinite(actions).all()
+            latest = json.loads((output / "online/latest.json").read_text())
+            if not args.resume and runner.policy.version > 0:
+                break
+            if args.resume and latest["metrics"].get("rlt/pending_update_budget") == 0:
+                runner.background.wait_idle()
+                break
+            assert time.monotonic() < deadline, "Async learner did not progress"
+        assert runner.committed == ["episode_001"]
+    latest = json.loads((output / "online/latest.json").read_text())
+    metrics = [
+        json.loads(line)
+        for line in (output / "online/async_metrics.jsonl").read_text().splitlines()
+    ]
+    overlaps = sum(
+        any(
+            c["start"] < m["learner_finished_at"] and c["end"] > m["learner_started_at"]
+            for m in metrics
+        )
+        for c in calls
+    )
+    assert overlaps > 0, "No inference request overlapped a learner update RPC"
+    assert latest["committed"] == ["episode_001"]
+    assert latest["metrics"]["demo_buffer/total_samples"] == 8
+    if args.resume:
+        assert latest["version"] == 200, latest
+        assert latest["metrics"]["rlt/pending_update_budget"] == 0
+    else:
+        assert latest["metrics"]["rlt/pending_update_budget"] > 0
+    stats = json.loads((episode / "online_features.json").read_text())["feature_stats"]
+    assert stats["reused_anchors"] == 1 and stats["backfilled_anchors"] > 0
+    report = {
+        "acceptance_s": acceptance_s,
+        "calls": calls,
+        "overlapping_calls": overlaps,
+        "version": latest["version"],
+        "pending": latest["metrics"]["rlt/pending_update_budget"],
+    }
+    (output / ("async_resume.json" if args.resume else "async_first.json")).write_text(
+        json.dumps(report, indent=2)
+    )
+    print("Async inference, snapshot installation and durable budget passed:", report)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1", type=Path, required=True)
@@ -164,6 +267,7 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--asynchronous", action="store_true")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[3]
     output = args.output.resolve()
@@ -171,6 +275,7 @@ def main() -> None:
     task = "pick up the two USB cables and insert them into the USB port on the outlet."
     profile = OmegaConf.load(repo / "examples/embodiment/config/piper_rlt_online.yaml")
     # This is an isolated optimizer/shape test, never a deployable training run.
+    profile.piper.async_training = args.asynchronous
     profile.piper.require_critic_warmup = False
     profile.algorithm.rlt_schedule.warmup_min_size = 1
     profile.algorithm.rlt_schedule.max_updates_per_train_step = 4
@@ -192,9 +297,12 @@ def main() -> None:
         offline_cache=cache,
         resume=args.resume,
     )
-    cfg.algorithm.update_epoch = 4
+    cfg.algorithm.update_epoch = 40 if args.asynchronous else 4
     cfg.actor.micro_batch_size = cfg.actor.global_batch_size = 4
     OmegaConf.save(cfg, output / "online.yaml")
+    if args.asynchronous:
+        asynchronous_check(cfg, args, output, task)
+        return
     with PiperOnlineRunner(cfg, output, resume=args.resume) as runner:
         initial = runner.rollout.status().wait()[0]
         if args.resume:

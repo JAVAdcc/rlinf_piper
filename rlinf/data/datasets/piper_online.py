@@ -65,7 +65,9 @@ def segment_trajectory(arrays: dict[str, torch.Tensor], version: int) -> Traject
         terminations=done[:, None],
         dones=done[:, None],
         truncations=torch.zeros_like(done[:, None]),
-        versions=torch.full((count, 1, 1), version, dtype=torch.int64),
+        versions=arrays.get(
+            "policy_versions", torch.full((count,), version, dtype=torch.int64)
+        ).reshape(count, 1, 1),
         forward_inputs={
             key: arrays[key][:, None]
             for key in ("valid_steps", "discount_steps", "next_valid_steps")
@@ -157,17 +159,14 @@ def backfill_replay_features(
         features[frame] = values
     reused = len(features)
     missing = [int(frame) for frame in frames if int(frame) not in features]
-    device = next(policy.feature_model.parameters()).device
     for start in range(0, len(missing), batch_size):
         batch_frames = missing[start : start + batch_size]
         samples = [sample_at(frame) for frame in batch_frames]
         if any(sample["task"] != task for sample in samples):
             raise ValueError("Recorded task text changed.")
-        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
-            torch.manual_seed(
-                int(json_fingerprint([fingerprint, batch_frames])[:15], 16)
-            )
-            values = policy.extract_features_batch(samples, task)
+        values = policy.extract_replay_features(
+            samples, task, int(json_fingerprint([fingerprint, batch_frames])[:15], 16)
+        )
         for frame, value in zip(batch_frames, values, strict=True):
             features[frame] = value
     return features, {
@@ -264,6 +263,23 @@ def cache_accepted_episode(
             .astype(bool),
             reward_scope="critical_segment",
         )
+        if "complementary_info.policy_version" in rows.column_names:
+            versions = np.asarray(rows["complementary_info.policy_version"]).reshape(-1)
+            # A subsampled window can span several policies or human actions.
+            # -1 denotes mixed/unknown behavior; the original tick IDs remain in data.
+            transitions["policy_versions"] = np.asarray(
+                [
+                    int(versions[start])
+                    if np.all(versions[start : start + length] == versions[start])
+                    else -1
+                    for start, length in zip(
+                        transitions["frames"][transitions["current"]],
+                        transitions["valid_steps"],
+                        strict=True,
+                    )
+                ],
+                dtype=np.int64,
+            )
 
         features, feature_stats = backfill_replay_features(
             policy,

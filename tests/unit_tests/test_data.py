@@ -262,10 +262,12 @@ def test_piper_replay_backfill_reuses_aligned_anchors_and_preserves_rng(tmp_path
         backfill_replay_features,
         save_replay_anchor,
     )
+    from rlinf.models.embodiment.piper_inference import PiperRLTPolicy
 
     class FeatureProvider:
         manifest = {"checkpoint_id": "stage1", "norm_stats_sha256": "norm"}
         feature_model = torch.nn.Linear(1, 1)
+        extract_replay_features = PiperRLTPolicy.extract_replay_features
 
         def __init__(self):
             self.calls = []

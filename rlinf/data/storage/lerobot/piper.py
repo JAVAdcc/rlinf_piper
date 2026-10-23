@@ -96,6 +96,11 @@ class PiperEpisodeRecorder:
                 "shape": (1,),
                 "names": None,
             },
+            "complementary_info.policy_version": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            },
             "complementary_info.policy_action": {
                 "dtype": "float32",
                 "shape": (7,),
@@ -161,6 +166,7 @@ class PiperEpisodeRecorder:
         is_intervention: bool = False,
         action_source: str | None = None,
         policy_action: np.ndarray | None = None,
+        policy_version: int = -1,
     ) -> None:
         if self.closed:
             raise RuntimeError("Episode recording is closed.")
@@ -192,6 +198,9 @@ class PiperEpisodeRecorder:
                 "complementary_info.action_source": np.array(
                     [ACTION_SOURCES[source]], dtype=np.int64
                 ),
+                "complementary_info.policy_version": np.array(
+                    [policy_version if valid else -1], dtype=np.int64
+                ),
                 "complementary_info.policy_action": np.asarray(
                     policy_action if policy_valid else np.zeros(7),
                     dtype=np.float32,
@@ -216,6 +225,7 @@ class PiperEpisodeRecorder:
         is_intervention: bool = False,
         action_source: str | None = None,
         policy_action: np.ndarray | None = None,
+        policy_version: int = -1,
     ) -> None:
         """Record a successfully submitted command and its pre-command observation."""
         self._append(
@@ -229,6 +239,7 @@ class PiperEpisodeRecorder:
             is_intervention=is_intervention,
             action_source=action_source,
             policy_action=policy_action,
+            policy_version=policy_version,
         )
         self.steps += 1
         self.human_steps += int(is_intervention)

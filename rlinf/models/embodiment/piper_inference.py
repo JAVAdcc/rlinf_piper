@@ -350,6 +350,16 @@ class PiperRLTPolicy:
         return self._infer(observation, task, actor_enabled, mode, True, True)
 
     @torch.inference_mode()
+    def extract_replay_features(
+        self, observations: list[dict], task: str, seed: int
+    ) -> list[dict]:
+        """Backfill with an isolated RNG in the process that owns the frozen VLA."""
+        device = next(self.feature_model.parameters()).device
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(seed)
+            return self.extract_features_batch(observations, task)
+
+    @torch.inference_mode()
     def extract_features_batch(self, observations: list[dict], task: str) -> list[dict]:
         """Backfill frozen replay anchors without changing the actor or executing it."""
         packed = [piper_env_observation(obs, task) for obs in observations]

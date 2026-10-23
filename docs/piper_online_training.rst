@@ -1,4 +1,4 @@
-Piper 的同步 online 训练
+Piper 的异步 online 训练
 ========================
 
 ``toolkits/piper/train_online.sh`` 让 Piper 数采流程驱动原生 RLT 训练。Stage1 为冻结的 H50 FP32 VLA，actor 的执行长度 C 从权重 metadata 读取，支持 C10 和 C50。``b`` 进入关键段，``s/f`` 给该段局部结果并恢复 reference。现场启动和续训命令集中在 ``order.md`` 第 10 节；当前 C50 BC5000 的固定权重测试使用第 13 节 ``eval_c50.sh``，它的 critic 未训练，不能直接用于 online。
@@ -6,9 +6,9 @@ Piper 的同步 online 训练
 确认保留后再训练
 ----------------
 
-整条 episode 停止、评分、保存和复位后，操作员仍可用 ``Left`` 撤销。只有 ``Right`` 确认保留时，才提交 replay、执行 learner 更新、保存 checkpoint 并广播新权重；完成后下一条才开始。最后一条同样需要确认。确认后不能撤销已经用于训练的数据，``q`` 退出前未确认的数据继续留在待确认状态。
+整条 episode 停止、评分、保存和复位后，操作员仍可用 ``Left`` 撤销。只有 ``Right`` 确认保留时才提交后台队列；下一条可以立即开始。后台准备特征、提交 replay、执行 learner 更新并发布完整 checkpoint。最后一条同样需要确认。确认后不能撤销已经用于训练的数据，``q`` 退出前未确认的数据继续留在待确认状态。
 
-训练发生在两条 episode 之间。终端和 CAN 留在主进程，``PiperRLTRollout`` 持有冻结 VLA 和 actor，``PiperRLTActor`` 继承 ``RLTACFSDPPolicy``。replay、DataLoader、optimizer、target、checkpoint 和权重广播复用原生组件；``PiperOnlineRunner`` 管理确认和提交事务。当前支持单机单 GPU，不在机械臂执行过程中更新权重。
+默认 ``piper.async_training=true``，训练可以和下一条的推理同时进行。终端和 CAN 留在主进程，``PiperRLTRollout`` 持有冻结 VLA 和 actor，``PiperRLTActor`` 继承 ``RLTACFSDPPolicy``。replay、DataLoader、optimizer、target、checkpoint 和权重广播复用原生组件；``PiperOnlineRunner`` 管理确认和提交事务。当前支持单机单 GPU。后台准备线程和 learner 线程相互独立，准备完成的内存队列最多暂存一条 episode；接受队列只保存路径与结果元数据，原始数据留在磁盘。
 
 执行长度与 replay 窗口
 ----------------------
@@ -38,15 +38,26 @@ online 池均匀、有放回采样最近 200 条有效 episode 的 chunk；demo 
 训练预算与恢复
 --------------
 
-``examples/embodiment/config/piper_rlt_online.yaml`` 启用原生 transition 计数调度。至少积累 64 个在线 transition 才开始更新；导入的离线样本不产生 online 更新预算。每个新增 transition 产生 5 次 critic 更新预算，每次确认最多执行 256 次，未完成预算保留到后续确认。每 2 次 critic 更新一次 actor。这个入口的 UTD 分母明确为新增 replay transition，不是原始帧或 batch 样本曝光次数。
+``examples/embodiment/config/piper_rlt_online.yaml`` 启用原生 transition 计数调度。至少积累 64 个在线 transition 才开始更新；导入的离线样本不产生 online 更新预算。每个新增 transition 产生 5 次 critic 更新预算，后台每轮最多执行 32 次并发布快照，有剩余预算就继续，不等待下一次确认。每 2 次 critic 更新一次 actor。这个入口的 UTD 分母明确为新增 replay transition，不是原始帧或 batch 样本曝光次数。
 
-例如第一条生成 100 个 transition，产生 500 次预算，本次执行 256 critic / 128 actor 更新，还剩 244 次；第二条再生成 20 个 transition，则累计剩余预算为 344，本次继续执行最多 256 次。预算、实际执行量和两个池大小写入 ``online_update.json``；若没有新的确认，剩余预算不会在机械臂执行期间自行消耗。
+例如第一条生成 100 个 transition，产生 500 次预算，后台分轮执行直至预算耗尽或程序退出。每轮实际更新量和预算写入 ``online/async_metrics.jsonl``，最新一轮写入 ``async_status.json``。episode 的 ``online_update.json`` 仅记录其入池轮次，不代表随后全部预算。最终 episode 确认后等待后台排空，期间 q 允许保存余量并退出。
 
 actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005``。前 1,000 次 critic 更新逐渐把 Q 权重由接近 0 提至 0.1，把 BC 权重从 5 降至 2。actor 使用导出网络的固定标准差采样。初始化要求 critic 已 warmup，当前 BC-only C50 包会在模型和硬件启动前被拒绝；测试 actor 的命令不受影响。
 
 新建运行从 warmup heads 初始化 target，并建立新的 optimizer。``--resume`` 恢复模型、target、optimizer、学习率、两个 replay 池、累计新增 transition、更新计数及随机数状态。离线池已经包含在 checkpoint 内，续训不再需要原离线 cache 路径。配置与权重绑定由运行快照恢复，新 C50 数据使用新目录；不在旧 run 中更换 stride 或模型。
 
-``online/latest.json`` 只在完整 checkpoint 发布后更新。确认但未提交成功的 episode 重试，已提交的目录不会重复入池。默认保留最近 3 份 checkpoint，以及续训进程正在读取的一份旧 checkpoint；旧 checkpoint 清理不删除在线原始数据。产出的 ``actor/model_state_dict/full_weights.pt`` 可用于独立评测。
+``online/latest.json`` 只在完整 checkpoint 发布后更新。确认但未提交成功的 episode 重试，已提交的目录不会重复入池。异步退出会完成当前更新小轮并保存；未完成特征补算的已接受 episode 依靠 result.json 恢复。恢复不重复入池，也不丢失已保存的训练预算；并发时序与真实轨迹不保证逐位复现。旧运行未配置 async_training 时继续同步执行。默认保留最近 3 份 checkpoint，以及续训进程正在读取的一份旧 checkpoint；旧 checkpoint 清理不删除在线原始数据。产出的 ``actor/model_state_dict/full_weights.pt`` 可用于独立评测。
+
+异步快照与推理优先
+------------------
+
+参考 `RLToken §5 <https://arxiv.org/html/2604.23073v2#S5>`_ 和 openpi-RLT 提交 ``c1e40ac360185778c98cf20da2820e22d2d415e7`` 的 `LearnerService.run_forever / export_actor_snapshot <https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/trainer.py>`_、`推理端 snapshot poller <https://github.com/Yyshadow/openpi-RLT/blob/c1e40ac360185778c98cf20da2820e22d2d415e7/rlt_online_rl/src/rlt_online_rl/inference.py>`_。迁移的是独立更新和不可变快照发布机制，训练仍使用本仓库 PyTorch/RLinf 原生 RLT 链路。
+
+初始和同步模式沿用 WeightSyncer；异步模式 learner 完整保存后原子替换 latest.json。rollout 在下一次推理检查版本、SHA256、张量键/形状/dtype/finite，验证完成才安装，并在同一个串行 RPC 内执行 forward。拒绝回退版本和不同运行的快照。当前排队动作继续使用原预测；trace、parquet 记录每个 tick 实际使用的 policy_version，human/hold 为 -1。跨版本 replay 窗口的版本为 -1，原逐帧数据仍保留版本。
+
+为适配单张 5090，只保留一份冻结 VLA。InferenceGate 序列化推理与特征补算，补算按 batch=2 分割，等待中的推理优先；无法抢占一个已经开始的 forward。特征补算在 VLA worker 的独立 RNG 上下文中执行。后台 learner 属于另一 worker，可与推理并发，但共享 GPU 仍可能增加推理延迟。trace 的 background_wait_s 可分辨等待特征补算的部分；这不是硬实时保证。
+
+后台错误在控制循环及评分、复位、等待按键期间通过健康检查上报，不会静默使用旧版本继续采集。q 退出停止新后台工作并保存当前 learner 小轮；最后一次正常确认则排空已确认工作再退出。语音“已提交”表示接受到后台，不误报“已更新”。
 
 不用机械臂检查完整链路
 ----------------------
@@ -67,3 +78,5 @@ actor 和 critic 学习率均为 ``3e-4``，每步更新 target Q，``tau=0.005`
    .venv-piper/bin/python tests/e2e_tests/embodied/piper_online.py "${piper_test_args[@]}" --resume
 
 第一遍检查 H50/C50 推理、锚点复用、批量提取、离线池导入、入池、真实 actor/critic 梯度更新和权重广播。后两遍从相同 checkpoint 继续消耗预算，比较得到的新权重摘要，覆盖 replay、optimizer、RNG 与计数恢复。CPU 单元测试另外覆盖段末对齐、短段 mask、人工动作混合、固定 batch、离线池保留及 C50 的中途切换和 HIL。
+
+异步 GPU 检查使用同一个脚本加 ``--asynchronous``，输出到新的测试目录，随后运行一次 ``--resume``。它在训练 RPC 期间持续真实 H50/C50 推理，检查快照热更新、退出时未耗尽预算与恢复后总更新数；合成数据只用于验证并发和恢复，不能衡量任务成功率。CPU 测试另覆盖推理优先、后台异常、完整快照校验和逐 chunk 版本归属。

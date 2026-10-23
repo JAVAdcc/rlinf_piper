@@ -18,6 +18,7 @@ import json
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from rlinf.data.datasets.rlt_warmup import file_sha256, json_fingerprint, write_json
 from rlinf.models.embodiment.piper_inference import load_piper_inference_config
+from rlinf.runners.piper_async import InferenceGate, PiperAsyncPipeline
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
@@ -119,6 +121,8 @@ def online_config(
     ):
         raise ValueError("Use native RLT AC with durable, already segmented replay.")
     schedule = cfg.algorithm.get("rlt_schedule", {})
+    if cfg.piper.get("async_training", False) and not schedule.get("enable", False):
+        raise ValueError("Async training requires transition-count update budgeting.")
     if schedule.get("enable", False) and (
         schedule.get("warmup_post_collect_updates", 0) != 0
         or schedule.get("train_every_transitions") != 1
@@ -233,19 +237,22 @@ class PiperOnlinePolicy:
     manual_critical = True
     record_replay_features = True
 
-    def __init__(self, worker, info: dict) -> None:
+    def __init__(self, worker, info: dict, codec=None) -> None:
         self.worker = worker
         self.manifest = info["manifest"]
         self.fps = info["fps"]
         self.action_horizon = info["action_horizon"]
         self.actor_horizon = info["actor_horizon"]
+        self.codec = codec
         self.version = 0
+        self.gate = InferenceGate()
+        self.cancel_backfill = lambda: False
 
     def infer(self, observation: dict, task: str, *, actor_enabled: bool) -> np.ndarray:
-        """Keep inference separate from local CAN, keyboard and human takeover."""
-        return self.worker.infer(observation, task, actor_enabled=actor_enabled).wait()[
-            0
-        ]
+        """Return actions and track the version actually used by the rollout worker."""
+        return self.infer_with_reference(
+            observation, task, actor_enabled=actor_enabled
+        )[0]
 
     def infer_with_reference(
         self,
@@ -255,10 +262,14 @@ class PiperOnlinePolicy:
         actor_enabled: bool,
     ) -> tuple[np.ndarray, dict]:
         """Carry paired reference diagnostics across the worker boundary."""
-        actions, diagnostics = self.worker.infer_with_reference(
-            observation, task, actor_enabled=actor_enabled
-        ).wait()[0]
-        return actions, {**diagnostics, "policy_version": self.version}
+        queued = time.monotonic()
+        with self.gate.request():
+            wait_s = time.monotonic() - queued
+            actions, diagnostics = self.worker.infer_with_reference(
+                observation, task, actor_enabled=actor_enabled
+            ).wait()[0]
+            self.version = int(diagnostics["policy_version"])
+        return actions, {**diagnostics, "background_wait_s": wait_s}
 
     def infer_for_replay(
         self,
@@ -269,24 +280,42 @@ class PiperOnlinePolicy:
         directory: Path,
         frame: int,
     ) -> tuple[np.ndarray, dict]:
-        """Persist the features of the recorded request frame, even if later cancelled."""
-        actions, diagnostics = self.worker.infer_for_replay(
-            observation,
-            task,
-            actor_enabled=actor_enabled,
-            directory=str(directory),
-            frame=frame,
-        ).wait()[0]
-        return actions, {**diagnostics, "policy_version": self.version}
+        """Persist request-frame features and keep a stable version for the chunk."""
+        queued = time.monotonic()
+        with self.gate.request():
+            wait_s = time.monotonic() - queued
+            actions, diagnostics = self.worker.infer_for_replay(
+                observation,
+                task,
+                actor_enabled=actor_enabled,
+                directory=str(directory),
+                frame=frame,
+            ).wait()[0]
+            self.version = int(diagnostics["policy_version"])
+        return actions, {**diagnostics, "background_wait_s": wait_s}
+
+    def extract_replay_features(
+        self, observations: list[dict], task: str, seed: int
+    ) -> list[dict]:
+        """Yield between backfill batches so inference has priority on the shared VLA."""
+        with self.gate.request(background=True, cancelled=self.cancel_backfill):
+            return self.worker.extract_replay_features(observations, task, seed).wait()[
+                0
+            ]
+
+    def rng_state(self) -> dict:
+        """Capture a complete rollout RNG state between RPCs, without model copying."""
+        with self.gate.request(background=True):
+            return self.worker.rng_state().wait()[0]
 
 
 class PiperOnlineRunner:
     """Own two native workers and atomically commit accepted episode updates.
 
-    The terminal owns collection and calls ``accept_episode`` only after Right
-    closes the undo window. Updates and weight broadcasts finish before another
-    episode can start. Resume replays accepted but uncommitted episodes exactly
-    once relative to the last complete learner checkpoint.
+    Right closes the undo window. Async mode prepares and learns in background,
+    publishing complete checkpoints for rollout installation at chunk boundaries.
+    Resume replays accepted but uncommitted episodes exactly once relative to the
+    last complete learner checkpoint. Older run snapshots retain synchronous mode.
     """
 
     def __init__(self, cfg: DictConfig, output: Path, *, resume: bool = False) -> None:
@@ -297,6 +326,8 @@ class PiperOnlineRunner:
         self.committed: list[str] = []
         self.generation = 0
         self.loaded_checkpoint = None
+        self.async_training = bool(cfg.piper.get("async_training", False))
+        self.background = None
         self.root = output / "online"
         self.binding = json_fingerprint(
             {
@@ -330,7 +361,16 @@ class PiperOnlineRunner:
             )
             self.actor.init_worker().wait()
             info = self.rollout.init_worker().wait()[0]
-            self.policy = PiperOnlinePolicy(self.rollout, info)
+            from rlinf.models.embodiment.openpi.policies.piper_policy import (
+                PiperActionCodec,
+            )
+
+            feature_cfg, _ = load_piper_inference_config(self.cfg.piper.stage1)
+            self.policy = PiperOnlinePolicy(
+                self.rollout,
+                info,
+                PiperActionCodec(feature_cfg.openpi_data.norm_stats_path),
+            )
             latest = self.root / "latest.json"
             if latest.exists():
                 if not self.resume:
@@ -353,6 +393,13 @@ class PiperOnlineRunner:
             self._sync()
             if not latest.exists():
                 self._checkpoint({"initialization": True})
+            if self.async_training:
+                self.rollout.enable_snapshots(str(self.root), self.binding).wait()
+                self.background = PiperAsyncPipeline(
+                    self._prepare_async, self._update_async
+                )
+                self.policy.cancel_backfill = self.background.stopped.is_set
+                self.background.start()
             # Recover the durable acceptance marker if the learner was interrupted.
             for path in sorted(self.output.glob("episode_*/result.json")):
                 result = json.loads(path.read_text())
@@ -372,7 +419,7 @@ class PiperOnlineRunner:
         return status
 
     def accept_episode(self, directory: Path, result: dict) -> None:
-        """Ingest, update, checkpoint and install the next policy while stopped."""
+        """Accept durable data, asynchronously when configured."""
         if directory.name in self.committed:
             return
         if not result.get("accepted") or result["outcome"] not in (
@@ -380,6 +427,13 @@ class PiperOnlineRunner:
             "failure",
         ):
             raise ValueError("Cannot train on an undoable or discarded episode.")
+        if self.background is not None:
+            self.background.submit(directory, result)
+            logger.info(
+                "Accepted %s; queued for background preparation and training.",
+                directory.name,
+            )
+            return
         started = time.monotonic()
         logger.info(
             "Accepted %s; caching segment features and updating RLT.", directory.name
@@ -407,19 +461,97 @@ class PiperOnlineRunner:
             metrics["elapsed_s"],
         )
 
-    def _checkpoint(self, metrics: dict) -> None:
+    def check_health(self) -> None:
+        """Report background errors at the next operator/control poll."""
+        if self.background is not None:
+            self.background.check_health()
+
+    def finish_training(self, poll: Callable) -> None:
+        """Drain final accepted data while the arm is stopped; q preserves pending work."""
+        if self.background is None:
+            return
+        logger.info("Finishing background training; q saves pending work for resume.")
+        while True:
+            if "q" in poll():
+                raise KeyboardInterrupt
+            try:
+                self.background.wait_idle(timeout=0.1)
+                return
+            except TimeoutError:
+                continue
+
+    def _prepare_async(self, directory: Path, result: dict):
+        from rlinf.data.datasets.piper_online import cache_accepted_episode
+
+        return cache_accepted_episode(
+            self.policy,
+            directory,
+            result,
+            self.cfg.piper.task,
+            stride=self.cfg.piper.replay_stride,
+            tail_policy=self.cfg.piper.replay_tail_policy,
+            feature_batch_size=self.cfg.piper.replay_feature_batch_size,
+        )
+
+    def _update_async(self, item) -> bool:
+        started = time.monotonic()
+        metrics = {"transitions": 0, "segments": 0}
+        if item is not None:
+            directory, result, trajectory = item
+            if trajectory is not None:
+                metrics.update(self.actor.ingest(trajectory).wait()[0])
+        learner_started_at = time.time()
+        metrics.update(self.actor.run_training().wait()[0])
+        learner_finished_at = time.time()
+        if any(not np.isfinite(value) for value in metrics.values()):
+            raise RuntimeError(
+                "Non-finite background training metrics; no policy published."
+            )
+        updates = int(metrics["rlt/critic_updates_run"])
+        if item is None and updates == 0:
+            return False
+        version = int(self.actor.get_rollout_sync_version().wait()[0])
+        if item is not None:
+            self.committed.append(directory.name)
+            metrics["episode"] = directory.name
+        metrics.update(
+            version=version,
+            training_s=time.monotonic() - started,
+            learner_started_at=learner_started_at,
+            learner_finished_at=learner_finished_at,
+        )
+        self._checkpoint(metrics, version=version)
+        metrics["elapsed_s"] = time.monotonic() - started
+        metrics["last_inferred_version"] = self.policy.version
+        with (self.root / "async_metrics.jsonl").open("a") as stream:
+            stream.write(json.dumps(metrics) + "\n")
+        write_json(self.root / "async_status.json", metrics)
+        if item is not None:
+            write_json(directory / "online_update.json", metrics)
+        logger.info(
+            "Background update published: version %d, pending budget %d.",
+            version,
+            int(metrics["rlt/pending_update_budget"]),
+        )
+        return updates > 0 and metrics["rlt/pending_update_budget"] > 0
+
+    def _checkpoint(self, metrics: dict, *, version: int | None = None) -> None:
+        version = self.policy.version if version is None else version
         self.generation += 1
         name = f"checkpoint_{self.generation:06d}"
         temporary = self.root / f".pending_{uuid.uuid4().hex}"
         temporary.mkdir()
-        self.actor.save_checkpoint(str(temporary / "actor"), self.policy.version).wait()
-        torch.save(self.rollout.rng_state().wait()[0], temporary / "rollout_rng.pt")
+        self.actor.save_checkpoint(str(temporary / "actor"), version).wait()
+        torch.save(self.policy.rng_state(), temporary / "rollout_rng.pt")
         state = {
             "binding": self.binding,
             "checkpoint": name,
             "generation": self.generation,
             "committed": self.committed.copy(),
-            "version": self.policy.version,
+            "version": version,
+            "snapshot_sha256": file_sha256(
+                temporary / "actor/model_state_dict/full_weights.pt"
+            ),
             "metrics": metrics,
         }
         write_json(temporary / "state.json", state)
@@ -436,8 +568,16 @@ class PiperOnlineRunner:
             if old != self.loaded_checkpoint:
                 shutil.rmtree(old)
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type, *_):
         import ray
+
+        failure = None
+        if self.background is not None:
+            try:
+                self.background.close()
+            except BaseException as error:
+                failure = error
+            self.background = None
 
         for name in ("actor", "rollout"):
             group = getattr(self, name)
@@ -459,3 +599,6 @@ class PiperOnlineRunner:
                         logger.warning(
                             "Worker already stopped during cleanup.", exc_info=True
                         )
+
+        if failure is not None and exc_type is None:
+            raise failure

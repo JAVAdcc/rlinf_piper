@@ -1,4 +1,4 @@
-# Synchronous, operator-accepted Piper segments. Stage 1 and actor model geometry
+# Background learning from operator-accepted Piper segments. Stage 1 and actor model geometry
 # are read from the checkpoint contracts by PiperOnlineRunner, never guessed.
 cluster:
   num_nodes: 1
@@ -39,7 +39,7 @@ algorithm:
     warmup_post_collect_updates: 0
     train_every_transitions: 1
     train_every_episodes: 0
-    max_updates_per_train_step: 256 # Carry unfinished budget to the next acceptance.
+    max_updates_per_train_step: 32 # Publish after each bounded background cycle.
   train_actor_steps: 0         # Warmup heads are already trained.
   gamma: 0.995                 # Per executed 30 Hz tick, as in offline warmup.
   tau: 0.005
@@ -77,6 +77,7 @@ weight_syncer:
     compression: none
     init_sync: {enabled: true, prefixes: null, bucket_size: 134217728}
 piper:
+  async_training: true        # Old saved profiles without this field remain synchronous.
   offline_cache: null          # Supply --offline-cache; only train split is used.
   require_offline_cache: true
   require_critic_warmup: true

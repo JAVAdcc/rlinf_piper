@@ -331,14 +331,14 @@ USE_TF=0 JAX_PLATFORMS=cpu "$PIPER_PYTHON" -m toolkits.piper.run_policy rollout 
 
 ## 10. 原生 RLT online 训练与续训
 
-`train_online.sh` 在每条 episode 确认保留后更新原生 RLT actor/critic，随后同步权重并开始下一条。Stage1 保持冻结。新运行必须显式指定已经完成 critic warmup 的 actor，以及与其 Stage1、任务、动作维度和 horizon 一致的离线 cache。**当前 C50 BC5000 包只用于第 13 节固定权重测试；它的 critic 未训练，会被 online 入口拒绝。** 以下路径需要换成后续完成 warmup 的导出和数据缓存，不会自动使用 C10 rollout 旧数据：
+`train_online.sh` 在每条 episode 确认保留后提交后台，下一条可立即开始；原生 RLT actor/critic 独立更新，rollout 在下一次推理切换完整快照。完整 C50 启动命令和已下载的 critic 权重见 [ONLINE_C50.md](ONLINE_C50.md)。Stage1 保持冻结。新运行必须显式指定已经完成 critic warmup 的 actor，以及与其 Stage1、任务、动作维度和 horizon 一致的离线 cache。新下载的 C50 prejoint 包已完成 critic TD10000；第 13 节旧 BC5000 包仍只用于固定权重评测。以下命令使用已下载的权重和配套离线 cache，不读取 C10 rollout 旧数据：
 
 ```bash
 cd /home/descfly/code/rlinf_piper
 export PIPER_PYTHON="$PWD/.venv-piper/bin/python"
 export PIPER_STAGE1_PATH="$PWD/checkpoints/piper_stage1_h50_fp32_20261003/global_step_50000/actor"
-export PIPER_ACTOR_PATH="/path/to/completed_c50_warmup/actor"
-export PIPER_OFFLINE_CACHE="/path/to/c50_warmup_cache"
+export PIPER_ACTOR_PATH="$PWD/checkpoints/piper_shared_c50_prejoint_20261022/actor"
+export PIPER_OFFLINE_CACHE="$PWD/outputs/piper/offline_cache/cache_local_segments_c50_s10_20261022"
 piper_online_dir="/media/descfly/新加卷/value/data_inference/rlinf_online_c50_$(date +%Y%m%d_%H%M%S)"
 
 bash toolkits/piper/train_online.sh \
@@ -363,7 +363,7 @@ bash toolkits/piper/train_online.sh \
 | batch | 固定 64：32 online + 32 offline；少量数据通过有放回采样保持比例 |
 | 人工接管 | 实际执行动作和逐帧 human mask 进入在线池，BC 对应帧模仿人工动作 |
 | 开始更新 | 至少 64 个在线 transition；按 transition 数判断，不按 episode 条数 |
-| 训练预算 | 每个新增在线 transition 产生 5 次 critic 更新预算；每次确认最多执行 256 次，剩余预算保留并随 checkpoint 恢复 |
+| 训练预算 | 每个新增在线 transition 产生 5 次 critic 更新预算；后台每轮最多执行 32 次，有预算则继续；退出时余量随 checkpoint 恢复 |
 | actor 频率 | 每 2 次 critic 更新一次；version 仍是累计 critic 更新数 |
 | 学习率 / target | actor、critic 均为 3e-4；每步软更新 target Q，tau=0.005 |
 
@@ -371,7 +371,7 @@ UTD 在本入口明确按“新增 replay transition”计数，不按帧数、b
 
 每段独立终止，成功段最后有效 tick 奖励为 1，失败为 0，`gamma=0.995` 按实际 tick 折扣。窗口不跨 critical phase 边界；整条 episode 的评分不覆盖分段奖励。保存的是实际发出的连续动作，包括 human 和 hold tick，而不是把网络预测的未执行尾部当作动作。
 
-推理过程中会在 `replay_anchors/` 保存请求帧的 normalized latent、proprio 和完整 H50 reference。确认后复用这些特征，对缺失的起点、下一状态去重，并按默认 batch=2 补算，再保存 `online_features.npz`。`online_features.json` 记录复用数量、补算数量和耗时；不需要每次梯度更新都运行 VLA。增密窗口会增加需要编码的状态，回合间仍有计算等待。
+推理过程中会在 `replay_anchors/` 保存请求帧的 normalized latent、proprio 和完整 H50 reference。确认后复用这些特征，对缺失的起点、下一状态去重，并按默认 batch=2 补算，再保存 `online_features.npz`。`online_features.json` 记录复用数量、补算数量和耗时；不需要每次梯度更新都运行 VLA。增密窗口会增加编码开销；后台按小 batch 补算，等待中的推理优先，但正在执行的 forward 无法抢占。单 GPU 的训练也会竞争算力。最后一条确认后等待后台完成，期间 q 可退出并保留余量。
 
 续训恢复模型、target、optimizer、两个 replay 池、累计新增数据量、训练计数和随机数状态：
 

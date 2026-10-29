@@ -64,6 +64,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="With manual-critical mode, select actor for an offline infer command (default reference)",
     )
+    parser.add_argument(
+        "--experts",
+        type=Path,
+        help="Registry of phase1/phase2 actor directories; replaces --actor",
+    )
+    parser.add_argument(
+        "--infer-expert",
+        choices=("phase1", "phase2"),
+        help="Expert for --infer-actor with --experts",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--online-config",
@@ -246,6 +256,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             for key in (
                 "checkpoint",
                 "actor",
+                "experts",
                 "hardware",
                 "dataset",
                 "online_config",
@@ -281,12 +292,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("Multiple episodes require --interactive.")
     if args.interactive and args.command != "rollout":
         parser.error("--interactive only applies to rollout.")
+    if args.experts is not None and (
+        args.actor is not None
+        or args.backend != "rlt"
+        or args.actor_mode != "manual-critical"
+    ):
+        parser.error("--experts requires manual-critical RLT and replaces --actor.")
+    if args.infer_expert is not None and (args.experts is None or not args.infer_actor):
+        parser.error("--infer-expert requires --experts and --infer-actor.")
+    if args.experts is not None and args.infer_actor and args.infer_expert is None:
+        parser.error("Select --infer-expert phase1 or phase2 for actor inference.")
     if args.backend == "cfg" and args.actor is not None:
         parser.error("--actor is only used by the rlt backend.")
     if args.actor_mode == "manual-critical":
-        if args.backend != "rlt" or args.actor is None:
+        if args.backend != "rlt" or (args.actor is None and args.experts is None):
             parser.error(
-                "--actor-mode manual-critical requires --actor with the rlt backend."
+                "--actor-mode manual-critical requires --actor or --experts with the rlt backend."
             )
         if args.command == "rollout" and not args.interactive:
             parser.error("Manual critical rollout requires --interactive.")
@@ -441,8 +462,69 @@ def _run_with_resources(
                         f"Missing {module}; install requirements/embodied/piper-hil.txt."
                     )
     torch.manual_seed(args.seed)
+    experts = None
+    if args.experts is not None:
+        from rlinf.models.embodiment.piper_experts import load_expert_paths
+
+        experts = load_expert_paths(args.experts)
+        if args.resume is not None and experts != read_collection_json(
+            output / "experts.json"
+        ):
+            raise ValueError(
+                "Expert registry changed; resume must preserve both actor paths."
+            )
+        (metadata_output / "experts.json").write_text(
+            json.dumps(experts, indent=2) + "\n"
+        )
     online = None
-    if args.online_config is not None:
+    if args.online_config is not None and experts is not None:
+        from rlinf.models.embodiment.piper_experts import EXPERT_PHASES
+        from rlinf.runners.piper_expert_runner import PiperExpertRunner
+        from rlinf.runners.piper_online_runner import online_config
+
+        configs = {}
+        for expert, phase in EXPERT_PHASES.items():
+            cfg = online_config(
+                output / f"online_{expert}.yaml"
+                if args.resume is not None
+                else args.online_config,
+                stage1=args.checkpoint,
+                actor=Path(experts[expert]),
+                hardware=OmegaConf.to_container(hardware, resolve=True),
+                task=args.task,
+                output=output / expert,
+                allow_offline_actor=args.allow_offline_actor,
+                offline_cache=args.offline_cache,
+                reference_dropout=args.reference_dropout,
+                resume=args.resume is not None,
+                phase_filter=phase,
+            )
+            if cfg.piper.get("async_training", False):
+                raise ValueError(
+                    "Paired experts require the episode-boundary expert online profile."
+                )
+            if not cfg.piper.offline_cache or not cfg.algorithm.get(
+                "rlt_schedule", {}
+            ).get("enable", False):
+                raise ValueError(
+                    "Paired experts require offline replay and transition-count budgeting."
+                )
+            if (
+                args.replan_steps is not None
+                and args.replan_steps < cfg.actor.model.num_action_chunks
+            ):
+                raise ValueError(
+                    "Online execution must not truncate the actor horizon."
+                )
+            cfg.piper.expert_id = expert
+            cfg.actor.group_name = f"PiperExpertActor_{expert}"
+            cfg.rollout.group_name = "PiperExpertRollout"
+            configs[expert] = cfg
+            OmegaConf.save(cfg, metadata_output / f"online_{expert}.yaml")
+        online = stack.enter_context(
+            PiperExpertRunner(configs, output, resume=args.resume is not None)
+        )
+    elif args.online_config is not None:
         from rlinf.runners.piper_online_runner import PiperOnlineRunner, online_config
 
         cfg = online_config(
@@ -468,6 +550,15 @@ def _run_with_resources(
         )
     if online is not None:
         policy = online.policy
+    elif experts is not None:
+        from rlinf.models.embodiment.piper_experts import PiperExpertPolicy
+
+        policy = PiperExpertPolicy(
+            args.checkpoint,
+            experts=experts,
+            device=args.device,
+            allow_offline_actor=args.allow_offline_actor,
+        )
     elif args.backend == "rlt":
         policy = PiperRLTPolicy(
             args.checkpoint,
@@ -503,7 +594,12 @@ def _run_with_resources(
         task = args.task or sample["task"]
         started = time.monotonic()
         actions = (
-            policy.infer(sample, task, actor_enabled=args.infer_actor)
+            policy.infer(
+                sample,
+                task,
+                actor_enabled=args.infer_actor,
+                **({"expert_id": args.infer_expert} if experts is not None else {}),
+            )
             if args.actor_mode == "manual-critical"
             else policy.infer(sample, task)
         )

@@ -3140,3 +3140,301 @@ def test_video_backpressure_or_writer_failure_cannot_silently_drop_frames(
     assert not (tmp_path / "dataset/meta/episodes.jsonl").exists()
     assert not list(tmp_path.rglob("streaming-video-*"))
     assert not any(thread.name == "piper-video" for thread in threading.enumerate())
+
+
+def test_piper_expert_selection_retries_and_rejects_in_segment_switch(tmp_path):
+    class Experts(Policy):
+        manual_critical = True
+        actor_horizon = 50
+        expert_ids = ("phase1", "phase2")
+
+        def infer(self, obs, task, *, actor_enabled, expert_id=None):
+            return np.full((50, 7), int(expert_id[-1]) if actor_enabled else 0)
+
+    session = Session()
+
+    class RouteKeys:
+        events = set()
+        polls = 0
+
+        def clear(self):
+            pass
+
+        def poll(self):
+            self.polls += 1
+            assert self.polls < 150
+            if "finish" in self.events:
+                return ["right"]
+            count = len(session.targets)
+            for name, when, keys in [
+                ("start", 0, ["right"]),
+                ("unarmed", 0, ["b"]),
+                ("second", 1, ["2", "b"]),
+                ("forbid", 2, ["1"]),
+                ("second_end", 3, ["f"]),
+                ("unarmed_again", 4, ["b"]),
+                ("first", 5, ["1", "b"]),
+                ("first_end", 7, ["s"]),
+                ("retry_second", 8, ["2", "b"]),
+                ("retry_end", 10, ["s"]),
+                ("stop", 11, ["right"]),
+                ("score", 11, ["s"]),
+                ("finish", 11, ["right"]),
+            ]:
+                if count == when and name not in self.events:
+                    self.events.add(name)
+                    return keys
+            return []
+
+    evaluate_piper(
+        Experts(),
+        session,
+        "USB",
+        output=tmp_path,
+        num_episodes=1,
+        steps=20,
+        keys=RouteKeys(),
+    )
+    result = json.loads((tmp_path / "episode_001/result.json").read_text())
+    assert [(p["expert_id"], p["outcome"]) for p in result["critical_phases"]] == [
+        ("phase2", "failure"),
+        ("phase1", "success"),
+        ("phase2", "success"),
+    ]
+    assert [p["start"] for p in result["critical_phases"]] == [1, 5, 8]
+    np.testing.assert_array_equal(
+        np.array(session.targets)[:, 0], [0, 2, 2, 0, 0, 1, 1, 0, 2, 2, 0]
+    )
+    actions = [
+        json.loads(line)
+        for line in (tmp_path / "episode_001/trace.jsonl").read_text().splitlines()
+        if json.loads(line)["event"] == "action"
+    ]
+    assert [r["expert_id"] for r in actions] == [
+        None,
+        "phase2",
+        "phase2",
+        None,
+        None,
+        "phase1",
+        "phase1",
+        None,
+        "phase2",
+        "phase2",
+        None,
+    ]
+
+
+def test_piper_expert_selection_snapshot_invalidates_previous_requests():
+    from rlinf.robotics.piper_runtime import PiperPolicySelection, _policy_request
+
+    selection = PiperPolicySelection(expert_ids=("phase1", "phase2"))
+    policy = SimpleNamespace(action_horizon=50, actor_horizon=50)
+    selection.select_expert("phase2")
+    selection.set_critical(True)
+    request = _policy_request(policy, selection, "reference", 50)
+    with pytest.raises(ValueError, match="End and score"):
+        selection.select_expert("phase1")
+    selection.set_critical(False)
+    assert selection.expert_id is None and request.expert_id == "phase2"
+    assert request.generation != selection.generation
+    with pytest.raises(ValueError, match="Select"):
+        selection.set_critical(True)
+    selection.select_expert("phase1")
+    selection.set_critical(True)
+    assert _policy_request(policy, selection, "reference", 50).expert_id == "phase1"
+
+
+@pytest.mark.parametrize("primary_error", [None, ValueError])
+def test_piper_expert_cleanup_releases_all_groups_after_first_failure(primary_error):
+    from rlinf.runners.piper_expert_runner import PiperExpertRunner
+
+    closed = []
+
+    class Group:
+        def __init__(self, name):
+            self.name = name
+
+        def close_buffers(self):
+            if self.name == "phase1":
+                raise RuntimeError("first worker lost")
+            return SimpleNamespace(wait=lambda: None)
+
+        def _close(self):
+            closed.append(self.name)
+
+    runner = object.__new__(PiperExpertRunner)
+    runner.actors = {key: Group(key) for key in ("phase1", "phase2")}
+    runner.rollout = Group("rollout")
+    if primary_error is None:
+        with pytest.raises(RuntimeError, match="worker lost"):
+            runner.__exit__(primary_error, None, None)
+    else:
+        runner.__exit__(primary_error, None, None)
+    assert closed == ["phase1", "phase2", "rollout"]
+    assert runner.actors == {} and runner.rollout is None
+    runner.__exit__(None, None, None)
+
+
+def test_piper_expert_round_drains_budget_and_skips_head_without_data(tmp_path):
+    from rlinf.runners.piper_expert_runner import PiperExpertRunner
+
+    def result(value):
+        return SimpleNamespace(wait=lambda: [value])
+
+    class Learner:
+        def __init__(self):
+            self.calls = 0
+            self.ingested = []
+
+        def ingest(self, trajectory):
+            self.ingested.append(trajectory)
+            return result({"transitions": 8, "segments": 1})
+
+        def run_training(self):
+            self.calls += 1
+            return result(
+                {
+                    "rlt/critic_updates_run": 32 if self.calls == 1 else 8,
+                    "rlt/actor_updates_run": 16 if self.calls == 1 else 4,
+                    "rlt/pending_update_budget": 8 if self.calls == 1 else 0,
+                }
+            )
+
+    runner = object.__new__(PiperExpertRunner)
+    runner.failed = False
+    runner.committed = []
+    runner.root = tmp_path
+    runner.generation = 0
+    runner.actors = {key: Learner() for key in ("phase1", "phase2")}
+    runner.rollout = SimpleNamespace(
+        prepare_expert_episode=lambda *_: result({"phase2": "second-only"})
+    )
+    runner.policy = SimpleNamespace(
+        begin_episode=lambda: 0, expert_versions={"phase1": 0, "phase2": 40}
+    )
+    saved = []
+    runner._checkpoint = lambda metrics: saved.append(metrics)
+    episode = tmp_path / "episode_001"
+    episode.mkdir()
+    accepted = {"accepted": True, "outcome": "success"}
+    runner.accept_episode(episode, accepted)
+    assert runner.actors["phase1"].calls == 0 and runner.actors["phase1"].ingested == []
+    assert runner.actors["phase2"].calls == 2
+    assert saved[0]["experts"]["phase2"]["critic_updates"] == 40
+    assert saved[0]["experts"]["phase2"]["actor_updates"] == 20
+    runner.accept_episode(episode, accepted)
+    assert len(saved) == 1
+
+
+def test_piper_expert_failed_second_save_keeps_previous_pair_pointer(tmp_path):
+    from rlinf.runners.piper_expert_runner import PiperExpertRunner
+
+    def done(value=None):
+        return SimpleNamespace(wait=lambda: [value])
+
+    class Writer:
+        def __init__(self, fail=False):
+            self.fail = fail
+
+        def get_rollout_sync_version(self):
+            return done(12)
+
+        def save_checkpoint(self, path, version):
+            if self.fail:
+                raise RuntimeError("second save interrupted")
+            root = Path(path) / "model_state_dict"
+            root.mkdir(parents=True)
+            (root / "full_weights.pt").write_bytes(b"first")
+            return done()
+
+    runner = object.__new__(PiperExpertRunner)
+    runner.root = tmp_path
+    runner.generation = 1
+    runner.committed = ["episode_001"]
+    runner.actors = {"phase1": Writer(), "phase2": Writer(True)}
+    latest = tmp_path / "latest.json"
+    latest.write_text('{"generation":1}')
+    before = latest.read_bytes()
+    with pytest.raises(RuntimeError, match="second save"):
+        runner._checkpoint({})
+    assert latest.read_bytes() == before and runner.generation == 1
+    assert not (tmp_path / "checkpoint_000002").exists()
+
+
+@pytest.mark.parametrize(
+    "mode", ["infer-reference", "infer-phase1", "infer-phase2", "rollout", "online"]
+)
+def test_piper_expert_cli_uses_registry_and_preserves_horizon(tmp_path, mode):
+    import sys
+
+    from toolkits.piper.run_policy import parse_args
+
+    repo = Path(__file__).resolve().parents[2]
+    capture = tmp_path / "capture-argv"
+    capture.write_text(
+        f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n"
+    )
+    capture.chmod(0o755)
+    env = {
+        **os.environ,
+        "PIPER_PYTHON": str(capture),
+        "PIPER_EXPERTS_PATH": str(tmp_path / "experts.yaml"),
+        "PIPER_OFFLINE_CACHE": str(tmp_path / "cache"),
+        "PIPER_DATA_PATH": str(tmp_path / "dataset"),
+        "PIPER_ACTOR_PATH": "/stale/shared/actor",
+    }
+    command = [
+        "bash",
+        str(
+            repo
+            / "toolkits/piper"
+            / ("train_experts.sh" if mode == "online" else "eval_experts.sh")
+        ),
+    ]
+    if mode != "online":
+        command.append(mode)
+    captured = subprocess.run(
+        command, env=env, capture_output=True, text=True, check=True
+    )
+    argv = json.loads(captured.stdout)[2:]
+    args = parse_args(argv)
+    assert args.experts == tmp_path / "experts.yaml" and args.actor is None
+    assert args.actor_mode == "manual-critical" and args.allow_offline_actor
+    if mode == "online":
+        assert args.online_config.name == "piper_rlt_experts_online.yaml"
+        assert args.offline_cache == tmp_path / "cache"
+    if mode in ("online", "rollout"):
+        assert args.replan_steps == 50 and args.record_dataset
+    else:
+        assert args.infer_actor == (mode != "infer-reference")
+        assert args.infer_expert == (
+            None if mode == "infer-reference" else mode.removeprefix("infer-")
+        )
+    with pytest.raises(SystemExit):
+        parse_args(argv + ["--actor", "/conflicting/shared/actor"])
+    if mode in ("online", "rollout"):
+        (tmp_path / "run.json").write_text(
+            json.dumps(
+                {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(args).items()
+                }
+            )
+        )
+        (tmp_path / "hardware.yaml").write_text("{}\n")
+        for resume_args in (
+            ["--resume", str(tmp_path)],
+            [f"--resume={tmp_path}"],
+        ):
+            resumed = subprocess.run(
+                command + resume_args + ["--num-episodes", "123"],
+                env={**os.environ, "PIPER_PYTHON": str(capture)},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            restored = parse_args(json.loads(resumed.stdout)[2:])
+            assert restored.experts == args.experts and restored.actor is None
+            assert restored.online_config == args.online_config
+            assert restored.num_episodes == 123

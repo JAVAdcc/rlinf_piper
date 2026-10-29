@@ -45,6 +45,7 @@ def online_config(
     offline_cache: Path | None = None,
     reference_dropout: float | None = None,
     resume: bool = False,
+    phase_filter: int | None = None,
 ) -> DictConfig:
     """Bind a native learner configuration to explicit deployment contracts."""
     cfg = OmegaConf.load(config)
@@ -79,11 +80,11 @@ def online_config(
         raise ValueError("Warmup actor and Stage 1 checkpoint disagree.")
     if (
         metadata.get("reward_scope") != "critical_segment"
-        or metadata.get("phase_filter") is not None
+        or metadata.get("phase_filter") != phase_filter
         or metadata.get("critic_action_projection") != "driver_limits"
     ):
         raise ValueError(
-            "Online training requires shared segment heads with driver-limit Q projection."
+            "Online training requires matching phase heads with driver-limit Q projection."
         )
     if (
         metadata["format"] == "rlinf-piper-rlt-offline-local-actor-v1"

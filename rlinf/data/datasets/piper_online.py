@@ -36,7 +36,44 @@ if TYPE_CHECKING:
     from rlinf.models.embodiment.piper_inference import PiperRLTPolicy
 
 
-def segment_trajectory(arrays: dict[str, torch.Tensor], version: int) -> Trajectory:
+def select_phase_transitions(
+    arrays: dict[str, torch.Tensor], phase_filter: int
+) -> dict[str, torch.Tensor]:
+    """Select one nonempty segment ordinal while retaining feature-row indices."""
+    if type(phase_filter) is not int or phase_filter < 0:
+        raise ValueError("phase_filter must be a nonnegative segment ordinal.")
+    phases = arrays["phase_id"]
+    if phases.ndim != 1 or phases.dtype != torch.int64:
+        raise ValueError("phase_id must be a one-dimensional int64 tensor.")
+    selected = phases == phase_filter
+    if not selected.any():
+        raise ValueError("No transitions for the selected phase.")
+    result = dict(arrays)
+    for key in (
+        "current",
+        "next",
+        "action_end",
+        "phase_id",
+        "actions",
+        "rewards",
+        "valid_steps",
+        "discount_steps",
+        "next_valid_steps",
+        "terminated",
+        "human",
+        "policy_versions",
+    ):
+        if key == "policy_versions" and key not in arrays:
+            continue
+        if len(arrays[key]) != len(phases):
+            raise ValueError(f"Transition length mismatch: {key}.")
+        result[key] = arrays[key][selected]
+    return result
+
+
+def segment_trajectory(
+    arrays: dict[str, torch.Tensor], version: int, *, expert_index: int | None = None
+) -> Trajectory:
     """Pack warmup-compatible, variable-length transitions into native replay.
 
     T is the number of chunk decisions and B is one physical robot. Local
@@ -69,8 +106,19 @@ def segment_trajectory(arrays: dict[str, torch.Tensor], version: int) -> Traject
             "policy_versions", torch.full((count,), version, dtype=torch.int64)
         ).reshape(count, 1, 1),
         forward_inputs={
-            key: arrays[key][:, None]
-            for key in ("valid_steps", "discount_steps", "next_valid_steps")
+            **(
+                {
+                    "expert_index": torch.full(
+                        (count, 1), expert_index, dtype=torch.int64
+                    )
+                }
+                if expert_index is not None
+                else {}
+            ),
+            **{
+                key: arrays[key][:, None]
+                for key in ("valid_steps", "discount_steps", "next_valid_steps")
+            },
         },
         curr_obs={
             key: arrays[key][arrays["current"]][:, None]
@@ -303,3 +351,77 @@ def cache_accepted_episode(
     with np.load(shard, allow_pickle=False) as saved:
         arrays = {key: torch.from_numpy(saved[key].copy()) for key in saved.files}
     return segment_trajectory(arrays, int(result["policy_version"]))
+
+
+def expert_trajectories(directory: Path, result: dict) -> dict[str, Trajectory]:
+    """Split a verified cached episode by explicit expert identity, including retries."""
+    from rlinf.models.embodiment.piper_experts import EXPERT_PHASES
+
+    phases = result["critical_phases"]
+    if not phases:
+        return {}
+    versions = result.get("expert_versions", {})
+    for phase in phases:
+        expert = phase.get("expert_id")
+        if expert not in EXPERT_PHASES or expert not in versions:
+            raise ValueError(
+                "Every scored segment requires an explicit known expert identity."
+            )
+        if phase.get("policy_version") != versions[expert]:
+            raise ValueError(
+                "Segment expert version differs from the episode snapshot."
+            )
+    # Never infer expert identity from segment order: attempts can repeat or skip.
+    with np.load(directory / "online_features.npz", allow_pickle=False) as saved:
+        arrays = {key: torch.from_numpy(saved[key].copy()) for key in saved.files}
+    if arrays["phase_id"].numel() and (
+        arrays["phase_id"].min() < 0 or arrays["phase_id"].max() >= len(phases)
+    ):
+        raise ValueError("Cached segment ordinal is outside the scored phase list.")
+    traces = [
+        json.loads(line)
+        for line in (directory / "trace.jsonl").read_text().splitlines()
+    ]
+    actions = {row["step"]: row for row in traces if row.get("event") == "action"}
+    for phase in phases:
+        for frame in range(phase["start"], phase["end"]):
+            row = actions.get(frame)
+            if row is None or row.get("expert_id") != phase["expert_id"]:
+                raise ValueError(
+                    "Recorded action expert differs from the segment label."
+                )
+            if (
+                row.get("action_source") == "actor"
+                and row.get("policy_version") != versions[phase["expert_id"]]
+            ):
+                raise ValueError("Recorded actor action has another policy version.")
+    results = {}
+    for expert, index in EXPERT_PHASES.items():
+        parts = [
+            select_phase_transitions(arrays, ordinal)
+            for ordinal, phase in enumerate(phases)
+            if phase["expert_id"] == expert and (arrays["phase_id"] == ordinal).any()
+        ]
+        if not parts:
+            continue
+        selected = dict(parts[0])
+        for key in (
+            "current",
+            "next",
+            "action_end",
+            "phase_id",
+            "actions",
+            "rewards",
+            "valid_steps",
+            "discount_steps",
+            "next_valid_steps",
+            "terminated",
+            "human",
+            "policy_versions",
+        ):
+            if key in selected:
+                selected[key] = torch.cat([part[key] for part in parts])
+        results[expert] = segment_trajectory(
+            selected, versions[expert], expert_index=index
+        )
+    return results

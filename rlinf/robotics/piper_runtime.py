@@ -51,11 +51,28 @@ class PiperPolicySelection:
 
     actor_enabled: bool = False
     generation: int = 0
+    expert_ids: tuple[str, ...] = ()
+    expert_id: str | None = None
+
+    def select_expert(self, expert_id: str) -> None:
+        """Arm one expert while reference control is active."""
+        if self.actor_enabled:
+            raise ValueError(
+                "End and score the active segment before selecting an expert."
+            )
+        if expert_id not in self.expert_ids:
+            raise ValueError("Unknown expert identity.")
+        self.expert_id = expert_id
+        self.generation += 1
 
     def set_critical(self, active: bool) -> None:
+        if active and self.expert_ids and self.expert_id is None:
+            raise ValueError("Select an expert before entering a critical segment.")
         if self.actor_enabled != active:
             self.actor_enabled = active
             self.generation += 1
+        if not active and self.expert_ids:
+            self.expert_id = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,7 @@ class _PolicyRequest:
     source: str
     horizon: int
     execute_steps: int
+    expert_id: str | None = None
 
     def infer(
         self,
@@ -78,6 +96,8 @@ class _PolicyRequest:
         kwargs = (
             {} if self.actor_enabled is None else {"actor_enabled": self.actor_enabled}
         )
+        if getattr(policy, "expert_ids", ()):
+            kwargs["expert_id"] = self.expert_id
         if replay_directory is not None:
             started = time.monotonic()
             actions, diagnostics = policy.infer_for_replay(
@@ -113,6 +133,7 @@ def _policy_request(
         ("actor" if enabled else "reference") if selection is not None else source,
         horizon,
         min(replan_steps, horizon),
+        selection.expert_id if selection is not None and enabled else None,
     )
 
 
@@ -549,6 +570,7 @@ def rollout_piper(
                     "replan_steps": request.execute_steps,
                     "action_source": request.source,
                     "route_generation": request.generation,
+                    "expert_id": request.expert_id,
                     "policy_version": diagnostics.get("policy_version", -1),
                     "background_wait_s": diagnostics.get("background_wait_s", 0.0),
                     **({"rlt_reference": diagnostics} if save_rlt_reference else {}),
@@ -577,6 +599,7 @@ def rollout_piper(
                             "event": "route_discard",
                             "step": completed,
                             "route_generation": request.generation,
+                            "expert_id": request.expert_id,
                         }
                     )
                     + "\n"
@@ -608,6 +631,7 @@ def rollout_piper(
                         "prediction_age_s": time.monotonic() - observed_at,
                         "action_source": request.source,
                         "route_generation": request.generation,
+                        "expert_id": request.expert_id,
                         "policy_version": diagnostics.get("policy_version", -1),
                     }
                 )
@@ -710,6 +734,7 @@ def _rollout_with_intervention(
                             "replan_steps": request.execute_steps,
                             "action_source": request.source,
                             "route_generation": request.generation,
+                            "expert_id": request.expert_id,
                             "policy_version": diagnostics.get("policy_version", -1),
                             "background_wait_s": diagnostics.get(
                                 "background_wait_s", 0.0
@@ -799,6 +824,10 @@ def _rollout_with_intervention(
                         "is_intervention": source == "human",
                         "control_generation": control.generation,
                         "route_generation": route_generation,
+                        "expert_id": policy_selection.expert_id
+                        if policy_selection is not None
+                        and policy_selection.actor_enabled
+                        else None,
                         "prediction_age_s": time.monotonic() - prediction_time
                         if source in ("reference", "actor")
                         else None,

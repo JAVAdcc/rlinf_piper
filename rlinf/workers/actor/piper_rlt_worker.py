@@ -145,16 +145,29 @@ class PiperRLTActor(RLTACFSDPPolicy):
 
     def ingest(self, trajectory: Trajectory) -> dict:
         """Commit one accepted episode through the native RLT ingestion path."""
+        if self.cfg.piper.get("expert_id") is not None:
+            identities = trajectory.forward_inputs.get("expert_index")
+            if (
+                identities is None
+                or not (identities == self.cfg.piper.actor_metadata.phase_filter).all()
+            ):
+                raise ValueError("Incoming trajectory does not belong to this expert.")
         added, completed = self._ingest_rollout_trajectories([trajectory])
         self._update_rollout_ingest_counters(added, completed)
         return {"transitions": added, "segments": completed}
 
-    def seed_offline_cache(self, path: str) -> int:
-        """Populate the separate demo pool using only the warmup training split."""
-        from rlinf.data.datasets.piper_online import segment_trajectory
+    def seed_offline_cache(self, path: str, phase_filter: int | None = None) -> int:
+        """Populate the demo pool from training parents and the bound ordinal."""
+        from rlinf.data.datasets.piper_online import (
+            segment_trajectory,
+            select_phase_transitions,
+        )
         from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
 
-        replay = CachedRLTReplay(path)
+        bound_phase = self.cfg.piper.get("actor_metadata", {}).get("phase_filter")
+        if phase_filter != bound_phase:
+            raise ValueError("Offline phase filter differs from the actor binding.")
+        replay = CachedRLTReplay(path, phase_filter=phase_filter)
         if (
             self.cfg.piper.get(
                 "offline_cache_fingerprint", replay.manifest["content_fingerprint"]
@@ -181,8 +194,19 @@ class PiperRLTActor(RLTACFSDPPolicy):
         if self.demo_buffer is None:
             raise ValueError("Configure a demo buffer before loading offline data.")
         for index in replay.splits["train"]:
+            arrays = replay.episodes[index]
+            if phase_filter is not None:
+                arrays = select_phase_transitions(arrays, phase_filter)
             self.demo_buffer.add_trajectories(
-                [segment_trajectory(replay.episodes[index], -1)]
+                [
+                    segment_trajectory(
+                        arrays,
+                        -1,
+                        expert_index=phase_filter
+                        if self.cfg.piper.get("expert_id") is not None
+                        else None,
+                    )
+                ]
             )
         if self.demo_buffer.total_samples == 0:
             raise ValueError("Offline cache contains no training transitions.")

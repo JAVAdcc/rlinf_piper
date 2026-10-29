@@ -101,6 +101,8 @@ v2 全局标注对应 ``piper-rlt-cache-v2``，v3 局部标注对应 ``piper-rlt
 
 默认训练预算是 5,000 步 actor BC、10,000 步 critic、5,000 步联合更新；联合阶段每 4 步更新一次 actor，总计 6,250 次 actor 更新和 15,000 次 critic 更新。每段尾部不足 C10 的动作窗口按真实有效长度屏蔽。完整的参数与阈值保存到 ``output/config.json``。
 
+``training.bc_reference_dropout`` 控制 BC 阶段每个样本整个 reference chunk 被置零的概率，默认 ``0.0`` 保留原配方。设为 ``0.5`` 时，每次 actor 更新独立遮掉约一半样本的 reference 输入，不缩放保留的输入；图像特征、proprio、原 reference／人工 BC 目标和有效长度 mask 不变。BC 仍使用确定性 actor 均值。该选项不影响 critic bootstrap、验证或部署，它们始终提供完整 reference；联合阶段继续使用独立的 ``dropout_end`` 调度。带遮挡的训练 loss 包含更难的无 reference 样本，应以同一验证集、完整 reference 输入的误差比较模型。它借鉴 openpi-RLT 的输入遮挡机制，但不复制其 Q＋BC warmup 配方。
+
 对旧 v2 全局回报，退出关键阶段不等于任务终止：窗口结束仍在段内时，critic 的下一状态就是动作后的观测；退出该段时，下一决策状态是下一段的起点，若没有下一段则是实际任务终点。中间由 reference 执行的真实控制 tick 计入 ``discount_steps``，不计入 actor 的动作窗口。成功奖励只在任务终点出现，最后一段与任务结束之间的间隔同样折扣；不会给每一段都发一次成功奖励。缓存同时保留 ``action_end``，用于区分紧随动作的观测和下一决策状态。
 
 可以先运行到固定预算中的某个位置，再恢复；``--until-step`` 不改变总预算或就绪要求：
@@ -144,6 +146,8 @@ v3 每个 ``critical_phases`` 条目必须有独立的 ``outcome``。窗口仍�
 TD 目标为 ``gamma**(K-1)*r + (1-d)*gamma**K*min(target_Q(next, action))``。gamma 仍按控制 tick 定义，默认 0.995；成功末窗口目标因此不是恒定 1，Q 也不是未经折扣的成功概率。不同段的局部价值不能直接当作整体任务价值。
 
 ``phase_filter: null`` 训练共享网络；``phase_filter: 0`` 或 ``1`` 只消费按时间排序的第一或第二关键段。过滤先选择包含该段的父 episode，再均匀抽父 episode 和段内窗口；不会改变既有 train/validation split，ordinal 也不声称识别了物理 USB 编号。筛选条件绑定 checkpoint。共享与分开网络使用相同每网络预算时，分开组总更新量翻倍，阶段采样曝光也不同，不能称为等预算架构消融。
+
+复用原生 learner 做分段缓存回放时，调用 ``seed_offline_cache(path, phase_filter)`` 填充该网络的训练 demo pool，筛选条件必须与 ``piper.actor_metadata.phase_filter`` 一致。现场缓存先经 ``select_phase_transitions(arrays, phase_filter)`` 筛选，再转换为 trajectory；筛选保留完整 feature 表及原始 current/next 索引，不改写动作、结果、有效时长或人工标签。两头需要各自的 worker、replay、优化器和输出目录。默认单网络入口仍拒绝专用权重；双 C50 手动专家入口使用显式身份路由和成对发布，见仓库 ``DEPLOY_EXPERTS.md``。
 
 每段验证单列局部成功/失败数量、TD 误差、末端误差及用对应训练段拟合的常数 baseline。缺少任一验证结果类别时，该段 balanced terminal RMSE 为 null，coverage 不通过；重叠窗口不能补充独立 episode 数。原覆盖阈值保持不变。
 

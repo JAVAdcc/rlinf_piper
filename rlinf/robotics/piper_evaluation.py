@@ -105,7 +105,7 @@ class TerminalKeys:
             else:
                 char = chr(self.pending[0]).lower()
                 self.pending = self.pending[1:]
-                if char in ("b", "s", "f", "r", "q", "i", "o"):
+                if char in ("b", "s", "f", "r", "q", "i", "o", "1", "2"):
                     keys.append(char)
         return keys
 
@@ -560,6 +560,14 @@ def evaluate_piper(
                 }
                 if on_accept is not None:
                     result["policy_version"] = int(policy.version)
+                if getattr(policy, "expert_ids", ()):
+                    result["expert_versions"] = dict(
+                        getattr(
+                            policy,
+                            "expert_versions",
+                            dict.fromkeys(policy.expert_ids, 0),
+                        )
+                    )
                 _write_json(episode_dir / "result.json", result)
                 summarize("running_episode")
                 started = time.monotonic()
@@ -570,10 +578,17 @@ def evaluate_piper(
                 notify("started", number)
                 post_episode_keys = []
                 selection = (
-                    PiperPolicySelection()
+                    PiperPolicySelection(
+                        expert_ids=tuple(getattr(policy, "expert_ids", ()))
+                    )
                     if getattr(policy, "manual_critical", False)
                     else None
                 )
+                if selection is not None and selection.expert_ids:
+                    print(
+                        "Select 1 or 2, then b to enter; s/f closes the segment. Select again for every attempt.",
+                        flush=True,
+                    )
 
                 def critical_active() -> bool:
                     phases = result["critical_phases"]
@@ -631,6 +646,20 @@ def evaluate_piper(
                         return True
                     for key in pressed:
                         if (
+                            key in ("1", "2")
+                            and selection is not None
+                            and selection.expert_ids
+                        ):
+                            try:
+                                selection.select_expert(f"phase{key}")
+                            except ValueError as exc:
+                                print(str(exc), flush=True)
+                            else:
+                                print(
+                                    f"Selected {selection.expert_id}; press b to enter.",
+                                    flush=True,
+                                )
+                        if (
                             control is not None
                             and key == control.config.key
                             and completed < steps
@@ -656,6 +685,15 @@ def evaluate_piper(
                                 )
                                 continue
                             elif completed < steps:
+                                if (
+                                    selection is not None
+                                    and selection.expert_ids
+                                    and selection.expert_id is None
+                                ):
+                                    print(
+                                        "Select 1 or 2 before pressing b.", flush=True
+                                    )
+                                    continue
                                 phases.append(
                                     {
                                         "start": completed,
@@ -663,6 +701,13 @@ def evaluate_piper(
                                         "outcome": "unscored",
                                     }
                                 )
+                                if selection is not None and selection.expert_ids:
+                                    phases[-1].update(
+                                        expert_id=selection.expert_id,
+                                        policy_version=result["expert_versions"][
+                                            selection.expert_id
+                                        ],
+                                    )
                             else:
                                 notify("phase_limit")
                                 print(

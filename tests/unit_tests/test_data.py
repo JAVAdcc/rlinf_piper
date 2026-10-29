@@ -186,12 +186,61 @@ def test_piper_online_segment_replay_keeps_partial_human_targets(tmp_path):
         third.close()
 
 
-def test_piper_online_demo_pool_excludes_validation(piper_local_warmup_cache):
+@pytest.mark.parametrize("ordinal,indices", [(0, [0, 1]), (1, [2])])
+def test_piper_phase_selection_preserves_native_transition_contract(ordinal, indices):
+    from rlinf.data.datasets.piper_online import (
+        segment_trajectory,
+        select_phase_transitions,
+    )
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+
+    values = episode_transitions(
+        np.arange(210, dtype=np.float32).reshape(30, 7) / 100,
+        phases=[
+            {"start": 2, "end": 15, "outcome": "success"},
+            {"start": 20, "end": 24, "outcome": "failure"},
+        ],
+        terminal=29,
+        chunk_length=10,
+        stride=10,
+        success=True,
+        human=np.arange(30) % 3 == 0,
+        reward_scope="critical_segment",
+    )
+    arrays = {key: torch.from_numpy(value) for key, value in values.items()}
+    count = len(arrays["frames"])
+    arrays.update(
+        z_rl=torch.arange(count * 8).reshape(count, 8).float(),
+        proprio=torch.arange(count * 7).reshape(count, 7).float(),
+        ref_chunk=torch.arange(count * 350).reshape(count, 50, 7).float(),
+        policy_versions=torch.tensor([9, 10, 11]),
+    )
+    before = {k: v.clone() for k, v in arrays.items()}
+    full = segment_trajectory(arrays, 0)
+    selected = segment_trajectory(select_phase_transitions(arrays, ordinal), 0)
+    for key in ("actions", "rewards", "terminations", "intervene_flags", "versions"):
+        torch.testing.assert_close(getattr(selected, key), getattr(full, key)[indices])
+    for key in ("curr_obs", "next_obs", "forward_inputs"):
+        for field in getattr(full, key):
+            torch.testing.assert_close(
+                getattr(selected, key)[field], getattr(full, key)[field][indices]
+            )
+    for key in arrays:
+        assert torch.equal(arrays[key], before[key])
+    for invalid in (-1, True, 0.5, 2):
+        with pytest.raises(ValueError):
+            select_phase_transitions(arrays, invalid)
+
+
+@pytest.mark.parametrize("phase_filter", [None, 0, 1])
+def test_piper_online_demo_pool_excludes_validation(
+    piper_local_warmup_cache, phase_filter
+):
     from rlinf.data.datasets.rlt_warmup import CachedRLTReplay
     from rlinf.data.storage.replay import TrajectoryReplayBuffer
     from rlinf.workers.actor.piper_rlt_worker import PiperRLTActor
 
-    cache = CachedRLTReplay(piper_local_warmup_cache)
+    cache = CachedRLTReplay(piper_local_warmup_cache, phase_filter=phase_filter)
     worker = object.__new__(PiperRLTActor)
     worker.cfg = OmegaConf.create(
         {
@@ -199,14 +248,19 @@ def test_piper_online_demo_pool_excludes_validation(piper_local_warmup_cache):
             "piper": {
                 "stage1_manifest": cache.manifest["stage1"],
                 "task": cache.manifest["annotations"]["task"],
+                "actor_metadata": {"phase_filter": phase_filter},
             },
         }
     )
     worker.demo_buffer = TrajectoryReplayBuffer(sample_window_size=10)
     try:
-        expected = sum(len(cache.episodes[i]["current"]) for i in cache.splits["train"])
-        assert worker.seed_offline_cache(str(piper_local_warmup_cache)) == expected
-        assert len(worker.demo_buffer) == 2
+        expected = sum(len(cache.selected_rows[i]) for i in cache.splits["train"])
+        assert (
+            worker.seed_offline_cache(str(piper_local_warmup_cache), phase_filter)
+            == expected
+        )
+        # Only the successful training parent reaches the second segment.
+        assert len(worker.demo_buffer) == (1 if phase_filter == 1 else 2)
         batch = worker.demo_buffer.sample(100)
         assert (
             batch["curr_obs"]["z_rl"].max() <= 0.1
@@ -214,7 +268,10 @@ def test_piper_online_demo_pool_excludes_validation(piper_local_warmup_cache):
         assert batch["versions"].eq(-1).all()
         worker.cfg.piper.task = "other task"
         with pytest.raises(ValueError, match="task differs"):
-            worker.seed_offline_cache(str(piper_local_warmup_cache))
+            worker.seed_offline_cache(str(piper_local_warmup_cache), phase_filter)
+        worker.cfg.piper.actor_metadata.phase_filter = 99
+        with pytest.raises(ValueError, match="actor binding"):
+            worker.seed_offline_cache(str(piper_local_warmup_cache), phase_filter)
     finally:
         worker.demo_buffer.close()
 
@@ -4646,3 +4703,81 @@ def test_piper_warmup_local_cache_rejects_global_edges_and_rewards(
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError):
         CachedRLTReplay(piper_local_warmup_cache)
+
+
+def test_piper_expert_replay_routes_retries_by_identity_and_rejects_mislabeled_trace(
+    tmp_path,
+):
+    import json
+
+    from rlinf.data.datasets.piper_online import expert_trajectories
+    from rlinf.data.datasets.rlt_warmup import episode_transitions
+
+    phases = [
+        {
+            "start": 1,
+            "end": 5,
+            "outcome": "failure",
+            "expert_id": "phase2",
+            "policy_version": 9,
+        },
+        {
+            "start": 7,
+            "end": 12,
+            "outcome": "success",
+            "expert_id": "phase1",
+            "policy_version": 17,
+        },
+        {
+            "start": 14,
+            "end": 20,
+            "outcome": "success",
+            "expert_id": "phase2",
+            "policy_version": 9,
+        },
+    ]
+    result = {"critical_phases": phases, "expert_versions": {"phase1": 17, "phase2": 9}}
+    data = episode_transitions(
+        np.zeros((23, 7), np.float32),
+        phases=phases,
+        terminal=22,
+        chunk_length=50,
+        stride=2,
+        success=True,
+        human=np.zeros(23, bool),
+        reward_scope="critical_segment",
+    )
+    n = len(data["frames"])
+    data.update(
+        z_rl=np.zeros((n, 8), np.float32),
+        proprio=np.zeros((n, 7), np.float32),
+        ref_chunk=np.zeros((n, 50, 7), np.float32),
+    )
+    np.savez(tmp_path / "online_features.npz", **data)
+    rows = [
+        {
+            "event": "action",
+            "step": t,
+            "expert_id": p["expert_id"],
+            "policy_version": p["policy_version"],
+            "action_source": "actor",
+        }
+        for p in phases
+        for t in range(p["start"], p["end"])
+    ]
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    trajectories = expert_trajectories(tmp_path, result)
+    assert set(trajectories) == {"phase1", "phase2"}
+    for expert, index in [("phase1", 0), ("phase2", 1)]:
+        trajectory = trajectories[expert]
+        assert (trajectory.forward_inputs["expert_index"] == index).all()
+        assert (trajectory.versions == result["expert_versions"][expert]).all()
+    assert (
+        trajectories["phase2"].actions.shape[0]
+        > trajectories["phase1"].actions.shape[0]
+    )
+    rows[0]["expert_id"] = "phase1"
+    trace.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    with pytest.raises(ValueError, match="action expert"):
+        expert_trajectories(tmp_path, result)

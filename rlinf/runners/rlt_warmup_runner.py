@@ -62,6 +62,7 @@ class WarmupTraining:
     bc_start: float = 5.0
     bc_end: float = 2.0
     q_end: float = 0.1
+    bc_reference_dropout: float = 0.0
     dropout_end: float = 0.5
     eval_every: int = 1000
     save_every: int = 1000
@@ -156,6 +157,8 @@ def load_warmup_config(path: str | Path, overrides: list[str] = ()) -> WarmupCon
             raise ValueError(f"training.{key} must be finite and positive.")
     if not 0 < cfg.training.gamma <= 1 or not 0 < cfg.training.tau <= 1:
         raise ValueError("gamma and tau must be in (0,1].")
+    if not 0 <= cfg.training.bc_reference_dropout <= 1:
+        raise ValueError("training.bc_reference_dropout must be in [0,1].")
     if not 0 <= cfg.training.dropout_end <= 1 or not 0 <= cfg.training.q_end < float(
         "inf"
     ):
@@ -359,7 +362,11 @@ class RLTWarmupRunner:
             phase == "joint" and joint_step % t.actor_every == 0
         ):
             progress = max(0.0, (joint_step - 1) / max(1, t.joint_steps - 1))
-            dropout = t.dropout_end * progress
+            dropout = (
+                t.bc_reference_dropout
+                if phase == "actor_bc"
+                else t.dropout_end * progress
+            )
             bc_weight = t.bc_start + (t.bc_end - t.bc_start) * progress
             q_weight = t.q_end * progress
             self.actor_optimizer.zero_grad(set_to_none=True)
@@ -368,7 +375,7 @@ class RLTWarmupRunner:
                 predicted, _, _ = self.model.sac_forward(
                     actor_training_observation(batch),
                     deterministic=phase == "actor_bc",
-                    apply_reference_dropout=phase == "joint",
+                    apply_reference_dropout=phase == "joint" or dropout > 0,
                     reference_dropout_prob=dropout,
                 )
                 bc = masked_behavior_loss(predicted, batch)

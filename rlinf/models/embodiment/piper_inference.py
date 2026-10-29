@@ -389,6 +389,8 @@ class PiperRLTPolicy:
         mode: str,
         save_reference: bool,
         save_features: bool = False,
+        *,
+        actor_model=None,
     ) -> tuple[np.ndarray, dict]:
         from rlinf.algorithms.rlt import predict_rlt_actions
         from rlinf.algorithms.rlt.route import RealworldRLTRoute
@@ -400,15 +402,16 @@ class PiperRLTPolicy:
             raise ValueError(
                 "Manual inference requires an explicit actor_enabled snapshot."
             )
-        use_actor = self.actor is not None and actor_enabled is not False
-        if actor_enabled is True and self.actor is None:
+        actor_model = self.actor if actor_model is None else actor_model
+        use_actor = actor_model is not None and actor_enabled is not False
+        if actor_enabled is True and actor_model is None:
             raise ValueError("No actor checkpoint is loaded.")
         if not use_actor:
             features = self.feature_model.extract_rlt_obs(env_obs)
             actions = features["ref_chunk"]
         else:
             actions, result = predict_rlt_actions(
-                policy_model=self.actor,
+                policy_model=actor_model,
                 feature_model=self.feature_model,
                 rlt_route=RealworldRLTRoute(),
                 env_obs=env_obs,

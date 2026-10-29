@@ -2600,6 +2600,20 @@ def test_piper_warmup_zero_joint_budget_stops_at_critic(tmp_path):
         load_warmup_config(path, ["training.joint_steps=-1"])
 
 
+def test_piper_warmup_bc_reference_dropout_config(tmp_path):
+    from rlinf.runners.rlt_warmup_runner import load_warmup_config
+
+    path = tmp_path / "dropout.yaml"
+    path.write_text("{}\n")
+    assert load_warmup_config(path).training.bc_reference_dropout == 0.0
+    for probability in (0.0, 0.5, 1.0):
+        cfg = load_warmup_config(path, [f"training.bc_reference_dropout={probability}"])
+        assert cfg.training.bc_reference_dropout == probability
+    for value in ("-0.01", "1.01", ".nan", ".inf"):
+        with pytest.raises(ValueError, match="bc_reference_dropout"):
+            load_warmup_config(path, [f"training.bc_reference_dropout={value}"])
+
+
 def test_piper_warmup_target_includes_reference_gaps_and_scores_only_the_task_end():
     from rlinf.runners.rlt_warmup_runner import discounted_target
 
@@ -2638,8 +2652,9 @@ def test_piper_warmup_human_conditioning_preserves_reference_and_padding():
 
 
 @pytest.mark.parametrize("dropout_end", [0.0, 1.0])
+@pytest.mark.parametrize("bc_reference_dropout", [0.0, 1.0])
 def test_piper_warmup_updates_use_human_conditioning_and_recorded_critic_actions(
-    piper_warmup_cache, tmp_path, dropout_end
+    piper_warmup_cache, tmp_path, dropout_end, bc_reference_dropout
 ):
     import json
 
@@ -2682,6 +2697,7 @@ def test_piper_warmup_updates_use_human_conditioning_and_recorded_critic_actions
                 actor_every=1,
                 batch_size=4,
                 dropout_end=dropout_end,
+                bc_reference_dropout=bc_reference_dropout,
             ),
         )
     )
@@ -2713,7 +2729,9 @@ def test_piper_warmup_updates_use_human_conditioning_and_recorded_critic_actions
             if step != 2:
                 expected = batch["curr_obs"]["ref_chunk"][:, :10].clone()
                 expected[:, 0] = 0.6
-                if step == 4 and dropout_end == 1.0:
+                if (step == 1 and bc_reference_dropout == 1.0) or (
+                    step == 4 and dropout_end == 1.0
+                ):
                     expected.zero_()
                 torch.testing.assert_close(
                     actor_inputs[-1][:, :70], expected.flatten(1)
@@ -2755,8 +2773,10 @@ def test_piper_warmup_gate_requires_validation_of_the_exported_update():
     )
 
 
+@pytest.mark.parametrize("bc_reference_dropout", [0.0, 0.5])
+@pytest.mark.parametrize("interrupt_step", [1, 3])
 def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
-    piper_warmup_cache, tmp_path
+    piper_warmup_cache, tmp_path, bc_reference_dropout, interrupt_step
 ):
     import copy
     import json
@@ -2784,6 +2804,7 @@ def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
             batch_size=4,
             eval_every=2,
             save_every=2,
+            bc_reference_dropout=bc_reference_dropout,
         ),
     )
     runner = RLTWarmupRunner(cfg)
@@ -2811,7 +2832,7 @@ def test_piper_warmup_freezes_the_correct_heads_and_resumes_exactly(
     report = full.run()
     resumed_cfg = copy.deepcopy(cfg)
     resumed_cfg.output = str(tmp_path / "resumed")
-    RLTWarmupRunner(resumed_cfg).run(until_step=3)
+    RLTWarmupRunner(resumed_cfg).run(until_step=interrupt_step)
     # A killed log write must not invalidate a complete optimizer checkpoint.
     with (Path(resumed_cfg.output) / "metrics.jsonl").open("a") as log:
         log.write('{"step": 4, "validation":')
@@ -2946,3 +2967,106 @@ def test_piper_warmup_validation_measures_human_targets_without_padding(
     assert report["actor_rmse"] == pytest.approx(0, abs=1e-7)
     assert report["human_rmse"] == pytest.approx(0.4)
     assert report["human_validation_ticks"] == int(mask.sum())
+
+
+def test_piper_expert_heads_are_independent_and_route_explicitly(tmp_path, monkeypatch):
+    import json
+
+    from rlinf.models.embodiment import openpi
+    from rlinf.models.embodiment.mlp_policy import get_model
+    from rlinf.models.embodiment.piper_experts import (
+        PiperExpertPolicy,
+        load_expert_paths,
+    )
+
+    root = _piper_test_checkpoint(tmp_path)
+    stage1 = json.loads((root / "piper_inference.json").read_text())
+    stage1["model"]["precision"] = "fp32"
+    stage1["model"]["openpi"]["action_chunk"] = 50
+    (root / "piper_inference.json").write_text(json.dumps(stage1))
+    config = {
+        "model_type": "rlt_mlp_policy",
+        "precision": "fp32",
+        "z_dim": 8,
+        "proprio_dim": 7,
+        "action_dim": 7,
+        "num_action_chunks": 50,
+        "ref_num_action_chunks": 50,
+        "add_q_head": True,
+    }
+    for phase in (1, 2):
+        target = tmp_path / f"phase{phase}"
+        (target / "model_state_dict").mkdir(parents=True)
+        torch.manual_seed(phase)
+        model = get_model(OmegaConf.create(config), torch_dtype=torch.float32)
+        with torch.no_grad():
+            model.actor_mean.bias.fill_(phase * 0.1)
+        torch.save(model.state_dict(), target / "model_state_dict/full_weights.pt")
+        (target / "piper_rlt_actor.json").write_text(
+            json.dumps(
+                {
+                    "format": "rlinf-piper-rlt-offline-local-actor-v1",
+                    "model": config,
+                    "stage1_checkpoint_id": stage1["checkpoint_id"],
+                    "phase_filter": phase - 1,
+                    "reward_scope": "critical_segment",
+                    "critic_action_projection": "driver_limits",
+                }
+            )
+        )
+    registry = tmp_path / "experts.json"
+    registry.write_text(json.dumps({"phase1": "phase1", "phase2": "phase2"}))
+    experts = load_expert_paths(registry)
+    loaded = []
+
+    class Features(torch.nn.Module):
+        action_chunk = 50
+
+        def extract_rlt_obs(self, obs):
+            return {
+                "z_rl": torch.zeros(1, 8),
+                "proprio": torch.zeros(1, 7),
+                "ref_chunk": torch.zeros(1, 50, 7),
+            }
+
+    def build(cfg):
+        loaded.append(cfg)
+        return Features()
+
+    monkeypatch.setattr(openpi, "get_model", build)
+    policy = PiperExpertPolicy(
+        root, experts=experts, device="cpu", allow_offline_actor=True
+    )
+    assert len(loaded) == 1
+    parameters = [
+        list(policy.expert_actors[key].parameters()) for key in policy.expert_ids
+    ]
+    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(*parameters, strict=True))
+    obs = {"observation.state": np.zeros(7)}
+    obs.update(
+        {
+            f"observation.images.{camera}": np.zeros((8, 9, 3), np.uint8)
+            for camera in ("front", "front_2", "wrist")
+        }
+    )
+    first = policy.infer(obs, "USB", actor_enabled=True, expert_id="phase1")
+    second = policy.infer(obs, "USB", actor_enabled=True, expert_id="phase2")
+    assert first.shape == second.shape == (50, 7)
+    assert not np.allclose(first, second)
+    np.testing.assert_array_equal(
+        first, policy.infer(obs, "USB", actor_enabled=True, expert_id="phase1")
+    )
+    assert policy.infer(obs, "USB", actor_enabled=False).shape == (50, 7)
+    with pytest.raises(ValueError, match="Select"):
+        policy.infer(obs, "USB", actor_enabled=True)
+    with pytest.raises(ValueError, match="Reference"):
+        policy.infer(obs, "USB", actor_enabled=False, expert_id="phase2")
+    with pytest.raises(ValueError, match="phase/reward"):
+        PiperExpertPolicy(
+            root,
+            experts={"phase1": experts["phase2"], "phase2": experts["phase1"]},
+            device="cpu",
+            allow_offline_actor=True,
+        )
+    with pytest.raises(ValueError, match="opt-in"):
+        PiperExpertPolicy(root, experts=experts, device="cpu")
